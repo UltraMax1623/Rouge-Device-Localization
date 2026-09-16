@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <cmath>
 #include "esp_wifi.h"
 
 // ===============================
@@ -37,6 +38,10 @@ void printMAC(uint8_t *mac) {
     "%02X:%02X:%02X:%02X:%02X:%02X:%02X",
     mac[0], mac[1], mac[2],
     mac[3], mac[4], mac[5]);
+}
+
+double rssiToDistance(double rssi, double A = -59.0, double n = 2.0) {
+    return pow(10.0, (A - rssi) / (10.0 * n));
 }
 
 // ===============================
@@ -140,6 +145,8 @@ void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
 
   int rssi = packet->rx_ctrl.rssi;
 
+  double distance = rssiToDistance(rssi);
+
   Serial.print("TARGET TRANSMITTER FOUND");
 
   Serial.print(" | MAC: ");
@@ -150,9 +157,12 @@ void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
   Serial.print(" dBm");
 
   Serial.print(" | Channel: ");
-  Serial.println(currentChannel);
-}
+  Serial.print(currentChannel);
 
+  Serial.print(" | DISTANCE: ");
+  Serial.print(distance);
+  Serial.println(" m");
+}
 // ===============================
 // Setup
 // ===============================
