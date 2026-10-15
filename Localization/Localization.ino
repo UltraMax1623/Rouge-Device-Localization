@@ -13,8 +13,8 @@ volatile double latestRssi = 0;
 uint8_t capturedMac[6];
 
 // Path loss model parameters
-// double A = -59.0;
-// double n = 2.0; //1 - 4
+volatile double A = -60.0;
+volatile double n = 2.0; //1 - 4
 bool sameMAC(const uint8_t *mac1, const uint8_t *mac2) {
   for (int i = 0; i < 6; i++) {
     if (mac1[i] != mac2[i]) return false;
@@ -93,7 +93,7 @@ void loop() {
     if (targetPacketFlag) {
         targetPacketFlag = false; // Reset flag
 
-        if (millis() - start1 < 10000) {
+        if (millis() - start1 < 7000) {
             rssilogger(latestRssi);
             totalrssi += latestRssi;
             packetcounter++;
@@ -103,14 +103,8 @@ void loop() {
                 Serial.print("MAC: ");
                 printMAC(capturedMac);
                 Serial.printf(" | Avg RSSI: %.2f dBm\n",avgRssi);
-                for (double a = -30; a >= -70; a = a - 0.5) {
-                    for (double n = 1.0; n <= 4.0; n = n + 0.05) {
-                        double distance = rssiToDistance(avgRssi, a, n);
-                        if (distance >= 0.98 && distance <= 1.02) {
-                            Serial.printf("Dist: %.4f m | A: %.4f | n: %.4f\n",distance, a, n);
-                        }
-                    }
-                }
+                double distance = rssiToDistance(avgRssi, A, n);
+                Serial.printf("Dist: %.4f m | A: %.4f | n: %.4f\n",distance, A, n);
                 Serial.print("\n\n\n\n");
             }
             start1 = millis();
@@ -118,6 +112,23 @@ void loop() {
             totalrssi = 0;
         }
     }
+    if (Serial.available() > 0){
+    String inputString = Serial.readStringUntil('\n');
+    inputString.trim();
+    char charBuffer[50];
+    inputString.toCharArray(charBuffer, sizeof(charBuffer));
+    int itemsRead = sscanf(charBuffer, "%lf %lf", &A, &n);
+    if (itemsRead == 2) {
+      packetcounter = 0;
+      totalrssi = 0;
+      Serial.print("Successfully parsed! Value 1: ");
+      Serial.print(A, 4); // Print with 4 decimal places
+      Serial.print(" | Value 2: ");
+      Serial.println(n, 4);
+    } else {
+      Serial.println("Error: Please format as 'number1 number2'");
+    }
+  }
     // Feed the task watchdog on CPU 1
     delay(2); 
 }
