@@ -21,7 +21,8 @@
 #define MESH_PORT       5555
 
 //global const
-// Path-loss calibration from the standalone localization sketch.
+// Fallbacks only: setup loads saved calibration; an opt + save replaces the
+// active globals and distributes/persists the model across the mesh.
 double A = -60.0;
 double n = 2.0;
 uint8_t target_mac[6] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
@@ -70,12 +71,16 @@ JsonDocument &sniffAverageCounts = timeSlicing.sniffAverageCounts;
 JsonDocument &channelDiscoveryReports = timeSlicing.channelDiscoveryReports;
 uint8_t &true_channel = timeSlicing.discoveredChannel;
 
+#include "calibration_mode.h"
+CalibrationMode calibrationMode;
+
 // Root command entry point; normal nodes receive configuration over mesh.
 bool runConfig() {
   return timeSlicing.beginConfiguration(macList);
 }
 
 bool handleConfigMode(JsonDocument &doc, uint32_t from){
+  if (!calibrationMode.allowConfiguration(doc)) return false;
   // Other modes will be handled separately later.
   const char *mode = doc["Mode"] | "";
 
@@ -177,6 +182,9 @@ bool node_mssg_parser(const String &message, uint32_t from) {
   const char *mode = doc["Mode"] | "";
   const char *action = doc["Action"] | "";
 
+  if (strcmp(mode, "an") == 0) return calibrationMode.handle(doc, from);
+  Serial.printf("Message from %u\n", from);
+
   if (strcmp(mode, "conf") == 0) {
     if (strcmp(action, "prepare") == 0) return handleConfigMode(doc, from);
     return timeSlicing.handleControl(doc, from);
@@ -198,17 +206,18 @@ bool node_mssg_parser(const String &message, uint32_t from) {
 }
 
 void receivedCallback(uint32_t from, String &message) {
-  Serial.printf("Message from %u\n", from);
   node_mssg_parser(message, from);
 }
 
 void newConnectionCallback(uint32_t nodeId) {
   timeSlicing.topologyChanged();
+  calibrationMode.topologyChanged();
   Serial.printf("Connected: %u\n", nodeId);
 }
 
 void changedConnectionCallback() {
   timeSlicing.topologyChanged();
+  calibrationMode.topologyChanged();
   Serial.println("Mesh connections changed");
 }
 
@@ -250,6 +259,15 @@ bool configureSelfMacs() {
     Serial.println("Wi-Fi initialization failed");
     return false;
   }
+
+  // Measurement keeps the driver initialized. Its MACs normally survive
+  // STA <-> AP/STA changes; avoid stopping/restarting Wi-Fi just to set
+  // addresses which are already correct.
+  uint8_t currentAP[6], currentStation[6];
+  if (esp_wifi_get_mac(WIFI_IF_AP, currentAP) == ESP_OK &&
+      esp_wifi_get_mac(WIFI_IF_STA, currentStation) == ESP_OK &&
+      memcmp(currentAP, AP_self_mac, 6) == 0 &&
+      memcmp(currentStation, station_self_mac, 6) == 0) return true;
 
   esp_err_t error = esp_wifi_stop();
   if (error != ESP_OK) {
@@ -321,7 +339,9 @@ bool restartMesh() {
 void stopMeshForMeasurement() {
   meshStarted = false;
   mesh.stopForMeasurement();
-  WiFi.mode(WIFI_OFF);
+  // AP off, station driver retained for ESP-NOW/sniffing. Avoid repeated
+  // teardown/recreation implicated by the field log's STOP_STATE warning.
+  if (!WiFi.mode(WIFI_STA)) Serial.println("[RADIO] Could not switch mesh radio to station mode");
 }
 
 void runTimeSlicing(bool armOnly) {
@@ -337,6 +357,12 @@ bool userInputBusy() {
 }
 
 void handleSerialCommand(const char *line, bool busyWhileReading) {
+#if ROOT_FIRMWARE
+  if (calibrationMode.localSession()) {
+    calibrationMode.command(line);
+    return;
+  }
+#endif
   if (busyWhileReading || userInputBusy()) {
     Serial.println("[ERROR] Round running: user input disabled until completion");
     return;
@@ -344,7 +370,19 @@ void handleSerialCommand(const char *line, bool busyWhileReading) {
 #if ROOT_FIRMWARE
   const auto command = UserCommand::parse(line);
   if (command.kind == UserCommand::Kind::Invalid) {
-    Serial.println("[ERROR] Use: conf | sniff <12-hex-MAC> [channel 1..13]");
+    Serial.println("[ERROR] Use: conf | sniff <12-hex-MAC> [channel 1..13] | an opt <board 2..15> | an diag <board 2..15> [distance 1..5]");
+    return;
+  }
+  if (command.kind == UserCommand::Kind::Calibrate) {
+    calibrationMode.start(command.board);
+    return;
+  }
+  if (command.kind == UserCommand::Kind::Diagnostic) {
+    calibrationMode.start(command.board, true, command.distance);
+    return;
+  }
+  if (!calibrationMode.networkSynced()) {
+    Serial.println("[ERROR] Wait for all configured nodes to acknowledge the root's A/n");
     return;
   }
   if (!timeSlicing.networkReadyForConfiguration(macList.size())) {
@@ -367,7 +405,8 @@ void processSerialInput() {
   static UserCommand::LineReader reader;
   unsigned budget = 64;
   while (budget-- && Serial.available() > 0) {
-    const auto result = reader.push(static_cast<char>(Serial.read()), userInputBusy());
+    const auto result = reader.push(static_cast<char>(Serial.read()),
+        !calibrationMode.localSession() && userInputBusy());
     using Result = UserCommand::LineReader::Result;
     if (result == Result::Busy) handleSerialCommand(reader.text(), true);
     else if (result == Result::Invalid)
@@ -391,6 +430,7 @@ void recoverUnavailableMesh() {
 void setup() {
   Serial.begin(115200);
   beginModeIndicator();
+  calibrationMode.begin();
 #if ROOT_FIRMWARE
   for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board) {
     macList.push_back(MacAddress{0x44, 0x33, 0x22, 0x11, 0x00, board});
@@ -399,7 +439,7 @@ void setup() {
   restartMesh();
   lastMeshRecoveryMs = millis();
 #if ROOT_FIRMWARE
-  Serial.println("[COMMAND] Enter conf or sniff <12-hex-MAC> (newline, 115200 baud)");
+  Serial.println("[COMMAND] conf | sniff <12-hex-MAC> [channel] | an opt <board> | an diag <board> [distance 1..5] (newline, 115200 baud)");
 #endif
 }
 
@@ -410,9 +450,14 @@ void loop() {
     mesh.update();
   }
   runTimeSlicing();
-  updateModeIndicator(currentMode,
+  calibrationMode.update();
+  auto radioActivity = timeSlicing.radioActivity();
+  if (calibrationMode.active() && !calibrationMode.identifying() &&
+      radioActivity == TimeSliceProtocol::RadioActivity::None)
+    radioActivity = TimeSliceProtocol::RadioActivity::Waiting;
+  updateModeIndicator(calibrationMode.identifying() ? String("scan") : currentMode,
       (!meshStarted && timeSlicing.phase() != TimeSlicingController::Phase::MEASURING)
           || timeSlicing.phase() == TimeSlicingController::Phase::FAILED,
-      mesh.broadcastIndicatorActive());
+      mesh.broadcastIndicatorActive(), radioActivity);
   delay(1);
 }

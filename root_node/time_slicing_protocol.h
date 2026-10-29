@@ -9,6 +9,8 @@ constexpr uint8_t CHANNEL = 1;
 constexpr uint32_t GUARD_US = 500000;
 constexpr uint32_t SAMPLE_US = 3000000;
 constexpr uint32_t SLOT_US = SAMPLE_US + 2 * GUARD_US;
+constexpr uint32_t CALIBRATION_SAMPLE_US = 10000000;
+constexpr uint32_t CALIBRATION_MIN_SAMPLES = 300;
 constexpr uint32_t PREPARE_US = 3000000;
 constexpr uint32_t START_LEAD_US = 10000000;
 constexpr size_t PAYLOAD_SIZE = 18;
@@ -16,6 +18,26 @@ constexpr int64_t DISCOVERY_US = 10000000;
 constexpr int64_t SNIFF_US = 20000000;
 constexpr uint8_t SNIFF_CYCLES = 3;
 constexpr int64_t CHANNEL_DWELL_US = 200000;
+
+inline uint32_t sampleDurationUs(bool calibration) {
+  return calibration ? CALIBRATION_SAMPLE_US : SAMPLE_US;
+}
+inline uint32_t slotDurationUs(bool calibration) {
+  return sampleDurationUs(calibration) + 2 * GUARD_US;
+}
+
+// Main-loop observations of each capture window, independent of packet count.
+// A packet span is reported separately: it measures first-to-last reception.
+struct WindowTiming {
+  int64_t openedUs = -1, closedUs = -1;
+  void observe(int64_t now, int64_t start, int64_t end) {
+    if (openedUs < 0 && now >= start && now < end) openedUs = now;
+    if (openedUs >= 0 && closedUs < 0 && now >= end) closedUs = now;
+  }
+  uint32_t elapsedMs() const {
+    return openedUs >= 0 && closedUs >= openedUs ? uint32_t((closedUs - openedUs) / 1000) : 0;
+  }
+};
 
 inline int64_t sniffDurationUs(bool discovery) { return discovery ? DISCOVERY_US : SNIFF_US; }
 inline uint8_t nextSniffCycle(uint8_t cycle) {
@@ -89,12 +111,22 @@ inline bool matchesMeasurement(const uint8_t *payload, const uint8_t *source,
 }
 
 inline bool activeSlot(int64_t now, int64_t start, size_t count,
-                       size_t &slot) {
+                       size_t &slot, bool calibration = false) {
   if (now < start) return false;
   uint64_t elapsed = static_cast<uint64_t>(now - start);
-  slot = elapsed / SLOT_US;
-  uint32_t offset = elapsed % SLOT_US;
+  const uint32_t duration = slotDurationUs(calibration);
+  slot = elapsed / duration;
+  uint32_t offset = elapsed % duration;
   return slot < count && offset >= GUARD_US &&
-         offset < SLOT_US - GUARD_US;
+         offset < duration - GUARD_US;
+}
+
+enum class RadioActivity { None, Waiting, Transmit, Receive };
+inline RadioActivity measurementActivity(int64_t now, int64_t start, size_t count,
+                                        size_t self, bool calibration = false) {
+  size_t slot;
+  if (self >= count || !activeSlot(now, start, count, slot, calibration))
+    return RadioActivity::Waiting;
+  return slot == self ? RadioActivity::Transmit : RadioActivity::Receive;
 }
 }  // namespace TimeSliceProtocol

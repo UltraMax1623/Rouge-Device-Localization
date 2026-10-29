@@ -6,11 +6,13 @@
 #include <string.h>
 
 namespace UserCommand {
-enum class Kind { Invalid, Conf, Sniff };
+enum class Kind { Invalid, Conf, Sniff, Calibrate, Diagnostic };
 struct Command {
   Kind kind = Kind::Invalid;
   std::array<uint8_t, 6> target{};
   uint8_t channel = 0;  // 0: scan channels 1..11.
+  uint8_t board = 0;
+  uint8_t distance = 1;  // Diagnostic placement label, not an RSSI-derived distance.
 };
 class LineReader {
  public:
@@ -48,6 +50,26 @@ inline int hexDigit(char value) {
 inline Command parse(const char *text) {
   Command command;
   while (*text == ' ' || *text == '\t') ++text;
+  const bool diagnostic = strncmp(text, "an diag ", 8) == 0 || strncmp(text, "an diag\t", 8) == 0;
+  if (diagnostic || strncmp(text, "an opt ", 7) == 0 || strncmp(text, "an opt\t", 7) == 0) {
+    text += diagnostic ? 8 : 7;
+    while (*text == ' ' || *text == '\t') ++text;
+    unsigned board = 0, digits = 0;
+    while (*text >= '0' && *text <= '9') {
+      board = board * 10 + unsigned(*text++ - '0');
+      if (++digits > 2) return command;
+    }
+    while (*text == ' ' || *text == '\t') ++text;
+    if (diagnostic && *text >= '1' && *text <= '5') {
+      command.distance = uint8_t(*text++ - '0');
+      while (*text == ' ' || *text == '\t') ++text;
+    }
+    if (!*text && digits && board >= 2 && board <= 15) {
+      command.kind = diagnostic ? Kind::Diagnostic : Kind::Calibrate;
+      command.board = uint8_t(board);
+    }
+    return command;
+  }
   if (strncmp(text, "conf", 4) == 0) {
     text += 4;
     while (*text == ' ' || *text == '\t') ++text;

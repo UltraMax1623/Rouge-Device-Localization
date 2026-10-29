@@ -108,6 +108,40 @@ int main() {
   assert(activeSlot(start + 99LL * SLOT_US + GUARD_US, start, 100, slot));
   assert(slot == 99);
   assert(SLOT_US - 2 * GUARD_US == SAMPLE_US);
+  assert(sampleDurationUs(false) == 3000000 && slotDurationUs(false) == 4000000);
+  assert(sampleDurationUs(true) == 10000000 && slotDurationUs(true) == 11000000);
+  assert(CALIBRATION_MIN_SAMPLES == 300);
+  const uint32_t calibrationSlot = slotDurationUs(true);
+  assert(!activeSlot(start + GUARD_US - 1, start, 2, slot, true));
+  assert(activeSlot(start + GUARD_US, start, 2, slot, true) && slot == 0);
+  // Calibration continues collecting where an ordinary conf slot has ended.
+  assert(activeSlot(start + 9000000, start, 2, slot, true) && slot == 0);
+  assert(activeSlot(start + calibrationSlot - GUARD_US - 1, start, 2, slot, true) && slot == 0);
+  assert(!activeSlot(start + calibrationSlot - GUARD_US, start, 2, slot, true));
+  assert(activeSlot(start + calibrationSlot + GUARD_US, start, 2, slot, true) && slot == 1);
+  assert(!activeSlot(start + 2LL * calibrationSlot, start, 2, slot, true));
+  WindowTiming timing;
+  const int64_t opening = start + GUARD_US, closing = opening + CALIBRATION_SAMPLE_US;
+  timing.observe(opening - 1, opening, closing);
+  assert(timing.openedUs < 0 && timing.elapsedMs() == 0);
+  timing.observe(opening + 1000, opening, closing);
+  timing.observe(closing - 1, opening, closing);
+  assert(timing.closedUs < 0);
+  timing.observe(closing + 2000, opening, closing);
+  assert(timing.elapsedMs() == 10001); // Observed time includes main-loop boundary jitter.
+  timing.observe(closing + 1000000, opening, closing);
+  assert(timing.elapsedMs() == 10001); // Closing is recorded once.
+  WindowTiming missed;
+  missed.observe(closing + 1, opening, closing);
+  assert(missed.elapsedMs() == 0 && missed.openedUs < 0); // Never invent a full capture.
+  assert(measurementActivity(start - 1, start, 2, 0, true) == RadioActivity::Waiting);
+  assert(measurementActivity(start + GUARD_US, start, 2, 0, true) == RadioActivity::Transmit);
+  assert(measurementActivity(start + GUARD_US, start, 2, 1, true) == RadioActivity::Receive);
+  assert(measurementActivity(start + calibrationSlot - GUARD_US, start, 2, 0, true) == RadioActivity::Waiting);
+  assert(measurementActivity(start + calibrationSlot + GUARD_US, start, 2, 0, true) == RadioActivity::Receive);
+  assert(measurementActivity(start + calibrationSlot + GUARD_US, start, 2, 1, true) == RadioActivity::Transmit);
+  assert(measurementActivity(start + 2LL * calibrationSlot, start, 2, 0, true) == RadioActivity::Waiting);
+  assert(measurementActivity(start + SLOT_US + GUARD_US, start, 2, 1) == RadioActivity::Transmit);
 
   uint8_t frame[39 + PAYLOAD_SIZE + 4] = {};
   frame[0] = 0xD0;
