@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Device Localization Console</title>
+
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: #f4f7fb;
+      color: #15263d;
+      font-family: Arial, sans-serif;
+    }
+
+    header {
+      padding: 20px 6%;
+      color: white;
+      background: #101a2b;
+      font-weight: bold;
+      letter-spacing: 1px;
+    }
+
+    main {
+      max-width: 1200px;
+      margin: auto;
+      padding: 32px 24px;
+    }
+
+    h1 { margin: 0 0 8px; }
+    h2 { margin-top: 0; font-size: 18px; }
+    .muted { color: #7b899a; }
+
+    .card {
+      margin: 20px 0;
+      padding: 22px;
+      border: 1px solid #e5ebf2;
+      border-radius: 14px;
+      background: white;
+      box-shadow: 0 8px 24px #12223a12;
+    }
+
+    .summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+
+    .buttons {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 13px 18px;
+      border: 0;
+      border-radius: 9px;
+      color: #082337;
+      background: linear-gradient(100deg, #35d0ba, #42a5ff);
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: #e8f0f8;
+      color: #285d8e;
+    }
+
+    button:disabled { opacity: .6; cursor: wait; }
+
+    .columns {
+      display: grid;
+      grid-template-columns: 1.5fr 1fr;
+      gap: 20px;
+    }
+
+    .left-column {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      min-width: 0;
+    }
+
+    .left-column > .card {
+      margin: 0;
+    }
+
+    .future-space {
+      min-height: 1px;
+    }
+
+    .map {
+      position: relative;
+      height: 420px;
+      overflow: hidden;
+      border: 1px solid #e5ebf2;
+      border-radius: 12px;
+      background-color: #f8fafc;
+      background-image:
+        linear-gradient(#eaf0f5 1px, transparent 1px),
+        linear-gradient(90deg, #eaf0f5 1px, transparent 1px);
+      background-size: 48px 48px;
+    }
+
+    .connections {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+    }
+
+    .connections line {
+      stroke: #a9bacd;
+      stroke-width: 2;
+      stroke-dasharray: 6 7;
+    }
+
+    .node {
+      position: absolute;
+      display: flex;
+      align-items: center;
+      flex-direction: column;
+      gap: 7px;
+      transform: translate(-50%, -50%);
+    }
+
+    .root { left: 57%; top: 49%; }
+    .node-one { left: 25%; top: 26%; }
+    .node-two { left: 79%; top: 27%; }
+    .node-three { left: 26%; top: 77%; }
+
+    .circle {
+      width: 54px;
+      height: 54px;
+      display: grid;
+      place-items: center;
+      border: 3px solid #37a4f5;
+      border-radius: 50%;
+      color: #2472b4;
+      background: white;
+      font-weight: bold;
+    }
+
+    .root .circle {
+      width: 66px;
+      height: 66px;
+      border: 0;
+      color: white;
+      background: #17b7a4;
+      line-height: 1.3;
+      text-align: center;
+    }
+
+    .node-name { font-size: 11px; font-weight: bold; white-space: nowrap; }
+    .node-status { color: #7b899a; font-size: 10px; white-space: nowrap; }
+
+    .device-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 13px 0;
+      border-bottom: 1px solid #edf1f5;
+      font-size: 13px;
+    }
+
+    .device-row:last-child { border-bottom: 0; }
+    .status { color: #7b899a; }
+
+    .result-box {
+      margin-top: 18px;
+      padding: 14px;
+      border-radius: 9px;
+      background: #f5f8fb;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    #message {
+      min-height: 42px;
+      margin-top: 14px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .success { color: #199d78; }
+    .error { color: #c75050; }
+
+    @media (max-width: 800px) {
+      .columns { grid-template-columns: 1fr; }
+      .future-space {
+        display: none;
+      }
+    }
+
+    @media (max-width: 500px) {
+      main { padding: 24px 14px; }
+      .card { padding: 16px; }
+      .map { height: 350px; }
+    }
+  </style>
+</head>
+
+<body>
+  <header>NODEWISE · DEVICE LOCALIZATION CONSOLE</header>
+
+  <main>
+    <h1>Project control</h1>
+    <p class="muted">Configure the nodes and optimize the RSSI AN value.</p>
+
+    <section class="card summary">
+      <div>
+        <strong>Network overview</strong>
+        <div class="muted">1 ESP32-S3 root and 3 ESP32 nodes</div>
+        <div id="connectionStatus" class="muted">S3: offline</div>
+      </div>
+
+      <div class="buttons">
+        <button id="configureButton" class="secondary" type="button">Configure</button>
+        <button id="optimizeButton" class="secondary" type="button">
+          Optimize RSSI AN
+        </button>
+      </div>
+    </section>
+
+    <div class="columns">
+      <div class="left-column">
+        <section class="card">
+          <h2>Node layout</h2>
+          <p class="muted">Illustrative view · positions are not to scale</p>
+
+          <div class="map">
+            <svg class="connections" viewBox="0 0 800 420" preserveAspectRatio="none">
+              <line x1="456" y1="206" x2="200" y2="110"></line>
+              <line x1="456" y1="206" x2="632" y2="113"></line>
+              <line x1="456" y1="206" x2="208" y2="324"></line>
+            </svg>
+
+            <div class="node root" data-node="root">
+              <div class="circle">ROOT<br>S3</div>
+              <div class="node-name">ESP32-S3 Root</div>
+              <div class="node-status">Waiting</div>
+            </div>
+
+            <div class="node node-one" data-node="node-01">
+              <div class="circle">01</div>
+              <div class="node-name">ESP32 Node 01</div>
+              <div class="node-status">Waiting</div>
+            </div>
+
+            <div class="node node-two" data-node="node-02">
+              <div class="circle">02</div>
+              <div class="node-name">ESP32 Node 02</div>
+              <div class="node-status">Waiting</div>
+            </div>
+
+            <div class="node node-three" data-node="node-03">
+              <div class="circle">03</div>
+              <div class="node-name">ESP32 Node 03</div>
+              <div class="node-status">Waiting</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Device status</h2>
+
+          <div class="device-row">
+            <strong>ESP32-S3 Root</strong>
+            <span class="status" id="root-status">Waiting</span>
+          </div>
+          <div class="device-row">
+            <strong>ESP32 Node 01</strong>
+            <span class="status" id="node-01-status">Waiting</span>
+          </div>
+          <div class="device-row">
+            <strong>ESP32 Node 02</strong>
+            <span class="status" id="node-02-status">Waiting</span>
+          </div>
+          <div class="device-row">
+            <strong>ESP32 Node 03</strong>
+            <span class="status" id="node-03-status">Waiting</span>
+          </div>
+
+          <div class="result-box">
+            <strong>RSSI AN optimization</strong>
+            <div id="optimizationStatus" class="muted">Not started</div>
+            <div id="optimizationValue" class="muted">No result received</div>
+          </div>
+
+          <p id="message" class="muted" role="status">
+            Connecting to the backend…
+          </p>
+        </section>
+      </div>
+      <aside class="future-space"></aside>
+    </div>
+  </main>
+
+  <script>
+    const configureButton = document.getElementById("configureButton");
+    const optimizeButton = document.getElementById("optimizeButton");
+    const message = document.getElementById("message");
+    const connectionStatus = document.getElementById("connectionStatus");
+
+    const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${wsProtocol}//${location.host}/ws?role=ui`);
+
+    socket.addEventListener("open", () => {
+      message.textContent = "Connected to backend. Waiting for the ESP32-S3.";
+    });
+
+    socket.addEventListener("close", () => {
+      connectionStatus.textContent = "S3: offline";
+      message.textContent = "WebSocket disconnected. Refresh the page to reconnect.";
+    });
+
+    socket.addEventListener("message", event => {
+      let data;
+
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (data.type === "device_connection") {
+        connectionStatus.textContent = data.connected ? "S3: online" : "S3: offline";
+        return;
+      }
+
+      if (data.type === "node_status") {
+        updateNodeStatus(data.nodeId, data.status);
+        message.textContent = `${data.nodeId}: ${data.status}`;
+        return;
+      }
+
+      if (data.type === "rssi_optimization") {
+        document.getElementById("optimizationStatus").textContent =
+          data.status || "Update received";
+
+        document.getElementById("optimizationValue").textContent =
+          data.values ? JSON.stringify(data.values) :
+          data.value ? String(data.value) :
+          "No value included in the update";
+
+        message.textContent = "RSSI AN optimization update received.";
+      }
+    });
+
+    function updateNodeStatus(nodeId, status) {
+      const row = document.getElementById(`${nodeId}-status`);
+      if (row) row.textContent = status;
+
+      const marker = document.querySelector(
+        `[data-node="${nodeId}"] .node-status`
+      );
+      if (marker) marker.textContent = status;
+    }
+
+    async function sendCommand(command, button) {
+      button.disabled = true;
+      message.className = "muted";
+      message.textContent = `Sending "${command}" to the backend…`;
+
+      if (command === "optimize_rssi_an") {
+        document.getElementById("optimizationStatus").textContent = "Command sent";
+        document.getElementById("optimizationValue").textContent =
+          "Waiting for the ESP32-S3 result";
+      }
+
+      try {
+        const response = await fetch("/api/command", {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: command
+        });
+
+        const result = await response.text();
+
+        if (!response.ok) {
+          throw new Error(result || "The backend returned an error.");
+        }
+
+        message.textContent = result;
+      } catch (error) {
+        message.className = "error";
+        message.textContent = error.message || "Could not contact the backend.";
+
+        if (command === "optimize_rssi_an") {
+          document.getElementById("optimizationStatus").textContent =
+            "Could not send command";
+        }
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    configureButton.addEventListener("click", () => {
+      sendCommand("conf", configureButton);
+    });
+
+    optimizeButton.addEventListener("click", () => {
+      sendCommand("optimize_rssi_an", optimizeButton);
+    });
+  </script>
+</body>
+</html>
