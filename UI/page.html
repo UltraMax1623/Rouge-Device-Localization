@@ -24,7 +24,7 @@
     }
 
     main {
-      max-width: 1200px;
+      max-width: 1400px;
       margin: auto;
       padding: 32px 24px;
     }
@@ -75,8 +75,9 @@
 
     .columns {
       display: grid;
-      grid-template-columns: 1.5fr 1fr;
+      grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr);
       gap: 20px;
+      align-items: start;
     }
 
     .left-column {
@@ -86,12 +87,9 @@
       min-width: 0;
     }
 
-    .left-column > .card {
+    .left-column > .card,
+    .terminal-card {
       margin: 0;
-    }
-
-    .future-space {
-      min-height: 1px;
     }
 
     .map {
@@ -155,8 +153,17 @@
       text-align: center;
     }
 
-    .node-name { font-size: 11px; font-weight: bold; white-space: nowrap; }
-    .node-status { color: #7b899a; font-size: 10px; white-space: nowrap; }
+    .node-name {
+      font-size: 11px;
+      font-weight: bold;
+      white-space: nowrap;
+    }
+
+    .node-status {
+      color: #7b899a;
+      font-size: 10px;
+      white-space: nowrap;
+    }
 
     .device-row {
       display: flex;
@@ -167,7 +174,7 @@
       font-size: 13px;
     }
 
-    .device-row:last-child { border-bottom: 0; }
+    .device-row:last-of-type { border-bottom: 0; }
     .status { color: #7b899a; }
 
     .result-box {
@@ -186,20 +193,72 @@
       line-height: 1.5;
     }
 
-    .success { color: #199d78; }
     .error { color: #c75050; }
 
-    @media (max-width: 800px) {
+    .terminal-card {
+      display: flex;
+      flex-direction: column;
+      min-height: 680px;
+      padding: 0;
+      overflow: hidden;
+      background: #101820;
+      border-color: #263746;
+    }
+
+    .terminal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 18px;
+      color: #e7f0f7;
+      background: #192633;
+      border-bottom: 1px solid #2b3b49;
+    }
+
+    .terminal-header h2 {
+      margin: 0;
+      font-size: 16px;
+    }
+
+    .terminal-header button {
+      padding: 8px 11px;
+      color: #d6e2eb;
+      background: #293b4a;
+      font-size: 12px;
+    }
+
+    #terminalOutput {
+      flex: 1;
+      min-height: 0;
+      max-height: 620px;
+      overflow-y: auto;
+      padding: 14px;
+      color: #d8e2ea;
+      background: #101820;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+
+    .terminal-line { margin: 0 0 5px; }
+    .terminal-time { color: #7f94a5; }
+    .terminal-source { color: #56c8b4; }
+    .terminal-error { color: #ff8585; }
+    .terminal-warn { color: #ffd37a; }
+
+    @media (max-width: 850px) {
       .columns { grid-template-columns: 1fr; }
-      .future-space {
-        display: none;
-      }
+      .terminal-card { min-height: 400px; }
+      #terminalOutput { max-height: 400px; }
     }
 
     @media (max-width: 500px) {
       main { padding: 24px 14px; }
       .card { padding: 16px; }
       .map { height: 350px; }
+      .terminal-card { padding: 0; }
     }
   </style>
 </head>
@@ -239,27 +298,27 @@
               <line x1="456" y1="206" x2="208" y2="324"></line>
             </svg>
 
-            <div class="node root" data-node="root">
+            <div class="node root" data-node="01">
               <div class="circle">ROOT<br>S3</div>
-              <div class="node-name">ESP32-S3 Root</div>
+              <div class="node-name">ESP32-S3 Root · 01</div>
               <div class="node-status">Waiting</div>
             </div>
 
-            <div class="node node-one" data-node="node-01">
-              <div class="circle">01</div>
-              <div class="node-name">ESP32 Node 01</div>
-              <div class="node-status">Waiting</div>
-            </div>
-
-            <div class="node node-two" data-node="node-02">
+            <div class="node node-one" data-node="02">
               <div class="circle">02</div>
               <div class="node-name">ESP32 Node 02</div>
               <div class="node-status">Waiting</div>
             </div>
 
-            <div class="node node-three" data-node="node-03">
+            <div class="node node-two" data-node="03">
               <div class="circle">03</div>
               <div class="node-name">ESP32 Node 03</div>
+              <div class="node-status">Waiting</div>
+            </div>
+
+            <div class="node node-three" data-node="04">
+              <div class="circle">04</div>
+              <div class="node-name">ESP32 Node 04</div>
               <div class="node-status">Waiting</div>
             </div>
           </div>
@@ -269,20 +328,20 @@
           <h2>Device status</h2>
 
           <div class="device-row">
-            <strong>ESP32-S3 Root</strong>
-            <span class="status" id="root-status">Waiting</span>
-          </div>
-          <div class="device-row">
-            <strong>ESP32 Node 01</strong>
-            <span class="status" id="node-01-status">Waiting</span>
+            <strong>ESP32-S3 Root · 01</strong>
+            <span class="status" id="01-status">Waiting</span>
           </div>
           <div class="device-row">
             <strong>ESP32 Node 02</strong>
-            <span class="status" id="node-02-status">Waiting</span>
+            <span class="status" id="02-status">Waiting</span>
           </div>
           <div class="device-row">
             <strong>ESP32 Node 03</strong>
-            <span class="status" id="node-03-status">Waiting</span>
+            <span class="status" id="03-status">Waiting</span>
+          </div>
+          <div class="device-row">
+            <strong>ESP32 Node 04</strong>
+            <span class="status" id="04-status">Waiting</span>
           </div>
 
           <div class="result-box">
@@ -296,7 +355,14 @@
           </p>
         </section>
       </div>
-      <aside class="future-space"></aside>
+
+      <aside class="card terminal-card">
+        <div class="terminal-header">
+          <h2>Live terminal</h2>
+          <button id="clearTerminalButton" type="button">Clear</button>
+        </div>
+        <div id="terminalOutput" aria-live="polite"></div>
+      </aside>
     </div>
   </main>
 
@@ -305,17 +371,51 @@
     const optimizeButton = document.getElementById("optimizeButton");
     const message = document.getElementById("message");
     const connectionStatus = document.getElementById("connectionStatus");
+    const terminalOutput = document.getElementById("terminalOutput");
+    const clearTerminalButton = document.getElementById("clearTerminalButton");
+
+    function addTerminalLine(source, text, kind = "") {
+      const line = document.createElement("div");
+      line.className = `terminal-line ${kind}`;
+
+      const time = new Date().toLocaleTimeString();
+      line.innerHTML =
+        `<span class="terminal-time">[${time}]</span> ` +
+        `<span class="terminal-source">[${source}]</span> `;
+
+      const content = document.createElement("span");
+      content.textContent = text;
+      line.appendChild(content);
+      terminalOutput.appendChild(line);
+
+      while (terminalOutput.children.length > 200) {
+        terminalOutput.removeChild(terminalOutput.firstChild);
+      }
+
+      terminalOutput.scrollTop = terminalOutput.scrollHeight;
+    }
+
+    clearTerminalButton.addEventListener("click", () => {
+      terminalOutput.replaceChildren();
+      addTerminalLine("UI", "Terminal cleared.");
+    });
 
     const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(`${wsProtocol}//${location.host}/ws?role=ui`);
 
     socket.addEventListener("open", () => {
       message.textContent = "Connected to backend. Waiting for the ESP32-S3.";
+      addTerminalLine("BACKEND", "Dashboard connected to backend.");
     });
 
     socket.addEventListener("close", () => {
       connectionStatus.textContent = "S3: offline";
       message.textContent = "WebSocket disconnected. Refresh the page to reconnect.";
+      addTerminalLine("BACKEND", "Dashboard WebSocket disconnected.", "terminal-error");
+    });
+
+    socket.addEventListener("error", () => {
+      addTerminalLine("BACKEND", "WebSocket error.", "terminal-error");
     });
 
     socket.addEventListener("message", event => {
@@ -324,17 +424,32 @@
       try {
         data = JSON.parse(event.data);
       } catch {
+        addTerminalLine("BACKEND", event.data);
         return;
       }
 
       if (data.type === "device_connection") {
-        connectionStatus.textContent = data.connected ? "S3: online" : "S3: offline";
+        connectionStatus.textContent =
+          data.connected ? "S3: online" : "S3: offline";
+
+        addTerminalLine(
+          "BACKEND",
+          `ESP32-S3 ${data.connected ? "connected" : "disconnected"}.`,
+          data.connected ? "" : "terminal-warn"
+        );
         return;
       }
 
       if (data.type === "node_status") {
         updateNodeStatus(data.nodeId, data.status);
         message.textContent = `${data.nodeId}: ${data.status}`;
+        addTerminalLine(
+          "ESP32",
+          `Node ${data.nodeId} status: ${data.status}`,
+          data.status === "failed" || data.status === "missing"
+            ? "terminal-warn"
+            : ""
+        );
         return;
       }
 
@@ -348,7 +463,11 @@
           "No value included in the update";
 
         message.textContent = "RSSI AN optimization update received.";
+        addTerminalLine("ESP32", "RSSI AN optimization update received.");
+        return;
       }
+
+      addTerminalLine("BACKEND", JSON.stringify(data));
     });
 
     function updateNodeStatus(nodeId, status) {
@@ -365,6 +484,7 @@
       button.disabled = true;
       message.className = "muted";
       message.textContent = `Sending "${command}" to the backend…`;
+      addTerminalLine("UI", `Sending command: ${command}`);
 
       if (command === "optimize_rssi_an") {
         document.getElementById("optimizationStatus").textContent = "Command sent";
@@ -386,9 +506,15 @@
         }
 
         message.textContent = result;
+        addTerminalLine("BACKEND", result);
       } catch (error) {
         message.className = "error";
         message.textContent = error.message || "Could not contact the backend.";
+        addTerminalLine(
+          "BACKEND",
+          error.message || "Could not contact the backend.",
+          "terminal-error"
+        );
 
         if (command === "optimize_rssi_an") {
           document.getElementById("optimizationStatus").textContent =

@@ -7,7 +7,7 @@ const HOST = "0.0.0.0";
 const PORT = 3000;
 const PAGE_PATH = path.join(__dirname, "page.html");
 
-// Use this same token in the ESP32-S3 firmware later.
+// Keep this token identical to the one in the ESP32-S3 firmware.
 const DEVICE_TOKEN = "local-device-token-change-me";
 
 const allowedCommands = new Set([
@@ -16,6 +16,9 @@ const allowedCommands = new Set([
 ]);
 
 let deviceSocket = null;
+
+const recentLogs = [];
+const MAX_RECENT_LOGS = 100;
 
 const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/") {
@@ -56,7 +59,8 @@ const server = http.createServer((req, res) => {
       }
 
       deviceSocket.send(command);
-      console.log(`Sent command "${command}" to ESP32-S3.`);
+      logToUi(`Sent command "${command}" to ESP32-S3.`);
+
       return sendText(res, 202, `Command "${command}" sent to ESP32-S3.`);
     });
 
@@ -88,7 +92,7 @@ webSockets.on("connection", (socket, request) => {
     }
 
     deviceSocket = socket;
-    console.log("ESP32-S3 connected by WebSocket.");
+    logToUi("ESP32-S3 connected by WebSocket.");
     broadcast({ type: "device_connection", connected: true });
   } else if (role !== "ui") {
     socket.close(1008, "Unknown connection role");
@@ -102,6 +106,13 @@ webSockets.on("connection", (socket, request) => {
         deviceSocket && deviceSocket.readyState === WebSocket.OPEN
       )
     }));
+
+    // Replay recent backend and device log messages to this page.
+    for (const entry of recentLogs) {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(entry));
+      }
+    }
   }
 
   socket.on("message", data => {
@@ -115,21 +126,40 @@ webSockets.on("connection", (socket, request) => {
         message.type === "rssi_optimization"
       ) {
         broadcast(message);
-        console.log("ESP32 update:", message);
+        logToUi(`ESP32 update: ${JSON.stringify(message)}`, "ESP32");
       }
     } catch {
-      console.log("Ignored unrecognized message from ESP32-S3.");
+      logToUi("Ignored unrecognized message from ESP32-S3.", "ESP32");
     }
   });
 
   socket.on("close", () => {
     if (role === "device" && deviceSocket === socket) {
       deviceSocket = null;
-      console.log("ESP32-S3 disconnected.");
+      logToUi("ESP32-S3 disconnected.");
       broadcast({ type: "device_connection", connected: false });
     }
   });
 });
+
+function logToUi(message, source = "BACKEND") {
+  console.log(message);
+
+  const entry = {
+    type: "log",
+    source,
+    message,
+    timestamp: new Date().toISOString()
+  };
+
+  recentLogs.push(entry);
+
+  if (recentLogs.length > MAX_RECENT_LOGS) {
+    recentLogs.shift();
+  }
+
+  broadcast(entry);
+}
 
 function broadcast(message) {
   const data = JSON.stringify(message);
@@ -153,7 +183,7 @@ function sendText(res, statusCode, text) {
 }
 
 server.listen(PORT, HOST, () => {
-  console.log(`Backend running on port ${PORT}.`);
-  console.log("Open http://127.0.0.1:3000 on this PC.");
-  console.log("Keep page.html beside server.js.");
+  logToUi(`Backend running on port ${PORT}.`);
+  logToUi("Open http://127.0.0.1:3000 on this PC.");
+  logToUi("Keep page.html beside server.js.");
 });

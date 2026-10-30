@@ -44,6 +44,73 @@ using MacAddress = std::array<uint8_t, 6>;
 std::vector<MacAddress> macList;
 String currentMode = "mesh";
 
+#if ROOT_FIRMWARE
+const char* ROUTER_SSID = "Partha's OnePlus";
+const char* ROUTER_PASSWORD = "partha2007";
+
+const char* BACKEND_HOST = "172.25.125.153";  // Replace with your PC's LAN IP
+const uint16_t BACKEND_PORT = 3000;
+const char* DEVICE_TOKEN = "local-device-token-change-me";
+
+WebSocketsClient webSocket;
+
+String uiNodeState[16];
+bool uiSnapshotPending = false;
+
+bool uiConfInProgress = false;
+
+void publishNodeState(uint8_t board, const char* status) {
+  if (board >= 16) return;
+
+  char nodeId[4];
+  snprintf(nodeId, sizeof(nodeId), "%02u", static_cast<unsigned>(board));
+
+  JsonDocument message;
+  message["type"] = "node_status";
+  message["nodeId"] = nodeId;
+  message["status"] = status;
+
+  serializeJson(message, uiNodeState[board]);
+
+  if (webSocket.isConnected()) {
+    webSocket.sendTXT(uiNodeState[board]);
+  }
+}
+
+char wsCommandBuffer[64] = {};
+bool wsCommandPending = false;
+
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+    uiSnapshotPending = true;
+      Serial.println("[WS] Connected to backend");
+      break;
+
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] Disconnected from backend");
+      break;
+
+    case WStype_TEXT:
+  if (length == 4 && memcmp(payload, "conf", 4) == 0) {
+    memcpy(wsCommandBuffer, "conf", 5);
+    wsCommandPending = true;
+    Serial.println("[WS] Queued conf command");
+  } else {
+    Serial.println("[WS] Rejected unsupported command");
+  }
+  break;
+
+    case WStype_ERROR:
+      Serial.println("[WS] Error");
+      break;
+
+    default:
+      break;
+  }
+}
+#endif
+
 //funtions
 bool node_mssg_parser(const String &message, uint32_t from);
 void receivedCallback(uint32_t from, String &message);
@@ -308,6 +375,9 @@ bool restartMesh() {
   mesh.setDebugMsgTypes(ERROR | STARTUP);
   mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT,
             WIFI_AP_STA, TimeSliceProtocol::CHANNEL);
+            #if ROOT_FIRMWARE
+  mesh.stationManual(ROUTER_SSID, ROUTER_PASSWORD);
+#endif
   mesh.setRoot(timeSlicing.isRoot());
   mesh.setContainsRoot(true);
 
@@ -430,6 +500,15 @@ void recoverUnavailableMesh() {
 void setup() {
   Serial.begin(115200);
   beginModeIndicator();
+  #if ROOT_FIRMWARE
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+
+  String wsPath = String("/ws?role=device&token=") + DEVICE_TOKEN;
+  webSocket.begin(BACKEND_HOST, BACKEND_PORT, wsPath.c_str());
+
+  Serial.println("[WS] Connecting to backend...");
+#endif
   calibrationMode.begin();
 #if ROOT_FIRMWARE
   for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board) {
@@ -444,20 +523,96 @@ void setup() {
 }
 
 void loop() {
+#if ROOT_FIRMWARE
+  webSocket.loop();
+
+  if (uiSnapshotPending && webSocket.isConnected()) {
+    uiSnapshotPending = false;
+
+    for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board) {
+      if (uiNodeState[board].length()) {
+        webSocket.sendTXT(uiNodeState[board]);
+      }
+    }
+  }
+
+  if (wsCommandPending) {
+    wsCommandPending = false;
+
+    uint32_t previousRoundId = timeSlicing.roundId();
+    handleSerialCommand(wsCommandBuffer, false);
+
+    if (timeSlicing.roundId() != previousRoundId) {
+      uiConfInProgress = true;
+
+      for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board) {
+        publishNodeState(board, board == 1 ? "root" : "configuring");
+      }
+    }
+  }
+
+  static int previousWifiStatus = -1;
+  static String previousWifiIP = "";
+
+  int currentWifiStatus = WiFi.status();
+  String currentWifiIP = WiFi.localIP().toString();
+
+  if (currentWifiStatus != previousWifiStatus ||
+      currentWifiIP != previousWifiIP) {
+    Serial.printf("[WIFI] status=%d IP=%s\n",
+                  currentWifiStatus, currentWifiIP.c_str());
+
+    previousWifiStatus = currentWifiStatus;
+    previousWifiIP = currentWifiIP;
+  }
+#endif
+
   processSerialInput();
   recoverUnavailableMesh();
+
   if (meshStarted) {
     mesh.update();
   }
+
+  // Must run on both the root and normal nodes.
   runTimeSlicing();
+
+#if ROOT_FIRMWARE
+  auto phase = timeSlicing.phase();
+
+  if (uiConfInProgress &&
+      (phase == TimeSlicingController::Phase::IDLE ||
+       phase == TimeSlicingController::Phase::FAILED)) {
+    for (uint8_t board = 2; board <= TEST_BOARD_COUNT; ++board) {
+      String reportKey = String(board);
+      bool receivedReport = roundReports[reportKey].is<JsonObject>();
+
+      const char* status =
+          phase == TimeSlicingController::Phase::FAILED ? "failed" :
+          receivedReport ? "configured" : "missing";
+
+      publishNodeState(board, status);
+    }
+
+    uiConfInProgress = false;
+  }
+#endif
+
   calibrationMode.update();
+
   auto radioActivity = timeSlicing.radioActivity();
   if (calibrationMode.active() && !calibrationMode.identifying() &&
-      radioActivity == TimeSliceProtocol::RadioActivity::None)
+      radioActivity == TimeSliceProtocol::RadioActivity::None) {
     radioActivity = TimeSliceProtocol::RadioActivity::Waiting;
-  updateModeIndicator(calibrationMode.identifying() ? String("scan") : currentMode,
-      (!meshStarted && timeSlicing.phase() != TimeSlicingController::Phase::MEASURING)
-          || timeSlicing.phase() == TimeSlicingController::Phase::FAILED,
-      mesh.broadcastIndicatorActive(), radioActivity);
+  }
+
+  updateModeIndicator(
+      calibrationMode.identifying() ? String("scan") : currentMode,
+      (!meshStarted &&
+       timeSlicing.phase() != TimeSlicingController::Phase::MEASURING) ||
+          timeSlicing.phase() == TimeSlicingController::Phase::FAILED,
+      mesh.broadcastIndicatorActive(),
+      radioActivity);
+
   delay(1);
 }

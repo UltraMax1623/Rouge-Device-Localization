@@ -680,6 +680,10 @@ class TimeSlicingController {
     sendJson(doc);
   }
   void sendReady() {
+    Serial.printf("[ROUND %u] Sending ready from slot %u to root %u\n",
+              round_,
+              static_cast<unsigned>(selfIndex_ + 1),
+              static_cast<unsigned>(rootNodeId()));
     JsonDocument doc;
     envelope(doc, "conf", "ready", 0);
     doc["ReporterSlot"] = selfIndex_ + 1;
