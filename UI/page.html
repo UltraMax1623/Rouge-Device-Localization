@@ -358,7 +358,7 @@
 
       <aside class="card terminal-card">
         <div class="terminal-header">
-          <h2>Live terminal</h2>
+          <h2>Log</h2>
           <button id="clearTerminalButton" type="button">Clear</button>
         </div>
         <div id="terminalOutput" aria-live="polite"></div>
@@ -378,14 +378,18 @@
       const line = document.createElement("div");
       line.className = `terminal-line ${kind}`;
 
-      const time = new Date().toLocaleTimeString();
-      line.innerHTML =
-        `<span class="terminal-time">[${time}]</span> ` +
-        `<span class="terminal-source">[${source}]</span> `;
+      const time = document.createElement("span");
+      time.className = "terminal-time";
+      time.textContent = `[${new Date().toLocaleTimeString()}] `;
+
+      const sourceLabel = document.createElement("span");
+      sourceLabel.className = "terminal-source";
+      sourceLabel.textContent = `[${source}] `;
 
       const content = document.createElement("span");
       content.textContent = text;
-      line.appendChild(content);
+
+      line.append(time, sourceLabel, content);
       terminalOutput.appendChild(line);
 
       while (terminalOutput.children.length > 200) {
@@ -428,6 +432,11 @@
         return;
       }
 
+      if (data.type === "log") {
+        addTerminalLine(data.source || "BACKEND", data.message || "");
+        return;
+      }
+
       if (data.type === "device_connection") {
         connectionStatus.textContent =
           data.connected ? "S3: online" : "S3: offline";
@@ -443,6 +452,7 @@
       if (data.type === "node_status") {
         updateNodeStatus(data.nodeId, data.status);
         message.textContent = `${data.nodeId}: ${data.status}`;
+
         addTerminalLine(
           "ESP32",
           `Node ${data.nodeId} status: ${data.status}`,
@@ -510,6 +520,7 @@
       } catch (error) {
         message.className = "error";
         message.textContent = error.message || "Could not contact the backend.";
+
         addTerminalLine(
           "BACKEND",
           error.message || "Could not contact the backend.",

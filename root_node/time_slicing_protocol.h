@@ -5,7 +5,7 @@
 #include <string.h>
 
 namespace TimeSliceProtocol {
-constexpr uint8_t CHANNEL = 1;
+constexpr uint8_t CHANNEL = 11;
 constexpr uint32_t GUARD_US = 500000;
 constexpr uint32_t SAMPLE_US = 3000000;
 constexpr uint32_t SLOT_US = SAMPLE_US + 2 * GUARD_US;

@@ -107,7 +107,6 @@ webSockets.on("connection", (socket, request) => {
       )
     }));
 
-    // Replay recent backend and device log messages to this page.
     for (const entry of recentLogs) {
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify(entry));
@@ -120,6 +119,16 @@ webSockets.on("connection", (socket, request) => {
 
     try {
       const message = JSON.parse(data.toString());
+
+      if (message.type === "log") {
+        const text =
+          typeof message.message === "string"
+            ? message.message.slice(0, 500)
+            : "ESP32 sent a log message.";
+
+        logToUi(text, "ESP32");
+        return;
+      }
 
       if (
         message.type === "node_status" ||

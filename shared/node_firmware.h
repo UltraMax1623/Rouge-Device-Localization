@@ -1,6 +1,9 @@
 #pragma once
 
 //imports
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
 #include "esp_mac.h"
@@ -45,10 +48,10 @@ std::vector<MacAddress> macList;
 String currentMode = "mesh";
 
 #if ROOT_FIRMWARE
-const char* ROUTER_SSID = "Partha's OnePlus";
-const char* ROUTER_PASSWORD = "partha2007";
+const char* ROUTER_SSID = "Pavan";
+const char* ROUTER_PASSWORD = "12345678";
 
-const char* BACKEND_HOST = "172.25.125.153";  // Replace with your PC's LAN IP
+const char* BACKEND_HOST = "10.131.226.153";  // Replace with your PC's LAN IP
 const uint16_t BACKEND_PORT = 3000;
 const char* DEVICE_TOKEN = "local-device-token-change-me";
 
@@ -77,6 +80,71 @@ void publishNodeState(uint8_t board, const char* status) {
   }
 }
 
+constexpr uint8_t UI_LOG_QUEUE_SIZE = 20;
+constexpr size_t UI_LOG_MESSAGE_LENGTH = 160;
+
+char uiLogQueue[UI_LOG_QUEUE_SIZE][UI_LOG_MESSAGE_LENGTH];
+uint8_t uiLogHead = 0;
+uint8_t uiLogCount = 0;
+
+void queueDeviceLog(const char* text) {
+  if (!text) return;
+
+  // If full, discard the oldest entry so new errors can still be queued.
+  if (uiLogCount == UI_LOG_QUEUE_SIZE) {
+    uiLogHead = (uiLogHead + 1) % UI_LOG_QUEUE_SIZE;
+    --uiLogCount;
+  }
+
+  uint8_t tail = (uiLogHead + uiLogCount) % UI_LOG_QUEUE_SIZE;
+  strncpy(uiLogQueue[tail], text, UI_LOG_MESSAGE_LENGTH - 1);
+  uiLogQueue[tail][UI_LOG_MESSAGE_LENGTH - 1] = '\0';
+  ++uiLogCount;
+}
+
+void deviceLog(const char* text) {
+  Serial.println(text);
+  queueDeviceLog(text);
+}
+
+void deviceLogf(const char* format, ...) {
+  char line[UI_LOG_MESSAGE_LENGTH];
+
+  va_list args;
+  va_start(args, format);
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+
+  // Remove trailing newline characters so the webpage displays one clean line.
+  size_t length = strlen(line);
+  while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
+    line[--length] = '\0';
+  }
+
+  Serial.println(line);
+  queueDeviceLog(line);
+}
+
+void flushDeviceLogQueue() {
+  if (!webSocket.isConnected()) return;
+
+  // Send only a few each loop so logging doesn't monopolize the loop.
+  for (uint8_t sent = 0; sent < 3 && uiLogCount > 0; ++sent) {
+    JsonDocument message;
+    message["type"] = "log";
+    message["source"] = "ESP32";
+    message["message"] = uiLogQueue[uiLogHead];
+
+    String payload;
+    serializeJson(message, payload);
+
+    if (!webSocket.sendTXT(payload)) return;
+
+    uiLogHead = (uiLogHead + 1) % UI_LOG_QUEUE_SIZE;
+    --uiLogCount;
+  }
+}
+
 char wsCommandBuffer[64] = {};
 bool wsCommandPending = false;
 
@@ -84,31 +152,35 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
     uiSnapshotPending = true;
-      Serial.println("[WS] Connected to backend");
+      deviceLog("[WS] Connected to backend");
       break;
 
     case WStype_DISCONNECTED:
-      Serial.println("[WS] Disconnected from backend");
+      deviceLog("[WS] Disconnected from backend");
       break;
 
     case WStype_TEXT:
   if (length == 4 && memcmp(payload, "conf", 4) == 0) {
     memcpy(wsCommandBuffer, "conf", 5);
     wsCommandPending = true;
-    Serial.println("[WS] Queued conf command");
+    deviceLog("[WS] Queued conf command");
   } else {
-    Serial.println("[WS] Rejected unsupported command");
+    deviceLog("[WS] Rejected unsupported command");
   }
   break;
 
     case WStype_ERROR:
-      Serial.println("[WS] Error");
+      deviceLog("[WS] Error");
       break;
 
     default:
       break;
   }
 }
+#else
+// Normal nodes keep printing locally; only the root has a backend WebSocket.
+#define deviceLog(text) Serial.println(text)
+#define deviceLogf(...) Serial.printf(__VA_ARGS__)
 #endif
 
 //funtions
@@ -158,12 +230,12 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
   // Configuration must be marked root -> nodes.
   if (!doc["RootDirection"].is<int>() ||
       doc["RootDirection"].as<int>() != 1) {
-    Serial.println("Configuration rejected: invalid direction");
+    deviceLog("Configuration rejected: invalid direction");
     return false;
   }
 
   if (!doc["MacList"].is<JsonObject>()) {
-    Serial.println("Configuration rejected: missing/invalid MacList");
+    deviceLog("Configuration rejected: missing/invalid MacList");
     return false;
   }
 
@@ -178,7 +250,7 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
 
     // Keys must be consecutive: "1", "2", ... "N".
     if (!receivedList[key].is<JsonArray>()) {
-      Serial.printf("Configuration rejected: invalid entry %s\n",
+      deviceLogf("Configuration rejected: invalid entry %s\n",
                     key.c_str());
       return false;
     }
@@ -186,7 +258,7 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
     JsonArray bytes = receivedList[key].as<JsonArray>();
 
     if (bytes.size() != 6) {
-      Serial.println("Configuration rejected: MAC needs six bytes");
+      deviceLog("Configuration rejected: MAC needs six bytes");
       return false;
     }
 
@@ -195,7 +267,7 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
     for (size_t j = 0; j < mac.size(); ++j) {
       if (!bytes[j].is<unsigned int>() ||
           bytes[j].as<unsigned int>() > 255) {
-        Serial.println("Configuration rejected: invalid MAC byte");
+        deviceLog("Configuration rejected: invalid MAC byte");
         return false;
       }
 
@@ -204,7 +276,7 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
 
     for (const MacAddress &existing : newMacList) {
       if (existing == mac) {
-        Serial.println("Configuration rejected: duplicate MAC");
+        deviceLog("Configuration rejected: duplicate MAC");
         return false;
       }
     }
@@ -214,7 +286,7 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
 
   // The controller also verifies the root, round ID, and timing parameters.
   if (!timeSlicing.acceptConfiguration(doc, newMacList, from)) {
-    Serial.println("Configuration rejected: root, round, or station list invalid");
+    deviceLog("Configuration rejected: root, round, or station list invalid");
     return false;
   }
 
@@ -222,7 +294,7 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
   macList = std::move(newMacList);
   runTimeSlicing(true);  // Arm only; radio changes happen later in loop().
 
-  Serial.printf("Configuration stored: %u MACs\n",
+  deviceLogf("Configuration stored: %u MACs\n",
                 static_cast<unsigned>(macList.size()));
 
   return true;
@@ -242,7 +314,7 @@ bool node_mssg_parser(const String &message, uint32_t from) {
   DeserializationError error = deserializeJson(doc, message);
 
   if (error) {
-    Serial.printf("JSON error: %s\n", error.c_str());
+    deviceLogf("JSON error: %s\n", error.c_str());
     return false;
   }
 
@@ -250,7 +322,7 @@ bool node_mssg_parser(const String &message, uint32_t from) {
   const char *action = doc["Action"] | "";
 
   if (strcmp(mode, "an") == 0) return calibrationMode.handle(doc, from);
-  Serial.printf("Message from %u\n", from);
+  deviceLogf("Message from %u\n", from);
 
   if (strcmp(mode, "conf") == 0) {
     if (strcmp(action, "prepare") == 0) return handleConfigMode(doc, from);
@@ -268,7 +340,7 @@ bool node_mssg_parser(const String &message, uint32_t from) {
     return handleSniffMode(doc, from);
   }
 
-  Serial.println("Message rejected: missing or unknown Mode");
+  deviceLog("Message rejected: missing or unknown Mode");
   return false;
 }
 
@@ -279,30 +351,30 @@ void receivedCallback(uint32_t from, String &message) {
 void newConnectionCallback(uint32_t nodeId) {
   timeSlicing.topologyChanged();
   calibrationMode.topologyChanged();
-  Serial.printf("Connected: %u\n", nodeId);
+  deviceLogf("Connected: %u\n", nodeId);
 }
 
 void changedConnectionCallback() {
   timeSlicing.topologyChanged();
   calibrationMode.topologyChanged();
-  Serial.println("Mesh connections changed");
+  deviceLog("Mesh connections changed");
 }
 
 void nodeTimeAdjustedCallback(int32_t offset) {
   timeSlicing.timeAdjusted(offset);
-  Serial.printf("Mesh time adjusted: %ld\n", static_cast<long>(offset));
+  deviceLogf("Mesh time adjusted: %ld\n", static_cast<long>(offset));
 }
 
 bool configureSelfMacs() {
 #if !ROOT_FIRMWARE
   if (esp_read_mac(AP_self_mac, ESP_MAC_WIFI_SOFTAP) != ESP_OK) {
-    Serial.println("Cannot read factory AP identity");
+    deviceLog("Cannot read factory AP identity");
     return false;
   }
 #endif
   if (memcmp(AP_self_mac, station_self_mac, 6) == 0 ||
       (AP_self_mac[0] & 1) || (station_self_mac[0] & 1)) {
-    Serial.println("Invalid MACs: use distinct unicast addresses");
+    deviceLog("Invalid MACs: use distinct unicast addresses");
     return false;
   }
 
@@ -310,12 +382,12 @@ bool configureSelfMacs() {
   // custom addresses there as well as in the Wi-Fi driver.
 #if ROOT_FIRMWARE
   if (esp_iface_mac_addr_set(AP_self_mac, ESP_MAC_WIFI_SOFTAP) != ESP_OK) {
-    Serial.println("Custom root AP registration failed");
+    deviceLog("Custom root AP registration failed");
     return false;
   }
 #endif
   if (esp_iface_mac_addr_set(station_self_mac, ESP_MAC_WIFI_STA) != ESP_OK) {
-    Serial.println("Custom interface MAC registration failed");
+    deviceLog("Custom interface MAC registration failed");
     return false;
   }
 
@@ -323,7 +395,7 @@ bool configureSelfMacs() {
   // changing their addresses. Restart without deinitializing the driver.
   WiFi.persistent(false);
   if (!WiFi.mode(WIFI_AP_STA)) {
-    Serial.println("Wi-Fi initialization failed");
+    deviceLog("Wi-Fi initialization failed");
     return false;
   }
 
@@ -338,14 +410,14 @@ bool configureSelfMacs() {
 
   esp_err_t error = esp_wifi_stop();
   if (error != ESP_OK) {
-    Serial.printf("Wi-Fi stop failed: %s\n", esp_err_to_name(error));
+    deviceLogf("Wi-Fi stop failed: %s\n", esp_err_to_name(error));
     return false;
   }
 
 #if ROOT_FIRMWARE
   error = esp_wifi_set_mac(WIFI_IF_AP, AP_self_mac);
   if (error != ESP_OK) {
-    Serial.printf("AP MAC setup failed: %s\n", esp_err_to_name(error));
+    deviceLogf("AP MAC setup failed: %s\n", esp_err_to_name(error));
     return false;
   }
 
@@ -353,13 +425,13 @@ bool configureSelfMacs() {
 
   error = esp_wifi_set_mac(WIFI_IF_STA, station_self_mac);
   if (error != ESP_OK) {
-    Serial.printf("Station MAC setup failed: %s\n", esp_err_to_name(error));
+    deviceLogf("Station MAC setup failed: %s\n", esp_err_to_name(error));
     return false;
   }
 
   error = esp_wifi_start();
   if (error != ESP_OK) {
-    Serial.printf("Wi-Fi start failed: %s\n", esp_err_to_name(error));
+    deviceLogf("Wi-Fi start failed: %s\n", esp_err_to_name(error));
     return false;
   }
   return true;
@@ -368,7 +440,7 @@ bool configureSelfMacs() {
 bool restartMesh() {
   meshStarted = false;
   if (!configureSelfMacs()) {
-    Serial.println("Mesh not started: check custom MAC configuration");
+    deviceLog("Mesh not started: check custom MAC configuration");
     return false;
   }
 
@@ -393,15 +465,15 @@ bool restartMesh() {
       memcmp(actualAP, AP_self_mac, 6) != 0 ||
       memcmp(actualStation, station_self_mac, 6) != 0 ||
       mesh.getNodeId() != painlessmesh::tcp::encodeNodeId(AP_self_mac)) {
-    Serial.println("Custom MAC verification failed; stopping mesh");
+    deviceLog("Custom MAC verification failed; stopping mesh");
     mesh.stopForMeasurement();
     return false;
   }
 
   meshStarted = true;
-  Serial.printf("AP MAC: %s\n", WiFi.softAPmacAddress().c_str());
-  Serial.printf("Station MAC: %s\n", WiFi.macAddress().c_str());
-  Serial.printf("Mesh node ID: %u\n", mesh.getNodeId());
+  deviceLogf("AP MAC: %s\n", WiFi.softAPmacAddress().c_str());
+  deviceLogf("Station MAC: %s\n", WiFi.macAddress().c_str());
+  deviceLogf("Mesh node ID: %u\n", mesh.getNodeId());
   timeSlicing.topologyChanged();
   return true;
 }
@@ -411,7 +483,7 @@ void stopMeshForMeasurement() {
   mesh.stopForMeasurement();
   // AP off, station driver retained for ESP-NOW/sniffing. Avoid repeated
   // teardown/recreation implicated by the field log's STOP_STATE warning.
-  if (!WiFi.mode(WIFI_STA)) Serial.println("[RADIO] Could not switch mesh radio to station mode");
+  if (!WiFi.mode(WIFI_STA)) deviceLog("[RADIO] Could not switch mesh radio to station mode");
 }
 
 void runTimeSlicing(bool armOnly) {
@@ -434,13 +506,13 @@ void handleSerialCommand(const char *line, bool busyWhileReading) {
   }
 #endif
   if (busyWhileReading || userInputBusy()) {
-    Serial.println("[ERROR] Round running: user input disabled until completion");
+    deviceLog("[ERROR] Round running: user input disabled until completion");
     return;
   }
 #if ROOT_FIRMWARE
   const auto command = UserCommand::parse(line);
   if (command.kind == UserCommand::Kind::Invalid) {
-    Serial.println("[ERROR] Use: conf | sniff <12-hex-MAC> [channel 1..13] | an opt <board 2..15> | an diag <board 2..15> [distance 1..5]");
+    deviceLog("[ERROR] Use: conf | sniff <12-hex-MAC> [channel 1..13] | an opt <board 2..15> | an diag <board 2..15> [distance 1..5]");
     return;
   }
   if (command.kind == UserCommand::Kind::Calibrate) {
@@ -452,20 +524,20 @@ void handleSerialCommand(const char *line, bool busyWhileReading) {
     return;
   }
   if (!calibrationMode.networkSynced()) {
-    Serial.println("[ERROR] Wait for all configured nodes to acknowledge the root's A/n");
+    deviceLog("[ERROR] Wait for all configured nodes to acknowledge the root's A/n");
     return;
   }
   if (!timeSlicing.networkReadyForConfiguration(macList.size())) {
-    Serial.printf("[ERROR] Wait for stable mesh: %u/%u reachable peers\n",
+    deviceLogf("[ERROR] Wait for stable mesh: %u/%u reachable peers\n",
         meshStarted ? static_cast<unsigned>(mesh.getNodeList().size()) : 0,
         static_cast<unsigned>(macList.size() - 1));
     return;
   }
   const bool started = command.kind == UserCommand::Kind::Conf
       ? runConfig() : timeSlicing.beginSniff(macList, command.target, command.channel);
-  if (!started) Serial.println("[ERROR] Could not start round; check calibration and mesh");
+  if (!started) deviceLog("[ERROR] Could not start round; check calibration and mesh");
 #else
-  Serial.println("[ERROR] Enter commands on root station 01 only");
+  deviceLog("[ERROR] Enter commands on root station 01 only");
 #endif
 }
 
@@ -480,7 +552,7 @@ void processSerialInput() {
     using Result = UserCommand::LineReader::Result;
     if (result == Result::Busy) handleSerialCommand(reader.text(), true);
     else if (result == Result::Invalid)
-      Serial.println("[ERROR] Invalid command characters or line longer than 63 characters");
+      deviceLog("[ERROR] Invalid command characters or line longer than 63 characters");
     else if (result == Result::Line) handleSerialCommand(reader.text(), false);
   }
 }
@@ -493,7 +565,7 @@ void recoverUnavailableMesh() {
   const uint32_t now = millis();
   if (now - lastMeshRecoveryMs < 5000) return;
   lastMeshRecoveryMs = now;
-  Serial.println("[MESH] Retrying unavailable mesh");
+  deviceLog("[MESH] Retrying unavailable mesh");
   if (restartMesh()) timeSlicing.meshRecovered();
 }
 
@@ -507,7 +579,7 @@ void setup() {
   String wsPath = String("/ws?role=device&token=") + DEVICE_TOKEN;
   webSocket.begin(BACKEND_HOST, BACKEND_PORT, wsPath.c_str());
 
-  Serial.println("[WS] Connecting to backend...");
+  deviceLog("[WS] Connecting to backend...");
 #endif
   calibrationMode.begin();
 #if ROOT_FIRMWARE
@@ -518,13 +590,14 @@ void setup() {
   restartMesh();
   lastMeshRecoveryMs = millis();
 #if ROOT_FIRMWARE
-  Serial.println("[COMMAND] conf | sniff <12-hex-MAC> [channel] | an opt <board> | an diag <board> [distance 1..5] (newline, 115200 baud)");
+  deviceLog("[COMMAND] conf | sniff <12-hex-MAC> [channel] | an opt <board> | an diag <board> [distance 1..5] (newline, 115200 baud)");
 #endif
 }
 
 void loop() {
 #if ROOT_FIRMWARE
   webSocket.loop();
+  flushDeviceLogQueue();
 
   if (uiSnapshotPending && webSocket.isConnected()) {
     uiSnapshotPending = false;
@@ -559,7 +632,7 @@ void loop() {
 
   if (currentWifiStatus != previousWifiStatus ||
       currentWifiIP != previousWifiIP) {
-    Serial.printf("[WIFI] status=%d IP=%s\n",
+    deviceLogf("[WIFI] status=%d IP=%s\n",
                   currentWifiStatus, currentWifiIP.c_str());
 
     previousWifiStatus = currentWifiStatus;
@@ -616,3 +689,4 @@ void loop() {
 
   delay(1);
 }
+
