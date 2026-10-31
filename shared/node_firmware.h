@@ -517,7 +517,6 @@ bool node_mssg_parser(const String &message, uint32_t from)
 
   if (strcmp(mode, "an") == 0)
     return calibrationMode.handle(doc, from);
-  deviceLogf("Message from %u\n", from);
 
   if (strcmp(mode, "conf") == 0)
   {
@@ -559,13 +558,11 @@ void changedConnectionCallback()
 {
   timeSlicing.topologyChanged();
   calibrationMode.topologyChanged();
-  deviceLog("Mesh connections changed");
 }
 
 void nodeTimeAdjustedCallback(int32_t offset)
 {
   timeSlicing.timeAdjusted(offset);
-  deviceLogf("Mesh time adjusted: %ld\n", static_cast<long>(offset));
 }
 
 bool configureSelfMacs()
@@ -660,7 +657,7 @@ bool restartMesh()
     return false;
   }
 
-  mesh.setDebugMsgTypes(ERROR | STARTUP);
+  mesh.setDebugMsgTypes(ERROR);
   channelMigration.bridgeConfigured(false);
   mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT,
             WIFI_AP_STA, meshChannel);
