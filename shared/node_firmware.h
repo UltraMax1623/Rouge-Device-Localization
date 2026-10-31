@@ -1,6 +1,6 @@
 #pragma once
 
-//imports
+// imports
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,6 +9,9 @@
 #include "esp_mac.h"
 #include "painlessMesh.h"
 #include <ArduinoJson.h>
+#if ROOT_FIRMWARE
+#include <Preferences.h>
+#endif
 #include <array>
 #include <vector>
 #include <utility>
@@ -16,19 +19,18 @@
 #include "mode_indicator.h"
 #include "serial_commands.h"
 
+// Defines
 
-//Defines
+#define MESH_PREFIX "MeshNetwork"
+#define MESH_PASSWORD "pavansqaured"
+#define MESH_PORT 5555
 
-#define MESH_PREFIX     "MeshNetwork"
-#define MESH_PASSWORD   "pavansqaured"
-#define MESH_PORT       5555
-
-//global const
-// Fallbacks only: setup loads saved calibration; an opt + save replaces the
-// active globals and distributes/persists the model across the mesh.
+// global const
+//  Fallbacks only: setup loads saved calibration; an opt + save replaces the
+//  active globals and distributes/persists the model across the mesh.
 double A = -60.0;
 double n = 2.0;
-uint8_t target_mac[6] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+uint8_t target_mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
 #if ROOT_FIRMWARE
 uint8_t AP_self_mac[6] = {0x54, 0x44, 0x33, 0x22, 0x11, 0x01};
 #else
@@ -38,7 +40,7 @@ uint8_t AP_self_mac[6] = {};
 uint8_t station_self_mac[6] = {0x44, 0x33, 0x22, 0x11, 0x00, BOARD_NUMBER};
 const uint8_t root_AP_mac[6] = {0x54, 0x44, 0x33, 0x22, 0x11, 0x01};
 bool meshStarted = false;
-int packet_count =  0;
+int packet_count = 0;
 int RSSI = 0;
 Scheduler userScheduler;
 MeasurementMesh mesh;
@@ -46,24 +48,90 @@ JsonDocument meshmess;
 using MacAddress = std::array<uint8_t, 6>;
 std::vector<MacAddress> macList;
 String currentMode = "mesh";
+uint8_t meshChannel = TimeSliceProtocol::CHANNEL;
 
 #if ROOT_FIRMWARE
-const char* ROUTER_SSID = "Pavan";
-const char* ROUTER_PASSWORD = "12345678";
+bool backendServiceAllowed();
+bool backendCommandBusy();
+const char *ROUTER_SSID = "Pavan";
+const char *ROUTER_PASSWORD = "12345678";
 
-const char* BACKEND_HOST = "10.131.226.153";  // Replace with your PC's LAN IP
+const char *BACKEND_HOST = "10.131.226.100"; // Used until a serverIP command saves another address.
 const uint16_t BACKEND_PORT = 3000;
-const char* DEVICE_TOKEN = "local-device-token-change-me";
+const char *DEVICE_TOKEN = "local-device-token-change-me";
 
 WebSocketsClient webSocket;
+String backendHost = BACKEND_HOST;
+void deviceLog(const char *text);
+void deviceLogf(const char *format, ...);
+
+bool validBackendHost(const String &host)
+{
+  IPAddress ip;
+  if (!ip.fromString(host) || ip[0] == 0 || ip[0] == 127 || ip[0] >= 224 ||
+      (ip[0] == 169 && ip[1] == 254))
+    return false;
+  return true;
+}
+
+void beginBackendConnection()
+{
+  const String wsPath = String("/ws?role=device&token=") + DEVICE_TOKEN;
+  webSocket.begin(backendHost.c_str(), BACKEND_PORT, wsPath.c_str());
+  deviceLogf("[WS] Connecting to backend %s:%u", backendHost.c_str(), BACKEND_PORT);
+}
+
+void loadBackendHost()
+{
+  Preferences prefs;
+  if (!prefs.begin("backend", true))
+  {
+    deviceLog("[WS] Could not read saved server IP; using firmware default");
+    return;
+  }
+  const String saved = prefs.getString("host", "");
+  prefs.end();
+  if (saved.length() && validBackendHost(saved)) backendHost = saved;
+  else if (saved.length()) deviceLog("[WS] Invalid saved server IP; using firmware default");
+}
+
+void setBackendHost(const String &host)
+{
+  if (!validBackendHost(host))
+  {
+    deviceLog("[ERROR] Use: serverIP <valid IPv4 address>, for example serverIP 10.31.252.100");
+    return;
+  }
+  Preferences prefs;
+  if (!prefs.begin("backend", false))
+  {
+    deviceLog("[ERROR] Could not open server IP storage; address unchanged");
+    return;
+  }
+  const size_t saved = prefs.putString("host", host);
+  prefs.end();
+  if (!saved)
+  {
+    deviceLog("[ERROR] Could not save server IP; address unchanged");
+    return;
+  }
+  backendHost = host;
+  webSocket.disconnect();
+  beginBackendConnection();
+  deviceLogf("[WS] Server IP saved: %s (persists after reboot)", backendHost.c_str());
+}
 
 String uiNodeState[16];
+bool uiNodeStatePending[16] = {};
 bool uiSnapshotPending = false;
+bool uiChannelPending = true;
 
 bool uiConfInProgress = false;
 
-void publishNodeState(uint8_t board, const char* status) {
-  if (board >= 16) return;
+void publishNodeState(uint8_t board, const char *status)
+{
+  if (board >= 16)
+    return;
 
   char nodeId[4];
   snprintf(nodeId, sizeof(nodeId), "%02u", static_cast<unsigned>(board));
@@ -75,9 +143,9 @@ void publishNodeState(uint8_t board, const char* status) {
 
   serializeJson(message, uiNodeState[board]);
 
-  if (webSocket.isConnected()) {
-    webSocket.sendTXT(uiNodeState[board]);
-  }
+  // Never send from a callback or command path. The guarded backend service
+  // will transmit the latest state once measurement timing permits it.
+  uiNodeStatePending[board] = true;
 }
 
 constexpr uint8_t UI_LOG_QUEUE_SIZE = 20;
@@ -87,11 +155,14 @@ char uiLogQueue[UI_LOG_QUEUE_SIZE][UI_LOG_MESSAGE_LENGTH];
 uint8_t uiLogHead = 0;
 uint8_t uiLogCount = 0;
 
-void queueDeviceLog(const char* text) {
-  if (!text) return;
+void queueDeviceLog(const char *text)
+{
+  if (!text)
+    return;
 
   // If full, discard the oldest entry so new errors can still be queued.
-  if (uiLogCount == UI_LOG_QUEUE_SIZE) {
+  if (uiLogCount == UI_LOG_QUEUE_SIZE)
+  {
     uiLogHead = (uiLogHead + 1) % UI_LOG_QUEUE_SIZE;
     --uiLogCount;
   }
@@ -102,12 +173,14 @@ void queueDeviceLog(const char* text) {
   ++uiLogCount;
 }
 
-void deviceLog(const char* text) {
+void deviceLog(const char *text)
+{
   Serial.println(text);
   queueDeviceLog(text);
 }
 
-void deviceLogf(const char* format, ...) {
+void deviceLogf(const char *format, ...)
+{
   char line[UI_LOG_MESSAGE_LENGTH];
 
   va_list args;
@@ -117,7 +190,8 @@ void deviceLogf(const char* format, ...) {
 
   // Remove trailing newline characters so the webpage displays one clean line.
   size_t length = strlen(line);
-  while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
+  while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+  {
     line[--length] = '\0';
   }
 
@@ -125,11 +199,14 @@ void deviceLogf(const char* format, ...) {
   queueDeviceLog(line);
 }
 
-void flushDeviceLogQueue() {
-  if (!webSocket.isConnected()) return;
+void flushDeviceLogQueue()
+{
+  if (!backendServiceAllowed() || !webSocket.isConnected())
+    return;
 
-  // Send only a few each loop so logging doesn't monopolize the loop.
-  for (uint8_t sent = 0; sent < 3 && uiLogCount > 0; ++sent) {
+  // One frame per service call; a frame count is not a network time bound.
+  for (uint8_t sent = 0; sent < 1 && uiLogCount > 0; ++sent)
+  {
     JsonDocument message;
     message["type"] = "log";
     message["source"] = "ESP32";
@@ -138,7 +215,8 @@ void flushDeviceLogQueue() {
     String payload;
     serializeJson(message, payload);
 
-    if (!webSocket.sendTXT(payload)) return;
+    if (!webSocket.sendTXT(payload))
+      return;
 
     uiLogHead = (uiLogHead + 1) % UI_LOG_QUEUE_SIZE;
     --uiLogCount;
@@ -148,33 +226,44 @@ void flushDeviceLogQueue() {
 char wsCommandBuffer[64] = {};
 bool wsCommandPending = false;
 
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED:
+void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
+{
+  switch (type)
+  {
+  case WStype_CONNECTED:
     uiSnapshotPending = true;
-      deviceLog("[WS] Connected to backend");
-      break;
+    uiChannelPending = true;
+    deviceLog("[WS] Connected to backend");
+    break;
 
-    case WStype_DISCONNECTED:
-      deviceLog("[WS] Disconnected from backend");
-      break;
+  case WStype_DISCONNECTED:
+    deviceLog("[WS] Disconnected from backend");
+    break;
 
-    case WStype_TEXT:
-  if (length == 4 && memcmp(payload, "conf", 4) == 0) {
-    memcpy(wsCommandBuffer, "conf", 5);
-    wsCommandPending = true;
-    deviceLog("[WS] Queued conf command");
-  } else {
-    deviceLog("[WS] Rejected unsupported command");
-  }
-  break;
+  case WStype_TEXT:
+    if (length == 4 && memcmp(payload, "conf", 4) == 0)
+    {
+      if (backendCommandBusy() || wsCommandPending)
+      {
+        deviceLog("[WS] Rejected conf: operation running or command already pending");
+        break;
+      }
+      memcpy(wsCommandBuffer, "conf", 5);
+      wsCommandPending = true;
+      deviceLog("[WS] Queued conf command");
+    }
+    else
+    {
+      deviceLog("[WS] Rejected unsupported command");
+    }
+    break;
 
-    case WStype_ERROR:
-      deviceLog("[WS] Error");
-      break;
+  case WStype_ERROR:
+    deviceLog("[WS] Error");
+    break;
 
-    default:
-      break;
+  default:
+    break;
   }
 }
 #else
@@ -183,7 +272,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 #define deviceLogf(...) Serial.printf(__VA_ARGS__)
 #endif
 
-//funtions
+// funtions
 bool node_mssg_parser(const String &message, uint32_t from);
 void receivedCallback(uint32_t from, String &message);
 void newConnectionCallback(uint32_t nodeId);
@@ -195,7 +284,8 @@ void stopMeshForMeasurement();
 void runTimeSlicing(bool armOnly = false);
 
 TimeSlicingController timeSlicing(mesh, AP_self_mac, station_self_mac,
-    root_AP_mac, meshStarted, currentMode, stopMeshForMeasurement, restartMesh);
+                                  root_AP_mac, meshStarted, currentMode, meshChannel,
+                                  stopMeshForMeasurement, restartMesh);
 // One-based JSON keys follow macList order. Counts remain zero-based in C++.
 JsonDocument &slotRSSI = timeSlicing.slotRSSI;
 std::vector<uint32_t> &slotPacketCounts = timeSlicing.slotPacketCounts;
@@ -212,29 +302,122 @@ uint8_t &true_channel = timeSlicing.discoveredChannel;
 
 #include "calibration_mode.h"
 CalibrationMode calibrationMode;
+#include "mesh_channel_migration.h"
+MeshChannelMigration channelMigration;
+
+#if ROOT_FIRMWARE
+bool backendCommandBusy() { return timeSlicing.busy() || calibrationMode.active() || channelMigration.busy(); }
+
+bool backendServiceAllowed()
+{
+  // Short-circuit before even asking the Wi-Fi driver for network details
+  // while its radio belongs to the measurement controller.
+  if (!RoundSafety::backendAllowed(timeSlicing.phase(), meshStarted, true,
+                                   calibrationMode.active()) || channelMigration.busy())
+    return false;
+  return WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0);
+}
+
+void serviceBackend()
+{
+  static bool paused = false;
+  static uint32_t lastServiceMs = 0;
+  if (!backendServiceAllowed())
+  {
+    if (!paused)
+      queueDeviceLog("[WS] Network service paused; updates buffered");
+    paused = true;
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - lastServiceMs < 25)
+    return;
+  lastServiceMs = now;
+  const uint32_t started = millis();
+  if (paused)
+  {
+    // Discard traffic left on the old connection while input was disabled.
+    // Closing may block too, so do it only now, after the critical phase.
+    wsCommandPending = false;
+    webSocket.disconnect();
+    deviceLog("[WS] Resuming with a fresh connection; old buffered commands discarded");
+    paused = false;
+  }
+  // Only here may the library reconnect, receive or write network frames.
+  webSocket.loop();
+  if (webSocket.isConnected())
+  {
+    static uint8_t lastReportedMeshChannel = 0;
+    static uint8_t lastReportedRouterChannel = 0;
+    if (uiChannelPending || lastReportedMeshChannel != meshChannel ||
+        lastReportedRouterChannel != channelMigration.routerChannel())
+    {
+      JsonDocument status;
+      status["type"] = "mesh_channel";
+      status["meshChannel"] = meshChannel;
+      status["routerChannel"] = channelMigration.routerChannel();
+      String payload;
+      serializeJson(status, payload);
+      if (webSocket.sendTXT(payload))
+      {
+        uiChannelPending = false;
+        lastReportedMeshChannel = meshChannel;
+        lastReportedRouterChannel = channelMigration.routerChannel();
+      }
+    }
+    if (uiSnapshotPending)
+    {
+      uiSnapshotPending = false;
+      for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
+        uiNodeStatePending[board] = uiNodeState[board].length() != 0;
+    }
+    bool sentState = false;
+    for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
+    {
+      if (!uiNodeStatePending[board])
+        continue;
+      if (webSocket.sendTXT(uiNodeState[board]))
+        uiNodeStatePending[board] = false;
+      sentState = true;
+      break;
+    }
+    if (!sentState)
+      flushDeviceLogQueue();
+  }
+  const uint32_t elapsed = millis() - started;
+  if (elapsed > 50)
+    deviceLogf("[TIMING] Backend service took %u ms (outside critical radio phases)", elapsed);
+}
+#endif
 
 // Root command entry point; normal nodes receive configuration over mesh.
-bool runConfig() {
+bool runConfig()
+{
   return timeSlicing.beginConfiguration(macList);
 }
 
-bool handleConfigMode(JsonDocument &doc, uint32_t from){
-  if (!calibrationMode.allowConfiguration(doc)) return false;
+bool handleConfigMode(JsonDocument &doc, uint32_t from)
+{
+  if (!calibrationMode.allowConfiguration(doc))
+    return false;
   // Other modes will be handled separately later.
   const char *mode = doc["Mode"] | "";
 
-  if (strcmp(mode, "conf") != 0) {
+  if (strcmp(mode, "conf") != 0)
+  {
     return false;
   }
 
   // Configuration must be marked root -> nodes.
   if (!doc["RootDirection"].is<int>() ||
-      doc["RootDirection"].as<int>() != 1) {
+      doc["RootDirection"].as<int>() != 1)
+  {
     deviceLog("Configuration rejected: invalid direction");
     return false;
   }
 
-  if (!doc["MacList"].is<JsonObject>()) {
+  if (!doc["MacList"].is<JsonObject>())
+  {
     deviceLog("Configuration rejected: missing/invalid MacList");
     return false;
   }
@@ -245,28 +428,33 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
   std::vector<MacAddress> newMacList;
   newMacList.reserve(receivedList.size());
 
-  for (size_t i = 0; i < receivedList.size(); ++i) {
+  for (size_t i = 0; i < receivedList.size(); ++i)
+  {
     String key = String(static_cast<unsigned long>(i + 1));
 
     // Keys must be consecutive: "1", "2", ... "N".
-    if (!receivedList[key].is<JsonArray>()) {
+    if (!receivedList[key].is<JsonArray>())
+    {
       deviceLogf("Configuration rejected: invalid entry %s\n",
-                    key.c_str());
+                 key.c_str());
       return false;
     }
 
     JsonArray bytes = receivedList[key].as<JsonArray>();
 
-    if (bytes.size() != 6) {
+    if (bytes.size() != 6)
+    {
       deviceLog("Configuration rejected: MAC needs six bytes");
       return false;
     }
 
     MacAddress mac{};
 
-    for (size_t j = 0; j < mac.size(); ++j) {
+    for (size_t j = 0; j < mac.size(); ++j)
+    {
       if (!bytes[j].is<unsigned int>() ||
-          bytes[j].as<unsigned int>() > 255) {
+          bytes[j].as<unsigned int>() > 255)
+      {
         deviceLog("Configuration rejected: invalid MAC byte");
         return false;
       }
@@ -274,8 +462,10 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
       mac[j] = static_cast<uint8_t>(bytes[j].as<unsigned int>());
     }
 
-    for (const MacAddress &existing : newMacList) {
-      if (existing == mac) {
+    for (const MacAddress &existing : newMacList)
+    {
+      if (existing == mac)
+      {
         deviceLog("Configuration rejected: duplicate MAC");
         return false;
       }
@@ -285,35 +475,39 @@ bool handleConfigMode(JsonDocument &doc, uint32_t from){
   }
 
   // The controller also verifies the root, round ID, and timing parameters.
-  if (!timeSlicing.acceptConfiguration(doc, newMacList, from)) {
+  if (!timeSlicing.acceptConfiguration(doc, newMacList, from))
+  {
     deviceLog("Configuration rejected: root, round, or station list invalid");
     return false;
   }
 
   // Apply only after every entry has passed validation.
   macList = std::move(newMacList);
-  runTimeSlicing(true);  // Arm only; radio changes happen later in loop().
+  runTimeSlicing(true); // Arm only; radio changes happen later in loop().
 
   deviceLogf("Configuration stored: %u MACs\n",
-                static_cast<unsigned>(macList.size()));
+             static_cast<unsigned>(macList.size()));
 
   return true;
 }
-bool handleMeshMode(JsonDocument &doc) {
-  // TODO: Implement mesh mode later.
-  return false;
+bool handleMeshMode(JsonDocument &doc, uint32_t from)
+{
+  return channelMigration.handle(doc, from);
 }
 
-bool handleSniffMode(JsonDocument &doc, uint32_t from) {
+bool handleSniffMode(JsonDocument &doc, uint32_t from)
+{
   return timeSlicing.handleControl(doc, from);
 }
 
-bool node_mssg_parser(const String &message, uint32_t from) {
+bool node_mssg_parser(const String &message, uint32_t from)
+{
   JsonDocument doc;
 
   DeserializationError error = deserializeJson(doc, message);
 
-  if (error) {
+  if (error)
+  {
     deviceLogf("JSON error: %s\n", error.c_str());
     return false;
   }
@@ -321,22 +515,27 @@ bool node_mssg_parser(const String &message, uint32_t from) {
   const char *mode = doc["Mode"] | "";
   const char *action = doc["Action"] | "";
 
-  if (strcmp(mode, "an") == 0) return calibrationMode.handle(doc, from);
+  if (strcmp(mode, "an") == 0)
+    return calibrationMode.handle(doc, from);
   deviceLogf("Message from %u\n", from);
 
-  if (strcmp(mode, "conf") == 0) {
-    if (strcmp(action, "prepare") == 0) return handleConfigMode(doc, from);
+  if (strcmp(mode, "conf") == 0)
+  {
+    if (strcmp(action, "prepare") == 0)
+      return handleConfigMode(doc, from);
     return timeSlicing.handleControl(doc, from);
   }
 
-  if (strcmp(mode, "mesh") == 0) {
+  if (strcmp(mode, "mesh") == 0)
+  {
     if (strcmp(action, "rssi_report") == 0 || strcmp(action, "sniff_report") == 0 ||
         strcmp(action, "report_ack") == 0)
       return timeSlicing.handleControl(doc, from);
-    return handleMeshMode(doc);
+    return handleMeshMode(doc, from);
   }
 
-  if (strcmp(mode, "sniff") == 0) {
+  if (strcmp(mode, "sniff") == 0)
+  {
     return handleSniffMode(doc, from);
   }
 
@@ -344,36 +543,43 @@ bool node_mssg_parser(const String &message, uint32_t from) {
   return false;
 }
 
-void receivedCallback(uint32_t from, String &message) {
+void receivedCallback(uint32_t from, String &message)
+{
   node_mssg_parser(message, from);
 }
 
-void newConnectionCallback(uint32_t nodeId) {
+void newConnectionCallback(uint32_t nodeId)
+{
   timeSlicing.topologyChanged();
   calibrationMode.topologyChanged();
   deviceLogf("Connected: %u\n", nodeId);
 }
 
-void changedConnectionCallback() {
+void changedConnectionCallback()
+{
   timeSlicing.topologyChanged();
   calibrationMode.topologyChanged();
   deviceLog("Mesh connections changed");
 }
 
-void nodeTimeAdjustedCallback(int32_t offset) {
+void nodeTimeAdjustedCallback(int32_t offset)
+{
   timeSlicing.timeAdjusted(offset);
   deviceLogf("Mesh time adjusted: %ld\n", static_cast<long>(offset));
 }
 
-bool configureSelfMacs() {
+bool configureSelfMacs()
+{
 #if !ROOT_FIRMWARE
-  if (esp_read_mac(AP_self_mac, ESP_MAC_WIFI_SOFTAP) != ESP_OK) {
+  if (esp_read_mac(AP_self_mac, ESP_MAC_WIFI_SOFTAP) != ESP_OK)
+  {
     deviceLog("Cannot read factory AP identity");
     return false;
   }
 #endif
   if (memcmp(AP_self_mac, station_self_mac, 6) == 0 ||
-      (AP_self_mac[0] & 1) || (station_self_mac[0] & 1)) {
+      (AP_self_mac[0] & 1) || (station_self_mac[0] & 1))
+  {
     deviceLog("Invalid MACs: use distinct unicast addresses");
     return false;
   }
@@ -381,12 +587,14 @@ bool configureSelfMacs() {
   // Core 3.x painlessMesh derives its ID using esp_read_mac(). Register the
   // custom addresses there as well as in the Wi-Fi driver.
 #if ROOT_FIRMWARE
-  if (esp_iface_mac_addr_set(AP_self_mac, ESP_MAC_WIFI_SOFTAP) != ESP_OK) {
+  if (esp_iface_mac_addr_set(AP_self_mac, ESP_MAC_WIFI_SOFTAP) != ESP_OK)
+  {
     deviceLog("Custom root AP registration failed");
     return false;
   }
 #endif
-  if (esp_iface_mac_addr_set(station_self_mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+  if (esp_iface_mac_addr_set(station_self_mac, ESP_MAC_WIFI_STA) != ESP_OK)
+  {
     deviceLog("Custom interface MAC registration failed");
     return false;
   }
@@ -394,7 +602,8 @@ bool configureSelfMacs() {
   // Initialize the Arduino Wi-Fi driver, then stop the interfaces before
   // changing their addresses. Restart without deinitializing the driver.
   WiFi.persistent(false);
-  if (!WiFi.mode(WIFI_AP_STA)) {
+  if (!WiFi.mode(WIFI_AP_STA))
+  {
     deviceLog("Wi-Fi initialization failed");
     return false;
   }
@@ -406,17 +615,20 @@ bool configureSelfMacs() {
   if (esp_wifi_get_mac(WIFI_IF_AP, currentAP) == ESP_OK &&
       esp_wifi_get_mac(WIFI_IF_STA, currentStation) == ESP_OK &&
       memcmp(currentAP, AP_self_mac, 6) == 0 &&
-      memcmp(currentStation, station_self_mac, 6) == 0) return true;
+      memcmp(currentStation, station_self_mac, 6) == 0)
+    return true;
 
   esp_err_t error = esp_wifi_stop();
-  if (error != ESP_OK) {
+  if (error != ESP_OK)
+  {
     deviceLogf("Wi-Fi stop failed: %s\n", esp_err_to_name(error));
     return false;
   }
 
 #if ROOT_FIRMWARE
   error = esp_wifi_set_mac(WIFI_IF_AP, AP_self_mac);
-  if (error != ESP_OK) {
+  if (error != ESP_OK)
+  {
     deviceLogf("AP MAC setup failed: %s\n", esp_err_to_name(error));
     return false;
   }
@@ -424,31 +636,40 @@ bool configureSelfMacs() {
 #endif
 
   error = esp_wifi_set_mac(WIFI_IF_STA, station_self_mac);
-  if (error != ESP_OK) {
+  if (error != ESP_OK)
+  {
     deviceLogf("Station MAC setup failed: %s\n", esp_err_to_name(error));
     return false;
   }
 
   error = esp_wifi_start();
-  if (error != ESP_OK) {
+  if (error != ESP_OK)
+  {
     deviceLogf("Wi-Fi start failed: %s\n", esp_err_to_name(error));
     return false;
   }
   return true;
 }
 
-bool restartMesh() {
+bool restartMesh()
+{
   meshStarted = false;
-  if (!configureSelfMacs()) {
+  if (!configureSelfMacs())
+  {
     deviceLog("Mesh not started: check custom MAC configuration");
     return false;
   }
 
   mesh.setDebugMsgTypes(ERROR | STARTUP);
+  channelMigration.bridgeConfigured(false);
   mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT,
-            WIFI_AP_STA, TimeSliceProtocol::CHANNEL);
-            #if ROOT_FIRMWARE
-  mesh.stationManual(ROUTER_SSID, ROUTER_PASSWORD);
+            WIFI_AP_STA, meshChannel);
+#if ROOT_FIRMWARE
+  if (channelMigration.routerChannel() == meshChannel)
+  {
+    mesh.stationManual(ROUTER_SSID, ROUTER_PASSWORD);
+    channelMigration.bridgeConfigured(true);
+  }
 #endif
   mesh.setRoot(timeSlicing.isRoot());
   mesh.setContainsRoot(true);
@@ -464,13 +685,15 @@ bool restartMesh() {
       esp_wifi_get_mac(WIFI_IF_STA, actualStation) != ESP_OK ||
       memcmp(actualAP, AP_self_mac, 6) != 0 ||
       memcmp(actualStation, station_self_mac, 6) != 0 ||
-      mesh.getNodeId() != painlessmesh::tcp::encodeNodeId(AP_self_mac)) {
+      mesh.getNodeId() != painlessmesh::tcp::encodeNodeId(AP_self_mac))
+  {
     deviceLog("Custom MAC verification failed; stopping mesh");
     mesh.stopForMeasurement();
     return false;
   }
 
   meshStarted = true;
+  deviceLogf("[CHANNEL] Mesh active on channel %u", meshChannel);
   deviceLogf("AP MAC: %s\n", WiFi.softAPmacAddress().c_str());
   deviceLogf("Station MAC: %s\n", WiFi.macAddress().c_str());
   deviceLogf("Mesh node ID: %u\n", mesh.getNodeId());
@@ -478,64 +701,92 @@ bool restartMesh() {
   return true;
 }
 
-void stopMeshForMeasurement() {
+void stopMeshForMeasurement()
+{
   meshStarted = false;
   mesh.stopForMeasurement();
   // AP off, station driver retained for ESP-NOW/sniffing. Avoid repeated
   // teardown/recreation implicated by the field log's STOP_STATE warning.
-  if (!WiFi.mode(WIFI_STA)) deviceLog("[RADIO] Could not switch mesh radio to station mode");
+  if (!WiFi.mode(WIFI_STA))
+    deviceLog("[RADIO] Could not switch mesh radio to station mode");
 }
 
-void runTimeSlicing(bool armOnly) {
-  if (armOnly) {
+void runTimeSlicing(bool armOnly)
+{
+  if (armOnly)
+  {
     timeSlicing.armConfiguredRound();
-  } else {
+  }
+  else
+  {
     timeSlicing.update();
   }
 }
 
-bool userInputBusy() {
-  return timeSlicing.busy() || timeSlicing.phase() == TimeSlicingController::Phase::FAILED;
+bool userInputBusy()
+{
+  return timeSlicing.busy() || channelMigration.busy() ||
+         timeSlicing.phase() == TimeSlicingController::Phase::FAILED;
 }
 
-void handleSerialCommand(const char *line, bool busyWhileReading) {
+void handleSerialCommand(const char *line, bool busyWhileReading)
+{
 #if ROOT_FIRMWARE
-  if (calibrationMode.localSession()) {
+  if (calibrationMode.localSession())
+  {
     calibrationMode.command(line);
     return;
   }
 #endif
-  if (busyWhileReading || userInputBusy()) {
+  if (busyWhileReading || userInputBusy())
+  {
     deviceLog("[ERROR] Round running: user input disabled until completion");
     return;
   }
 #if ROOT_FIRMWARE
-  const auto command = UserCommand::parse(line);
-  if (command.kind == UserCommand::Kind::Invalid) {
-    deviceLog("[ERROR] Use: conf | sniff <12-hex-MAC> [channel 1..13] | an opt <board 2..15> | an diag <board 2..15> [distance 1..5]");
+  while (*line == ' ' || *line == '\t') ++line;
+  if (strncmp(line, "serverIP", 8) == 0 &&
+      (line[8] == '\0' || line[8] == ' ' || line[8] == '\t'))
+  {
+    String address = line + 8;
+    address.trim();
+    if (address.length()) setBackendHost(address);
+    else deviceLogf("[WS] Current server IP: %s:%u", backendHost.c_str(), BACKEND_PORT);
     return;
   }
-  if (command.kind == UserCommand::Kind::Calibrate) {
+  const auto command = UserCommand::parse(line);
+  if (command.kind == UserCommand::Kind::Invalid)
+  {
+    deviceLog("[ERROR] Use: conf | sniff <12-hex-MAC> [channel 1..13] | an opt <board 2..15> | an diag <board 2..15> [distance 1..5] | serverIP [IPv4]");
+    return;
+  }
+  if (command.kind == UserCommand::Kind::Calibrate)
+  {
     calibrationMode.start(command.board);
     return;
   }
-  if (command.kind == UserCommand::Kind::Diagnostic) {
+  if (command.kind == UserCommand::Kind::Diagnostic)
+  {
     calibrationMode.start(command.board, true, command.distance);
     return;
   }
-  if (!calibrationMode.networkSynced()) {
+  if (!calibrationMode.networkSynced())
+  {
     deviceLog("[ERROR] Wait for all configured nodes to acknowledge the root's A/n");
     return;
   }
-  if (!timeSlicing.networkReadyForConfiguration(macList.size())) {
+  if (!timeSlicing.networkReadyForConfiguration(macList.size()))
+  {
     deviceLogf("[ERROR] Wait for stable mesh: %u/%u reachable peers\n",
-        meshStarted ? static_cast<unsigned>(mesh.getNodeList().size()) : 0,
-        static_cast<unsigned>(macList.size() - 1));
+               meshStarted ? static_cast<unsigned>(mesh.getNodeList().size()) : 0,
+               static_cast<unsigned>(macList.size() - 1));
     return;
   }
   const bool started = command.kind == UserCommand::Kind::Conf
-      ? runConfig() : timeSlicing.beginSniff(macList, command.target, command.channel);
-  if (!started) deviceLog("[ERROR] Could not start round; check calibration and mesh");
+                           ? runConfig()
+                           : timeSlicing.beginSniff(macList, command.target, command.channel);
+  if (!started)
+    deviceLog("[ERROR] Could not start round; check calibration and mesh");
 #else
   deviceLog("[ERROR] Enter commands on root station 01 only");
 #endif
@@ -543,150 +794,150 @@ void handleSerialCommand(const char *line, bool busyWhileReading) {
 
 // Bounded, nonblocking input. Busy input is rejected, never saved for later.
 // Remember busy state even if a partial line finishes after the round ends.
-void processSerialInput() {
+void processSerialInput()
+{
   static UserCommand::LineReader reader;
   unsigned budget = 64;
-  while (budget-- && Serial.available() > 0) {
+  while (budget-- && Serial.available() > 0)
+  {
     const auto result = reader.push(static_cast<char>(Serial.read()),
-        !calibrationMode.localSession() && userInputBusy());
+                                    !calibrationMode.localSession() && userInputBusy());
     using Result = UserCommand::LineReader::Result;
-    if (result == Result::Busy) handleSerialCommand(reader.text(), true);
+    if (result == Result::Busy)
+      handleSerialCommand(reader.text(), true);
     else if (result == Result::Invalid)
       deviceLog("[ERROR] Invalid command characters or line longer than 63 characters");
-    else if (result == Result::Line) handleSerialCommand(reader.text(), false);
+    else if (result == Result::Line)
+      handleSerialCommand(reader.text(), false);
   }
 }
 
 uint32_t lastMeshRecoveryMs = 0;
-void recoverUnavailableMesh() {
+void recoverUnavailableMesh()
+{
   const auto phase = timeSlicing.phase();
   if (meshStarted || (phase != TimeSlicingController::Phase::IDLE &&
-                      phase != TimeSlicingController::Phase::FAILED)) return;
+                      phase != TimeSlicingController::Phase::FAILED) ||
+      channelMigration.busy())
+    return;
   const uint32_t now = millis();
-  if (now - lastMeshRecoveryMs < 5000) return;
+  if (now - lastMeshRecoveryMs < 5000)
+    return;
   lastMeshRecoveryMs = now;
   deviceLog("[MESH] Retrying unavailable mesh");
-  if (restartMesh()) timeSlicing.meshRecovered();
+  if (restartMesh())
+    timeSlicing.meshRecovered();
 }
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   beginModeIndicator();
-  #if ROOT_FIRMWARE
+#if ROOT_FIRMWARE
+  // Register custom MACs before a Wi-Fi scan initializes the driver.
+  if (configureSelfMacs()) channelMigration.discoverAtBoot();
+#endif
+#if ROOT_FIRMWARE
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
-
-  String wsPath = String("/ws?role=device&token=") + DEVICE_TOKEN;
-  webSocket.begin(BACKEND_HOST, BACKEND_PORT, wsPath.c_str());
-
-  deviceLog("[WS] Connecting to backend...");
+  loadBackendHost();
+  beginBackendConnection();
 #endif
   calibrationMode.begin();
 #if ROOT_FIRMWARE
-  for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board) {
+  for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
+  {
     macList.push_back(MacAddress{0x44, 0x33, 0x22, 0x11, 0x00, board});
   }
 #endif
   restartMesh();
   lastMeshRecoveryMs = millis();
 #if ROOT_FIRMWARE
-  deviceLog("[COMMAND] conf | sniff <12-hex-MAC> [channel] | an opt <board> | an diag <board> [distance 1..5] (newline, 115200 baud)");
+  deviceLog("[COMMAND] conf | sniff <12-hex-MAC> [channel] | an opt <board> | an diag <board> [distance 1..5] | serverIP [IPv4] (newline, 115200 baud)");
 #endif
 }
 
-void loop() {
-#if ROOT_FIRMWARE
-  webSocket.loop();
-  flushDeviceLogQueue();
-
-  if (uiSnapshotPending && webSocket.isConnected()) {
-    uiSnapshotPending = false;
-
-    for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board) {
-      if (uiNodeState[board].length()) {
-        webSocket.sendTXT(uiNodeState[board]);
-      }
-    }
+void loop()
+{
+  // The controller runs before any optional operation, and immediately after
+  // mesh callbacks (which can arm a round or deliver its final report).
+  runTimeSlicing();
+  if (meshStarted)
+  {
+    const uint32_t meshStartedMs = millis();
+    mesh.update();
+    const uint32_t meshElapsedMs = millis() - meshStartedMs;
+    runTimeSlicing();
+    if (meshElapsedMs > 50 && !timeSlicing.timingCritical())
+      deviceLogf("[TIMING] Mesh update took %u ms", meshElapsedMs);
   }
 
-  if (wsCommandPending) {
-    wsCommandPending = false;
-
-    uint32_t previousRoundId = timeSlicing.roundId();
-    handleSerialCommand(wsCommandBuffer, false);
-
-    if (timeSlicing.roundId() != previousRoundId) {
-      uiConfInProgress = true;
-
-      for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board) {
-        publishNodeState(board, board == 1 ? "root" : "configuring");
-      }
-    }
-  }
-
-  static int previousWifiStatus = -1;
-  static String previousWifiIP = "";
-
-  int currentWifiStatus = WiFi.status();
-  String currentWifiIP = WiFi.localIP().toString();
-
-  if (currentWifiStatus != previousWifiStatus ||
-      currentWifiIP != previousWifiIP) {
-    deviceLogf("[WIFI] status=%d IP=%s\n",
-                  currentWifiStatus, currentWifiIP.c_str());
-
-    previousWifiStatus = currentWifiStatus;
-    previousWifiIP = currentWifiIP;
-  }
-#endif
+  if (!timeSlicing.timingCritical()) channelMigration.update();
 
   processSerialInput();
-  recoverUnavailableMesh();
-
-  if (meshStarted) {
-    mesh.update();
+  runTimeSlicing();
+  if (!timeSlicing.timingCritical())
+  {
+    recoverUnavailableMesh();
+    calibrationMode.update();
   }
-
-  // Must run on both the root and normal nodes.
   runTimeSlicing();
 
 #if ROOT_FIRMWARE
-  auto phase = timeSlicing.phase();
-
-  if (uiConfInProgress &&
-      (phase == TimeSlicingController::Phase::IDLE ||
-       phase == TimeSlicingController::Phase::FAILED)) {
-    for (uint8_t board = 2; board <= TEST_BOARD_COUNT; ++board) {
-      String reportKey = String(board);
-      bool receivedReport = roundReports[reportKey].is<JsonObject>();
-
-      const char* status =
-          phase == TimeSlicingController::Phase::FAILED ? "failed" :
-          receivedReport ? "configured" : "missing";
-
-      publishNodeState(board, status);
+  if (wsCommandPending)
+  {
+    wsCommandPending = false;
+    const uint32_t previousRoundId = timeSlicing.roundId();
+    handleSerialCommand(wsCommandBuffer, false);
+    if (timeSlicing.roundId() != previousRoundId)
+    {
+      uiConfInProgress = true;
+      for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
+        publishNodeState(board, board == 1 ? "root" : "configuring");
     }
+  }
 
+  const auto phase = timeSlicing.phase();
+  if (uiConfInProgress &&
+      (phase == TimeSlicingController::Phase::IDLE || phase == TimeSlicingController::Phase::FAILED))
+  {
+    for (uint8_t board = 2; board <= TEST_BOARD_COUNT; ++board)
+    {
+      const String reportKey = String(board);
+      const bool receivedReport = roundReports[reportKey].is<JsonObject>();
+      const bool failed = timeSlicing.roundCancelled() ||
+                          phase == TimeSlicingController::Phase::FAILED ||
+                          (receivedReport && strcmp(roundReports[reportKey]["Status"] | "", "ok") != 0);
+      publishNodeState(board, failed ? "failed" : receivedReport ? "configured"
+                                                                 : "missing");
+    }
     uiConfInProgress = false;
   }
-#endif
 
-  calibrationMode.update();
+  if (!timeSlicing.timingCritical())
+  {
+    static int previousWifiStatus = -1;
+    static String previousWifiIP = "";
+    const int status = WiFi.status();
+    const String ip = WiFi.localIP().toString();
+    if (status != previousWifiStatus || ip != previousWifiIP)
+    {
+      deviceLogf("[WIFI] status=%d IP=%s", status, ip.c_str());
+      previousWifiStatus = status;
+      previousWifiIP = ip;
+    }
+  }
+  serviceBackend();
+#endif
 
   auto radioActivity = timeSlicing.radioActivity();
   if (calibrationMode.active() && !calibrationMode.identifying() &&
-      radioActivity == TimeSliceProtocol::RadioActivity::None) {
+      radioActivity == TimeSliceProtocol::RadioActivity::None)
     radioActivity = TimeSliceProtocol::RadioActivity::Waiting;
-  }
-
   updateModeIndicator(
       calibrationMode.identifying() ? String("scan") : currentMode,
-      (!meshStarted &&
-       timeSlicing.phase() != TimeSlicingController::Phase::MEASURING) ||
+      (!meshStarted && timeSlicing.phase() != TimeSlicingController::Phase::MEASURING) ||
           timeSlicing.phase() == TimeSlicingController::Phase::FAILED,
-      mesh.broadcastIndicatorActive(),
-      radioActivity);
-
+      mesh.broadcastIndicatorActive(), radioActivity);
   delay(1);
 }
-

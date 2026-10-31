@@ -12,6 +12,7 @@
 #include "painlessMesh.h"
 #include "time_slicing_protocol.h"
 #include "../shared/rssi_distance.h"
+#include "../shared/round_safety.h"
 #include "../shared/calibration_math.h"
 
 // painlessMesh 1.5.7 allocates an ESP32 mutex on every init(), but its
@@ -50,8 +51,7 @@ class MeasurementMesh : public painlessMesh {
 class TimeSlicingController {
  public:
   using Mac = std::array<uint8_t, 6>;
-  enum class Phase { IDLE, WAIT_READY, CONFIGURED, PREPARED, ARMED,
-                     MEASURING, COLLECTING, REPORTING, CHANNEL_WAIT, FAILED };
+  using Phase = RoundSafety::Phase;
 
   JsonDocument slotRSSI;
   std::vector<uint32_t> slotPacketCounts;
@@ -68,10 +68,10 @@ class TimeSlicingController {
 
   TimeSlicingController(MeasurementMesh &mesh, const uint8_t *selfAP,
                         const uint8_t *selfStation, const uint8_t *rootAP,
-                        bool &meshStarted, String &mode,
+                        bool &meshStarted, String &mode, uint8_t &meshChannel,
                         void (*stopMesh)(), bool (*restartMesh)())
       : mesh_(mesh), selfAP_(selfAP), selfStation_(selfStation), rootAP_(rootAP),
-        meshStarted_(meshStarted), mode_(mode), stopMesh_(stopMesh),
+        meshStarted_(meshStarted), mode_(mode), meshChannel_(meshChannel), stopMesh_(stopMesh),
         restartMesh_(restartMesh) {}
 
   bool isRoot() const { return memcmp(selfAP_, rootAP_, 6) == 0; }
@@ -80,6 +80,8 @@ class TimeSlicingController {
   }
   bool busy() const { return phase_ != Phase::IDLE && phase_ != Phase::FAILED; }
   Phase phase() const { return phase_; }
+  bool timingCritical() const { return RoundSafety::timingCritical(phase_); }
+  bool roundCancelled() const { return cancelled_; }
   TimeSliceProtocol::RadioActivity radioActivity() const {
     using TimeSliceProtocol::RadioActivity;
     if (phase_ != Phase::MEASURING) return RadioActivity::None;
@@ -105,6 +107,12 @@ class TimeSlicingController {
   }
   void meshRecovered() {
     if (phase_ != Phase::FAILED || !meshStarted_) return;
+    if (cancelled_) {
+      phase_ = Phase::IDLE;
+      mode_ = "mesh";
+      sendCancelAck();
+      return;
+    }
     mode_ = "mesh";
     phaseSinceMs_ = millis();
     lastMessageMs_ = millis() - RETRY_MS;
@@ -273,16 +281,43 @@ class TimeSlicingController {
     }
 
     if (strcmp(action, "cancel") == 0) {
-      if (isRoot() || from != rootNodeId() || !validEnvelope(doc, 1) ||
-          (phase_ != Phase::PREPARED && phase_ != Phase::ARMED &&
-           phase_ != Phase::CONFIGURED)) return false;
+      if (isRoot() || from != rootNodeId() || !validEnvelope(doc, 1)) return false;
+      cancelled_ = true;
+      if (phase_ == Phase::MEASURING) {
+        cancelRadioPending_ = true;  // Restore the radio later, outside callbacks.
+        return true;
+      }
       phase_ = Phase::IDLE;
       mode_ = "mesh";
+      sendCancelAck();
       return true;
     }
 
-    if (strcmp(action, "rssi_report") == 0 || strcmp(action, "sniff_report") == 0)
+    if (strcmp(action, "cancel_ack") == 0) {
+      if (!isRoot() || !cancelled_ || !validEnvelope(doc, 0)) return false;
+      size_t slot;
+      if (!reporterSlot(doc, slot) || slot == selfIndex_ ||
+          !macMatches(doc["StationMAC"], table_[slot]) ||
+          (peerIds_[slot] && peerIds_[slot] != from)) return false;
+      peerIds_[slot] = from;
+      if (!cancellation_.acknowledged(slot)) Serial.printf("[ROUND %u] Cancel acknowledged: %s\n",
+                                                   round_, macString(table_[slot]).c_str());
+      cancellation_.acknowledge(slot);
+      return true;
+    }
+
+    if (strcmp(action, "rssi_report") == 0 || strcmp(action, "sniff_report") == 0) {
+      if (isRoot() && cancelled_ && validEnvelope(doc, 0)) {
+        size_t slot;
+        if (!reporterSlot(doc, slot) || slot == selfIndex_ || peerIds_[slot] != from)
+          return false;
+        Serial.printf("[ROUND %u] Ignored late report from %s: round cancelled\n",
+                      round_, macString(table_[slot]).c_str());
+        sendCancel(from);
+        return true;
+      }
       return acceptReport(doc, from);
+    }
     if (strcmp(action, "report_ack") == 0) {
       if (isRoot() || from != rootNodeId() || !validEnvelope(doc, 1) ||
           phase_ != Phase::REPORTING) return false;
@@ -295,7 +330,35 @@ class TimeSlicingController {
 
   void update() {
     using namespace TimeSliceProtocol;
+    const int64_t serviceUs = esp_timer_get_time();
+    if (timingCritical() && lastUpdateUs_ && serviceUs > lastUpdateUs_) {
+      const uint64_t gap = uint64_t(serviceUs - lastUpdateUs_);
+      if (gap > maxServiceGapUs_) maxServiceGapUs_ = gap;
+    }
+    lastUpdateUs_ = serviceUs;
     uint32_t nowMs = millis();
+    if (cancelRadioPending_) {
+      cancelRadioPending_ = false;
+      endRadio();
+      mode_ = "mesh";
+      if (!restartMesh_()) { phase_ = Phase::FAILED; return; }
+      phase_ = Phase::IDLE;
+      sendCancelAck();
+      return;
+    }
+    if (phase_ == Phase::CANCELLING) {
+      if (cancellation_.status(nowMs) != RoundSafety::Cancellation::Status::Pending) {
+        for (size_t i = 0; i < table_.size(); ++i) {
+          if (!cancellation_.acknowledged(i)) Serial.printf("[ROUND %u] Cancel ACK timeout: %s\n",
+                                                   round_, macString(table_[i]).c_str());
+        }
+        phase_ = Phase::IDLE;
+        Serial.println("[ROUND] Cancelled; no result table or average produced. Commands enabled");
+      } else if (meshStarted_ && nowMs - lastMessageMs_ >= RETRY_MS) {
+        sendCancel();
+      }
+      return;
+    }
     if (phase_ == Phase::CHANNEL_WAIT) {
       if (nowMs - phaseSinceMs_ > READY_TIMEOUT_MS) {
         phase_ = Phase::IDLE;
@@ -316,10 +379,7 @@ class TimeSlicingController {
           if (!ready_[i]) Serial.printf("[ROUND %u] Missing ready: %s\n",
                                        round_, macString(table_[i]).c_str());
         }
-        sendControl("cancel", true);
-        phase_ = Phase::IDLE;
-        mode_ = "mesh";
-        Serial.println("[ROUND] Cancelled: missing ready replies");
+        beginCancellation("missing ready replies");
       } else if (allSet(ready_) && settled()) {
         meshStartUs_ = mesh_.getNodeTime() + START_LEAD_US;
         phase_ = Phase::ARMED;
@@ -349,6 +409,8 @@ class TimeSlicingController {
       } else if (remaining <= static_cast<int32_t>(PREPARE_US)) {
         // Do not shift late slots: either meet the shared schedule or fail.
         if (remaining < static_cast<int32_t>(PREPARE_US - 250000)) {
+          Serial.printf("[TIMING] Preparation remaining=%ld us; controller max gap=%llu us\n",
+                        static_cast<long>(remaining), static_cast<unsigned long long>(maxServiceGapUs_));
           finishRound(false, "missed radio preparation deadline", false);
           return;
         }
@@ -472,6 +534,7 @@ class TimeSlicingController {
   const uint8_t *selfAP_, *selfStation_, *rootAP_;
   bool &meshStarted_;
   String &mode_;
+  uint8_t &meshChannel_;
   void (*stopMesh_)();
   bool (*restartMesh_)();
   Phase phase_ = Phase::IDLE;
@@ -497,6 +560,11 @@ class TimeSlicingController {
   std::array<uint32_t, 14> channelSamples_{};
   int64_t localStartUs_ = 0, nextSendUs_ = 0;
   bool scheduleInvalid_ = false, radioInitialized_ = false, resultOK_ = false;
+  bool cancelled_ = false, cancelRadioPending_ = false;
+  RoundSafety::Cancellation cancellation_;
+  uint32_t cancelTimeoutMs_ = 10000;
+  int64_t lastUpdateUs_ = 0;
+  uint64_t maxServiceGapUs_ = 0;
   const char *resultReason_ = "not started";
   portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;
   bool capturing_ = false, txBusy_ = false;
@@ -578,12 +646,12 @@ class TimeSlicingController {
     }
     return hash;
   }
-  static bool parametersMatch(JsonDocument &doc, uint32_t hash) {
+  bool parametersMatch(JsonDocument &doc, uint32_t hash) const {
     const bool calibration = doc["Calibration"] | false;
     return doc["ConfigHash"].is<uint32_t>() &&
            doc["ConfigHash"].as<uint32_t>() == hash &&
            doc["Channel"].is<unsigned>() &&
-           doc["Channel"].as<unsigned>() == TimeSliceProtocol::CHANNEL &&
+           doc["Channel"].as<unsigned>() == meshChannel_ &&
            doc["SlotMs"].is<unsigned>() &&
            doc["SlotMs"].as<unsigned>() == TimeSliceProtocol::slotDurationUs(calibration) / 1000 &&
            (!calibration || (doc["SampleMs"].is<unsigned>() &&
@@ -604,6 +672,9 @@ class TimeSlicingController {
     slotPacketCounts.assign(table.size(), 0);
     ready_.assign(table.size(), false);
     reportReceived_.assign(table.size(), false);
+    cancelled_ = cancelRadioPending_ = false;
+    maxServiceGapUs_ = 0;
+    lastUpdateUs_ = esp_timer_get_time();
     peerIds_.assign(table.size(), 0);
     for (size_t i = 0; i < table.size(); ++i) {
       if (memcmp(table[i].data(), selfStation_, 6) == 0) selfIndex_ = i;
@@ -655,7 +726,7 @@ class TimeSlicingController {
     }
   }
   void parameters(JsonDocument &doc) const {
-    doc["Channel"] = TimeSliceProtocol::CHANNEL;
+    doc["Channel"] = meshChannel_;
     doc["SlotMs"] = TimeSliceProtocol::slotDurationUs(calibrationRound_) / 1000;
     doc["SampleMs"] = TimeSliceProtocol::sampleDurationUs(calibrationRound_) / 1000;
     doc["GuardMs"] = TimeSliceProtocol::GUARD_US / 1000;
@@ -697,6 +768,45 @@ class TimeSlicingController {
     parameters(doc);
     if (strcmp(action, "start") == 0) doc["StartTimeUs"] = meshStartUs_;
     sendJson(doc, broadcast ? 0 : rootNodeId());
+  }
+
+  void sendCancel(uint32_t destination = 0) {
+    JsonDocument doc;
+    envelope(doc, "conf", "cancel", 1);
+    sendJson(doc, destination);
+  }
+
+  void sendCancelAck() {
+    if (isRoot() || !meshStarted_) return;
+    JsonDocument doc;
+    envelope(doc, "conf", "cancel_ack", 0);
+    doc["ReporterSlot"] = selfIndex_ + 1;
+    JsonArray bytes = doc["StationMAC"].to<JsonArray>();
+    for (uint8_t byte : table_[selfIndex_]) bytes.add(byte);
+    sendJson(doc, rootNodeId());
+  }
+
+  void beginCancellation(const char *reason) {
+    const bool armed = phase_ == Phase::ARMED;
+    const uint32_t durationMs = sniffRound_
+        ? uint32_t(TimeSliceProtocol::sniffDurationUs(discoveryRound_) / 1000)
+        : uint32_t(table_.size() * int64_t(TimeSliceProtocol::slotDurationUs(calibrationRound_)) / 1000);
+    // A peer may have already stopped its mesh and cannot hear cancel until
+    // capture ends. Keep the old round identity until that return/report window.
+    cancelTimeoutMs_ = armed ? durationMs + TimeSliceProtocol::START_LEAD_US / 1000 + READY_TIMEOUT_MS : 10000;
+    cancelled_ = true;
+    resultOK_ = false;
+    resultReason_ = reason;
+    cancellation_.begin(table_.size(), selfIndex_, millis(), cancelTimeoutMs_);
+    reports.clear();
+    distanceReports.clear();
+    phase_ = Phase::CANCELLING;
+    mode_ = "mesh";
+    phaseSinceMs_ = millis();
+    lastMessageMs_ = millis() - RETRY_MS;
+    Serial.printf("[ROUND %u] Cancelling: %s; waiting for node acknowledgements (up to %u ms)\n",
+                  round_, reason, cancelTimeoutMs_);
+    sendCancel();
   }
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
@@ -788,13 +898,13 @@ class TimeSlicingController {
              esp_wifi_set_promiscuous_rx_cb(sniffCallback) == ESP_OK &&
              esp_wifi_set_promiscuous(true) == ESP_OK;
     }
-    if (esp_wifi_set_channel(TimeSliceProtocol::CHANNEL, WIFI_SECOND_CHAN_NONE) != ESP_OK ||
+    if (esp_wifi_set_channel(meshChannel_, WIFI_SECOND_CHAN_NONE) != ESP_OK ||
         esp_wifi_set_max_tx_power(60) != ESP_OK || esp_now_init() != ESP_OK) return false;
     radioInitialized_ = true;
     if (calibrationRound_) snapshotRadioConfiguration();
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, BROADCAST_MAC, 6);
-    peer.channel = TimeSliceProtocol::CHANNEL;
+    peer.channel = meshChannel_;
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     wifi_promiscuous_filter_t filter = {};
@@ -885,11 +995,17 @@ class TimeSlicingController {
     }
   }
   void finishRound(bool ok, const char *reason, bool restoreRadio) {
+    if (isRoot() && !ok && !restoreRadio) {
+      beginCancellation(reason);
+      return;
+    }
     if (calibrationRound_ && phase_ == Phase::MEASURING) {
       radioElapsedMs_ = uint32_t((esp_timer_get_time() - localStartUs_) / 1000);
       Serial.printf("[AN] Pair radio elapsed %.3f s; restoring mesh for reports\n", double(radioElapsedMs_) / 1000);
     }
     if (restoreRadio) endRadio();
+    Serial.printf("[TIMING] Round %u maximum controller gap=%llu us\n",
+                  round_, static_cast<unsigned long long>(maxServiceGapUs_));
     resultOK_ = ok;
     resultReason_ = reason;
     if (sniffRound_) {
@@ -947,14 +1063,6 @@ class TimeSlicingController {
       reports[String(static_cast<unsigned long>(selfIndex_ + 1))].set(report);
       storeDistanceReport(report, selfIndex_);
       reportReceived_[selfIndex_] = true;
-      if (!ok && !restoreRadio) {
-        // No radio measurement started on the root. Cancel peers and avoid
-        // waiting two minutes for reports from stations told to stay in mesh.
-        sendControl("cancel", true);
-        phase_ = Phase::IDLE;
-        Serial.println("[ROUND] Cancelled before measurement; enter a command to retry");
-        if (!discoveryRound_) printDistanceSummary();
-      }
     } else {
       phase_ = Phase::REPORTING;
     }

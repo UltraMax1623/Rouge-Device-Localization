@@ -3,7 +3,7 @@
 #include <cmath>
 #include <limits>
 
-// Path-loss model parameters copied from Localization/Localization.ino.
+// Fallback path-loss model parameters used before calibration.
 // A is the reference RSSI at one metre; n is the path-loss exponent.
 extern double A;
 extern double n;

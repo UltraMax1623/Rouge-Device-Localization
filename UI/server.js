@@ -16,6 +16,7 @@ const allowedCommands = new Set([
 ]);
 
 let deviceSocket = null;
+let meshChannelStatus = null;
 
 const recentLogs = [];
 const MAX_RECENT_LOGS = 100;
@@ -92,6 +93,7 @@ webSockets.on("connection", (socket, request) => {
     }
 
     deviceSocket = socket;
+    meshChannelStatus = null;
     logToUi("ESP32-S3 connected by WebSocket.");
     broadcast({ type: "device_connection", connected: true });
   } else if (role !== "ui") {
@@ -106,6 +108,7 @@ webSockets.on("connection", (socket, request) => {
         deviceSocket && deviceSocket.readyState === WebSocket.OPEN
       )
     }));
+    if (meshChannelStatus) socket.send(JSON.stringify(meshChannelStatus));
 
     for (const entry of recentLogs) {
       if (socket.readyState === WebSocket.OPEN) {
@@ -136,6 +139,16 @@ webSockets.on("connection", (socket, request) => {
       ) {
         broadcast(message);
         logToUi(`ESP32 update: ${JSON.stringify(message)}`, "ESP32");
+        return;
+      }
+      if (message.type === "mesh_channel" &&
+          Number.isInteger(message.meshChannel) && message.meshChannel >= 1 &&
+          message.meshChannel <= 13 &&
+          Number.isInteger(message.routerChannel) && message.routerChannel >= 0 &&
+          message.routerChannel <= 13) {
+        meshChannelStatus = message;
+        broadcast(message);
+        logToUi(`Mesh channel ${message.meshChannel}; Pavan channel ${message.routerChannel || "unknown"}.`, "ESP32");
       }
     } catch {
       logToUi("Ignored unrecognized message from ESP32-S3.", "ESP32");
@@ -145,6 +158,7 @@ webSockets.on("connection", (socket, request) => {
   socket.on("close", () => {
     if (role === "device" && deviceSocket === socket) {
       deviceSocket = null;
+      meshChannelStatus = null;
       logToUi("ESP32-S3 disconnected.");
       broadcast({ type: "device_connection", connected: false });
     }

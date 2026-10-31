@@ -345,6 +345,11 @@
           </div>
 
           <div class="result-box">
+            <strong>Wi-Fi channels</strong>
+            <div id="meshChannelStatus" class="muted">Waiting for root</div>
+          </div>
+
+          <div class="result-box">
             <strong>RSSI AN optimization</strong>
             <div id="optimizationStatus" class="muted">Not started</div>
             <div id="optimizationValue" class="muted">No result received</div>
@@ -440,6 +445,8 @@
       if (data.type === "device_connection") {
         connectionStatus.textContent =
           data.connected ? "S3: online" : "S3: offline";
+        if (!data.connected)
+          document.getElementById("meshChannelStatus").textContent = "Root offline";
 
         addTerminalLine(
           "BACKEND",
@@ -460,6 +467,12 @@
             ? "terminal-warn"
             : ""
         );
+        return;
+      }
+
+      if (data.type === "mesh_channel") {
+        document.getElementById("meshChannelStatus").textContent =
+          `Mesh: ${data.meshChannel} · Pavan: ${data.routerChannel || "not found"}`;
         return;
       }
 

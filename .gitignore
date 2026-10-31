@@ -1,1 +1,25 @@
+# Local builds, Codex helpers, and generated output
 .build/
+/tmp/
+/output/
+/.codex/
+/.agents/
+
+# Local documentation and reports
+*.md
+*.pdf
+*.doc
+*.docx
+/docs/
+/documents/
+
+# Local Python testing helpers (application Python may still be tracked)
+/tests/**/*.py
+codex*.py
+*_codex.py
+__pycache__/
+*.py[cod]
+.venv/
+
+# Installed UI dependencies
+node_modules/
