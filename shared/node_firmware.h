@@ -1,4 +1,5 @@
 #pragma once
+#include "firmware_log.h"
 
 // imports
 #include <stdarg.h>
@@ -30,7 +31,6 @@
 //  active globals and distributes/persists the model across the mesh.
 double A = -60.0;
 double n = 2.0;
-uint8_t target_mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
 #if ROOT_FIRMWARE
 uint8_t AP_self_mac[6] = {0x54, 0x44, 0x33, 0x22, 0x11, 0x01};
 #else
@@ -40,11 +40,8 @@ uint8_t AP_self_mac[6] = {};
 uint8_t station_self_mac[6] = {0x44, 0x33, 0x22, 0x11, 0x00, BOARD_NUMBER};
 const uint8_t root_AP_mac[6] = {0x54, 0x44, 0x33, 0x22, 0x11, 0x01};
 bool meshStarted = false;
-int packet_count = 0;
-int RSSI = 0;
 Scheduler userScheduler;
 MeasurementMesh mesh;
-JsonDocument meshmess;
 using MacAddress = std::array<uint8_t, 6>;
 std::vector<MacAddress> macList;
 String currentMode = "mesh";
@@ -53,6 +50,20 @@ uint8_t meshChannel = TimeSliceProtocol::CHANNEL;
 #if ROOT_FIRMWARE
 bool backendServiceAllowed();
 bool backendCommandBusy();
+#include "connection_debug.h"
+#include "coordinate_engine.h"
+#if CONNECTION_DEBUG
+volatile uint8_t lastWifiDisconnectReason = 0;
+volatile uint32_t wifiDisconnectCount = 0;
+
+void connectionWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
+    ++wifiDisconnectCount;
+  }
+}
+#endif
 const char *ROUTER_SSID = "Pavan";
 const char *ROUTER_PASSWORD = "12345678";
 
@@ -91,8 +102,12 @@ void loadBackendHost()
   }
   const String saved = prefs.getString("host", "");
   prefs.end();
-  if (saved.length() && validBackendHost(saved)) backendHost = saved;
+  if (saved.length() && validBackendHost(saved)) {
+    backendHost = saved;
+    deviceLogf("[WS] Loaded server IP from saved settings: %s", backendHost.c_str());
+  }
   else if (saved.length()) deviceLog("[WS] Invalid saved server IP; using firmware default");
+  else deviceLog("[WS] No saved server IP; using firmware default");
 }
 
 void setBackendHost(const String &host)
@@ -116,6 +131,7 @@ void setBackendHost(const String &host)
     return;
   }
   backendHost = host;
+  Serial.printf("IP: %s\n", backendHost.c_str());
   webSocket.disconnect();
   beginBackendConnection();
   deviceLogf("[WS] Server IP saved: %s (persists after reboot)", backendHost.c_str());
@@ -126,7 +142,48 @@ bool uiNodeStatePending[16] = {};
 bool uiSnapshotPending = false;
 bool uiChannelPending = true;
 
-bool uiConfInProgress = false;
+bool webCommandRunning = false;
+String activeCommandId;
+String activeCommandName = "conf";
+String pendingCommandName;
+JsonDocument pendingCommandParams;
+String pendingControlId, pendingControlAction, lastControlId;
+String webSnapshot;
+bool webCancelled = false;
+Coordinates::Result lastNodeCoordinates;
+uint32_t lastCoordinateRound = 0;
+std::array<uint8_t,6> webSniffTarget{};
+String pendingCommandId;
+#include "command_events.h"
+CommandEvents commandEvents;
+void queueDeviceLog(const char *text);
+
+void commandEnvelope(JsonDocument &event, const String &id, const char *phase)
+{
+  event["type"] = "command_event";
+  event["commandId"] = id;
+  event["command"] = activeCommandName;
+  event["phase"] = phase;
+}
+
+void queueCommandEvent(JsonDocument &event)
+{
+  // A new command reserves enough room for every configured result and end.
+  if (!commandEvents.push(event)) queueDeviceLog("[ERROR] Command event storage full");
+}
+
+void rejectCommand(const String &id, const char *code, const char *message)
+{
+  JsonDocument error;
+  commandEnvelope(error, id, "error");
+  error["code"] = code;
+  error["message"] = message;
+  queueCommandEvent(error);
+  JsonDocument end;
+  commandEnvelope(end, id, "end");
+  end["status"] = "failed";
+  queueCommandEvent(end);
+}
 
 void publishNodeState(uint8_t board, const char *status)
 {
@@ -175,7 +232,10 @@ void queueDeviceLog(const char *text)
 
 void deviceLog(const char *text)
 {
-  Serial.println(text);
+  FW_LOG(text);
+  if (strncmp(text, "[CHANNEL]", 9) == 0 || strncmp(text, "[WS]", 4) == 0 ||
+      strncmp(text, "[WIFI]", 6) == 0 || strncmp(text, "[MESH]", 6) == 0 ||
+      strncmp(text, "[TIMING]", 8) == 0) connectionTrace(text);
   queueDeviceLog(text);
 }
 
@@ -195,7 +255,10 @@ void deviceLogf(const char *format, ...)
     line[--length] = '\0';
   }
 
-  Serial.println(line);
+  FW_LOG(line);
+  if (strncmp(line, "[CHANNEL]", 9) == 0 || strncmp(line, "[WS]", 4) == 0 ||
+      strncmp(line, "[WIFI]", 6) == 0 || strncmp(line, "[MESH]", 6) == 0 ||
+      strncmp(line, "[TIMING]", 8) == 0) connectionTrace(line);
   queueDeviceLog(line);
 }
 
@@ -223,7 +286,6 @@ void flushDeviceLogQueue()
   }
 }
 
-char wsCommandBuffer[64] = {};
 bool wsCommandPending = false;
 
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
@@ -231,6 +293,17 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
   switch (type)
   {
   case WStype_CONNECTED:
+    {
+      JsonDocument state;
+      state["type"] = "command_state";
+      state["commandId"] = activeCommandId;
+      state["command"] = activeCommandName;
+      state["pendingEvents"] = commandEvents.available();
+      commandEvents.describePending(state);
+      String payload;
+      serializeJson(state, payload);
+      webSocket.sendTXT(payload);
+    }
     uiSnapshotPending = true;
     uiChannelPending = true;
     deviceLog("[WS] Connected to backend");
@@ -241,20 +314,30 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     break;
 
   case WStype_TEXT:
-    if (length == 4 && memcmp(payload, "conf", 4) == 0)
     {
-      if (backendCommandBusy() || wsCommandPending)
-      {
-        deviceLog("[WS] Rejected conf: operation running or command already pending");
+      JsonDocument request;
+      if (deserializeJson(request, payload, length)) break;
+      if (strcmp(request["type"] | "", "event_ack") == 0) {
+        commandEvents.acknowledge(request);
         break;
       }
-      memcpy(wsCommandBuffer, "conf", 5);
+      if (strcmp(request["type"] | "", "command_control") == 0) {
+        if (request["commandId"].as<String>() == activeCommandId && request["controlId"].is<String>() && !pendingControlId.length()) {
+          pendingControlId=request["controlId"].as<String>();
+          pendingControlAction=request["action"].as<String>();
+        }
+        break;
+      }
+      if (
+          strcmp(request["type"] | "", "command") != 0 ||
+          !request["commandId"].is<String>() || wsCommandPending) break;
+      const String id = request["commandId"].as<String>();
+      if (id.isEmpty() || id.length() > 63) break;
+      pendingCommandId = id;
+      pendingCommandName = request["command"].as<String>();
+      pendingCommandParams.clear();
+      pendingCommandParams.set(request["params"].as<JsonObjectConst>());
       wsCommandPending = true;
-      deviceLog("[WS] Queued conf command");
-    }
-    else
-    {
-      deviceLog("[WS] Rejected unsupported command");
     }
     break;
 
@@ -268,8 +351,8 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 }
 #else
 // Normal nodes keep printing locally; only the root has a backend WebSocket.
-#define deviceLog(text) Serial.println(text)
-#define deviceLogf(...) Serial.printf(__VA_ARGS__)
+#define deviceLog(text) FW_LOG(text)
+#define deviceLogf(...) FW_LOG(__VA_ARGS__)
 #endif
 
 // funtions
@@ -307,16 +390,56 @@ MeshChannelMigration channelMigration;
 
 #if ROOT_FIRMWARE
 bool backendCommandBusy() { return timeSlicing.busy() || calibrationMode.active() || channelMigration.busy(); }
+#if CONNECTION_DEBUG
+bool connectionDebugAllowed() { return !timeSlicing.timingCritical(); }
+#endif
+
+void printConnectionStatus()
+{
+#if CONNECTION_DEBUG
+  static uint32_t lastPrintMs = 0;
+  if (!connectionDebugAllowed() || millis() - lastPrintMs < 5000) return;
+  lastPrintMs = millis();
+  const int status = WiFi.status();
+  const bool router = status == WL_CONNECTED && WiFi.SSID() == ROUTER_SSID;
+  const char *gate = timeSlicing.busy() ? "measurement/report cycle" :
+      calibrationMode.active() ? "calibration" : channelMigration.busy() ? "channel migration/scan" :
+      !meshStarted ? "mesh stopped" : !router ? "not associated with hotspot" :
+      WiFi.localIP() == IPAddress(0,0,0,0) ? "waiting for DHCP" :
+      WiFi.channel() != meshChannel ? "radio/mesh channel mismatch" : "backend enabled";
+  Serial.printf("[%lu ms] [NET] %s; mesh=%u router=%u radio=%u peers=%u/%u A/n_synced=%u migration=%s failures=%u retry_in=%lu ms\n",
+      millis(), gate, meshChannel, channelMigration.routerChannel(), WiFi.channel(),
+      unsigned(meshStarted ? mesh.getNodeList().size() : 0), TEST_BOARD_COUNT - 1,
+      calibrationMode.networkSynced(), channelMigration.debugPhase(),
+      channelMigration.debugFailures(), channelMigration.debugRetryMs());
+  Serial.printf("[NET] wifi_status=%d SSID='%s' BSSID=%s IP=%s mask=%s gateway=%s RSSI=%d disconnects=%lu last_reason=%u\n",
+      status, WiFi.SSID().c_str(), WiFi.BSSIDstr().c_str(), WiFi.localIP().toString().c_str(),
+      WiFi.subnetMask().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
+      router ? WiFi.RSSI() : 0, uint32_t(wifiDisconnectCount), lastWifiDisconnectReason);
+  Serial.printf("[NET] server=%s:%u WS=%s pending_delivery=%u free_heap=%u\n",
+      backendHost.c_str(), BACKEND_PORT, webSocket.isConnected() ? "connected" : "disconnected",
+      commandEvents.available(), ESP.getFreeHeap());
+  IPAddress server;
+  if (router && server.fromString(backendHost) && WiFi.subnetMask() != IPAddress(0,0,0,0) &&
+      (uint32_t(server) & uint32_t(WiFi.subnetMask())) !=
+      (uint32_t(WiFi.localIP()) & uint32_t(WiFi.subnetMask())))
+    Serial.println("[NET] Server IP is outside the hotspot subnet; check PC IPv4 and serverIP (a routed network can be valid).");
+#endif
+}
 
 bool backendServiceAllowed()
 {
   // Short-circuit before even asking the Wi-Fi driver for network details
   // while its radio belongs to the measurement controller.
   if (!RoundSafety::backendAllowed(timeSlicing.phase(), meshStarted, true,
-                                   calibrationMode.active()) || channelMigration.busy())
+                                   calibrationMode.active() && !calibrationMode.backendSafe()) || channelMigration.busy())
     return false;
-  return WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0);
+  return WiFi.status() == WL_CONNECTED && WiFi.SSID() == ROUTER_SSID &&
+         WiFi.channel() == meshChannel &&
+         WiFi.localIP() != IPAddress(0, 0, 0, 0);
 }
+
+void publishNetworkStatus();
 
 void serviceBackend()
 {
@@ -336,6 +459,7 @@ void serviceBackend()
   const uint32_t started = millis();
   if (paused)
   {
+    connectionTrace("[WS] Network available again; closing old socket before reconnect");
     // Discard traffic left on the old connection while input was disabled.
     // Closing may block too, so do it only now, after the critical phase.
     wsCommandPending = false;
@@ -344,9 +468,21 @@ void serviceBackend()
     paused = false;
   }
   // Only here may the library reconnect, receive or write network frames.
+#if CONNECTION_DEBUG
+  if (!webSocket.isConnected()) {
+    static uint32_t lastReconnectTrace = 0;
+    if (!lastReconnectTrace || millis() - lastReconnectTrace >= 5000) {
+      lastReconnectTrace = millis();
+      deviceLogf("[WS] Servicing reconnect to %s:%u; router IP=%s", backendHost.c_str(),
+                 BACKEND_PORT, WiFi.localIP().toString().c_str());
+    }
+  }
+#endif
   webSocket.loop();
   if (webSocket.isConnected())
   {
+    commandEvents.send(webSocket);
+    publishNetworkStatus();
     static uint8_t lastReportedMeshChannel = 0;
     static uint8_t lastReportedRouterChannel = 0;
     if (uiChannelPending || lastReportedMeshChannel != meshChannel ||
@@ -395,6 +531,154 @@ bool runConfig()
 {
   return timeSlicing.beginConfiguration(macList);
 }
+
+#if ROOT_FIRMWARE
+String configuredMac(uint8_t board)
+{
+  const auto &mac = macList[board - 1];
+  char value[18];
+  snprintf(value, sizeof(value), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(value);
+}
+
+void startWebConf(const String &id)
+{
+  if (commandEvents.available() || !commandEvents.room(TEST_BOARD_COUNT + 6)) {
+    rejectCommand(id, "RESULTS_PENDING", "Previous results are still awaiting backend acknowledgement.");
+    return;
+  }
+  if (webCommandRunning || timeSlicing.busy() ||
+      timeSlicing.phase() == TimeSlicingController::Phase::FAILED ||
+      calibrationMode.active() || channelMigration.busy())
+  {
+    rejectCommand(id, "BUSY", "Another operation is running.");
+    return;
+  }
+  if (!calibrationMode.networkSynced())
+  {
+    rejectCommand(id, "CALIBRATION_NOT_SYNCED", "Nodes have not acknowledged the root A/n values.");
+    return;
+  }
+  if (!timeSlicing.networkReadyForConfiguration(macList.size()))
+  {
+    rejectCommand(id, "MESH_NOT_READY", "The configured peers are not all reachable.");
+    return;
+  }
+  JsonDocument start;
+  commandEnvelope(start, id, "start");
+  start["status"] = "accepted";
+  start["boards"] = TEST_BOARD_COUNT;
+  String payload;
+  serializeJson(start, payload);
+  queueCommandEvent(start);
+  if (!webSocket.isConnected() || !commandEvents.send(webSocket, true))
+  {
+    rejectCommand(id, "START_ACK_FAILED", "Could not acknowledge the command before measurement.");
+    return;
+  }
+  activeCommandId = id;
+  if (!runConfig())
+  {
+    rejectCommand(id, "START_FAILED", "The root could not start the configuration round.");
+    activeCommandId = "";
+    return;
+  }
+  JsonDocument progress;
+  commandEnvelope(progress, id, "log");
+  progress["message"] = "Configuration round started; waiting for node reports.";
+  progress["roundId"] = timeSlicing.roundId();
+  queueCommandEvent(progress);
+  webCommandRunning = true;
+  for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
+    publishNodeState(board, board == 1 ? "root" : "configuring");
+}
+
+void finishWebConf(TimeSlicingController::Phase phase)
+{
+  static double ranges[Coordinates::MAX_NODES][Coordinates::MAX_NODES];
+  bool present[Coordinates::MAX_NODES] = {};
+  for (uint8_t i=0;i<TEST_BOARD_COUNT;++i) {
+    present[i] = strcmp(roundReports[String(i+1)]["Status"] | "", "ok") == 0;
+    for(uint8_t j=0;j<TEST_BOARD_COUNT;++j) ranges[i][j]=0;
+  }
+  for(uint8_t i=0;i<TEST_BOARD_COUNT;++i) for(uint8_t j=i+1;j<TEST_BOARD_COUNT;++j) {
+    const JsonVariantConst forward=roundDistanceReports[configuredMac(i+1)][configuredMac(j+1)];
+    const JsonVariantConst reverse=roundDistanceReports[configuredMac(j+1)][configuredMac(i+1)];
+    double sum=0; unsigned count=0;
+    if(present[i] && forward.is<double>() && std::isfinite(forward.as<double>()) && forward.as<double>()>0) { sum+=forward.as<double>(); ++count; }
+    if(present[j] && reverse.is<double>() && std::isfinite(reverse.as<double>()) && reverse.as<double>()>0) { sum+=reverse.as<double>(); ++count; }
+    if(count) ranges[i][j]=ranges[j][i]=sum/count;
+  }
+  const auto coordinates=Coordinates::solve(ranges,present,TEST_BOARD_COUNT);
+  if (coordinates.valid && !webCancelled) { lastNodeCoordinates=coordinates; lastCoordinateRound=timeSlicing.roundId(); }
+  bool complete = phase != TimeSlicingController::Phase::FAILED &&
+                  !timeSlicing.roundCancelled();
+  for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
+  {
+    const String reporter = configuredMac(board);
+    const JsonVariantConst report = roundReports[String(board)];
+    const bool present = report.is<JsonObjectConst>();
+    const bool reportOk = present && strcmp(report["Status"] | "", "ok") == 0;
+    JsonDocument data;
+    commandEnvelope(data, activeCommandId, "data");
+    data["reporterMac"] = reporter;
+    data["status"] = !present ? "offline" : reportOk ? "ok" : "failed";
+    JsonObject position=data["position"].to<JsonObject>();
+    position["unit"]="m";
+    position["status"]=coordinates.points[board-1].valid ? "estimated" : "unavailable";
+    if(coordinates.points[board-1].valid) {
+      position["x"]=coordinates.points[board-1].x;
+      position["y"]=coordinates.points[board-1].y;
+    } else { position["x"]=nullptr; position["y"]=nullptr; }
+    if(coordinates.valid) position["fitRmseMeters"]=coordinates.rmse;
+    position["frame"]="root-origin; first available peer on positive X; positive Y preferred";
+    if (present && !reportOk) data["reason"] = report["Reason"] | "report failed";
+    JsonArray distances = data["distances"].to<JsonArray>();
+    if (!reportOk) complete = false;
+    for (uint8_t target = 1; target <= TEST_BOARD_COUNT; ++target)
+    {
+      if (target == board) continue;
+      const String targetMac = configuredMac(target);
+      JsonObject reading = distances.add<JsonObject>();
+      reading["targetMac"] = targetMac;
+      const JsonVariantConst value = roundDistanceReports[reporter][targetMac];
+      if (reportOk && value.is<double>() && std::isfinite(value.as<double>()) &&
+          value.as<double>() > 0)
+      {
+        reading["meters"] = value.as<double>();
+        reading["status"] = "ok";
+      }
+      else
+      {
+        reading["meters"] = nullptr;
+        reading["status"] = !present || !roundReports[String(target)].is<JsonObject>()
+                                ? "offline" : "unavailable";
+        complete = false;
+      }
+    }
+    queueCommandEvent(data);
+  }
+  if (!complete && !webCancelled)
+  {
+    JsonDocument error;
+    commandEnvelope(error, activeCommandId, "error");
+    error["code"] = phase == TimeSlicingController::Phase::FAILED ||
+                    timeSlicing.roundCancelled() ? "ROUND_FAILED" : "INCOMPLETE_RESULTS";
+    error["message"] = phase == TimeSlicingController::Phase::FAILED ||
+                       timeSlicing.roundCancelled() ? timeSlicing.resultReason() :
+                       "Configuration ended without all required distance readings.";
+    queueCommandEvent(error);
+  }
+  JsonDocument end;
+  commandEnvelope(end, activeCommandId, "end");
+  end["status"] = webCancelled ? "cancelled" : complete ? "success" : "failed";
+  end["roundId"] = timeSlicing.roundId();
+  queueCommandEvent(end);
+  activeCommandId = "";
+}
+#include "web_commands.h"
+#endif
 
 bool handleConfigMode(JsonDocument &doc, uint32_t from)
 {
@@ -657,14 +941,14 @@ bool restartMesh()
     return false;
   }
 
-  mesh.setDebugMsgTypes(ERROR);
+  // painlessMesh defaults to silent logging. Its setter prints even for level 0.
   channelMigration.bridgeConfigured(false);
   mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT,
             WIFI_AP_STA, meshChannel);
 #if ROOT_FIRMWARE
   if (channelMigration.routerChannel() == meshChannel)
   {
-    mesh.stationManual(ROUTER_SSID, ROUTER_PASSWORD);
+    mesh.configureRouterStation(ROUTER_SSID, ROUTER_PASSWORD);
     channelMigration.bridgeConfigured(true);
   }
 #endif
@@ -748,7 +1032,7 @@ void handleSerialCommand(const char *line, bool busyWhileReading)
     String address = line + 8;
     address.trim();
     if (address.length()) setBackendHost(address);
-    else deviceLogf("[WS] Current server IP: %s:%u", backendHost.c_str(), BACKEND_PORT);
+    else Serial.printf("IP: %s\n", backendHost.c_str());
     return;
   }
   const auto command = UserCommand::parse(line);
@@ -829,6 +1113,10 @@ void recoverUnavailableMesh()
 void setup()
 {
   Serial.begin(115200);
+#if ROOT_FIRMWARE && CONNECTION_DEBUG
+  WiFi.onEvent(connectionWifiEvent);
+  connectionTrace("[NET] Connection diagnostics enabled; snapshots every 5 seconds; no credentials printed");
+#endif
   beginModeIndicator();
 #if ROOT_FIRMWARE
   // Register custom MACs before a Wi-Fi scan initializes the driver.
@@ -838,6 +1126,7 @@ void setup()
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
   loadBackendHost();
+  Serial.printf("IP: %s\n", backendHost.c_str());
   beginBackendConnection();
 #endif
   calibrationMode.begin();
@@ -881,35 +1170,15 @@ void loop()
   runTimeSlicing();
 
 #if ROOT_FIRMWARE
-  if (wsCommandPending)
+  if (wsCommandPending && !timeSlicing.timingCritical())
   {
     wsCommandPending = false;
-    const uint32_t previousRoundId = timeSlicing.roundId();
-    handleSerialCommand(wsCommandBuffer, false);
-    if (timeSlicing.roundId() != previousRoundId)
-    {
-      uiConfInProgress = true;
-      for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
-        publishNodeState(board, board == 1 ? "root" : "configuring");
-    }
+    const String id = pendingCommandId;
+    pendingCommandId = "";
+    dispatchWebCommand(id,pendingCommandName,pendingCommandParams);
   }
 
-  const auto phase = timeSlicing.phase();
-  if (uiConfInProgress &&
-      (phase == TimeSlicingController::Phase::IDLE || phase == TimeSlicingController::Phase::FAILED))
-  {
-    for (uint8_t board = 2; board <= TEST_BOARD_COUNT; ++board)
-    {
-      const String reportKey = String(board);
-      const bool receivedReport = roundReports[reportKey].is<JsonObject>();
-      const bool failed = timeSlicing.roundCancelled() ||
-                          phase == TimeSlicingController::Phase::FAILED ||
-                          (receivedReport && strcmp(roundReports[reportKey]["Status"] | "", "ok") != 0);
-      publishNodeState(board, failed ? "failed" : receivedReport ? "configured"
-                                                                 : "missing");
-    }
-    uiConfInProgress = false;
-  }
+  updateWebCommand();
 
   if (!timeSlicing.timingCritical())
   {
@@ -925,6 +1194,7 @@ void loop()
     }
   }
   serviceBackend();
+  printConnectionStatus();
 #endif
 
   auto radioActivity = timeSlicing.radioActivity();

@@ -1,4 +1,5 @@
 #pragma once
+#include "firmware_log.h"
 
 #include <Preferences.h>
 #include <cstring>
@@ -12,6 +13,72 @@ class CalibrationMode {
  public:
   bool active() const { return state_ != State::Idle || remoteSession_ != 0; }
   bool localSession() const { return state_ != State::Idle; }
+  bool backendSafe() const {
+    return !timeSlicing.busy() && (state_ == State::Idle || state_ == State::Identify ||
+        state_ == State::Wait || state_ == State::Settle || state_ == State::Review || state_ == State::Save);
+  }
+  bool nodeOnline(unsigned board) const {
+    if (board == 1) return meshStarted;
+    const Peer *peer = findPeer(board);
+    return peer && fresh(*peer);
+  }
+  const char *outcome() const { return outcome_; }
+  bool webControl(const String &action) {
+    if (!localSession()) return false;
+    if (action == "cancel") {
+      if (state_ == State::Save) return false;
+      if (timeSlicing.busy() && !timeSlicing.timingCritical()) timeSlicing.requestCancellation();
+      command("cancel"); return true;
+    }
+    if (action == "next" && state_ == State::Wait) { command("next"); return true; }
+    if (!diagnostic_ && state_ == State::Review &&
+        (action == "retry" || (action == "save" && acceptable_) ||
+         (action.length() == 11 && action.startsWith("remeasure ") && action[10] >= '1' && action[10] <= '5'))) {
+      command(action.c_str());
+      return action != "save" || state_ == State::Save;
+    }
+    return false;
+  }
+  void snapshot(JsonDocument &doc, bool diagnostic) const {
+    const char *names[] = {"idle", "identify", "placement", "settling", "capture", "review", "saving"};
+    doc["kind"] = diagnostic ? "diagnostic" : "calibration";
+    doc["state"] = names[unsigned(state_)]; doc["board"] = selected_;
+    doc["distanceMeters"] = diagnostic ? double(diagnosticDistance_) : distance(); doc["attempt"] = attempt_;
+    doc["canNext"] = state_ == State::Wait;
+    doc["canSave"] = !diagnostic && state_ == State::Review && acceptable_;
+    doc["canReview"] = !diagnostic && state_ == State::Review;
+    doc["canCancel"] = localSession() && state_ != State::Save;
+    doc["outcome"] = outcome_; doc["A"] = A; doc["n"] = n;
+    if (std::isfinite(candidate_.a)) doc["candidateA"] = candidate_.a;
+    if (std::isfinite(candidate_.n)) doc["candidateN"] = candidate_.n;
+    if (std::isfinite(candidate_.rmse)) doc["fitRmseDb"] = candidate_.rmse;
+    if (validationRun_) {
+      doc["validation"]["rootMeters"]=validation_.forward;doc["validation"]["nodeMeters"]=validation_.reverse;
+      doc["validation"]["meanErrorMeters"]=validation_.mae;doc["validation"]["previousErrorMeters"]=validation_.previousMae;
+      doc["validation"]["passed"]=validation_.passed();
+    }
+    if (diagnostic) doc["radioChecks"].set(diagnosticEvidence_);
+    doc["message"] = state_ == State::Wait ? "Place root and selected node at the indicated separation, then press Next." :
+        state_ == State::Review ? (acceptable_ ? "Validation accepted. Save, retry, or remeasure a distance." : "Fit rejected. Retry or remeasure; the current model is retained.") :
+        state_ == State::Identify ? "Identifying selected boards for 7 seconds; waiting for mesh acknowledgements." :
+        state_ == State::Save ? "Saved on root; waiting for nodes to acknowledge the model." :
+        state_ == State::Idle ? "Session ended." : "Capturing readings. Keep both boards stationary.";
+    JsonArray readings = doc["readings"].to<JsonArray>();
+    for (unsigned i=0;i<5;++i) {
+      JsonObject row=readings.add<JsonObject>(); row["distanceMeters"]=diagnostic ? double(diagnosticDistance_) : double(i+1);
+      row["window"]=i+1;
+      const double f=diagnostic ? diagnosticForward_[i] : forward_[i];
+      const double r=diagnostic ? diagnosticReverse_[i] : reverse_[i];
+      if (std::isfinite(f)) row["rootRssi"]=f; else row["rootRssi"]=nullptr;
+      if (std::isfinite(r)) row["nodeRssi"]=r; else row["nodeRssi"]=nullptr;
+      if (!diagnostic && candidate_.valid() && std::isfinite(f) && std::isfinite(r)) {
+        const double fd=rssiToDistance(f,candidate_.a,candidate_.n), rd=rssiToDistance(r,candidate_.a,candidate_.n);
+        row["rootEstimatedMeters"]=fd;row["nodeEstimatedMeters"]=rd;
+        row["recheck"]=std::fabs(fd-double(i+1))>0.3*(i+1)||std::fabs(rd-double(i+1))>0.3*(i+1);
+      }
+      if (diagnostic) { row["rootValid"]=diagnosticForwardValid_[i]; row["nodeValid"]=diagnosticReverseValid_[i]; }
+    }
+  }
   // Queue work from mesh callbacks; send only later from loop(). Idle peers
   // do not need heartbeats once this connection event is acknowledged.
   void topologyChanged() {
@@ -34,7 +101,7 @@ class CalibrationMode {
     }
     if (validBlob(stored)) {
       A = stored.a; n = stored.exponent; revision_ = stored.revision; persisted_ = true;
-      Serial.printf("[AN] Loaded saved globals: A=%.4f n=%.4f\n", A, n);
+      FW_LOG("[AN] Loaded saved globals: A=%.4f n=%.4f\n", A, n);
     }
     if (timeSlicing.isRoot() && !revision_) revision_ = newId();
   }
@@ -42,10 +109,14 @@ class CalibrationMode {
   bool start(uint8_t board, bool diagnostic = false, uint8_t fixedDistance = 1) {
     if (!timeSlicing.isRoot() || active() || timeSlicing.busy() ||
         board < 2 || board > macList.size() || !networkSynced() || fixedDistance < 1 || fixedDistance > 5) {
-      Serial.println("[AN] Wait for all configured boards to connect and acknowledge the model");
+      FW_LOG("[AN] Wait for all configured boards to connect and acknowledge the model");
       return false;
     }
     selected_ = board; session_ = newId(); point_ = attempt_ = 0;
+    outcome_ = "running";
+    candidate_ = {}; forwardFit_ = {}; reverseFit_ = {};
+    validationRun_=false;diagnosticEvidence_.clear();
+    forward_.fill(NAN); reverse_.fill(NAN);
     diagnostic_ = diagnostic; diagnosticDistance_ = fixedDistance; diagnosticRound_ = 0;
     diagnosticForward_.fill(NAN); diagnosticReverse_.fill(NAN);
     diagnosticForwardValid_.fill(false); diagnosticReverseValid_.fill(false);
@@ -54,8 +125,8 @@ class CalibrationMode {
     stateSince_ = millis(); lastSend_ = millis() - 1000;
     syncPending_ = true; syncAttempts_ = 0;
     for (auto &peer : peers_) { peer.lock = 0; peer.identified = false; }
-    Serial.printf("[AN] Root 01 and node %02u: blink for 7 seconds, then wait for placement\n", board);
-    if (diagnostic_) Serial.println("[DIAG] Fixed-position diagnostic: five captures; A/n and saved calibration will not be changed");
+    FW_LOG("[AN] Root 01 and node %02u: blink for 7 seconds, then wait for placement\n", board);
+    if (diagnostic_) FW_LOG("[DIAG] Fixed-position diagnostic: five captures; A/n and saved calibration will not be changed");
     return true;
   }
 
@@ -63,50 +134,53 @@ class CalibrationMode {
   void command(const char *raw) {
     String text(raw); text.trim();
     if (diagnostic_ && text != "next" && text != "cancel") {
-      Serial.println("[DIAG] Use next at the placement prompt, or cancel. Diagnostics cannot save calibration");
+      FW_LOG("[DIAG] Use next at the placement prompt, or cancel. Diagnostics cannot save calibration");
       return;
     }
     if (text == "cancel") {
       if (state_ == State::Save) {
-        Serial.println("[AN] Save already committed; waiting for distribution. Cannot undo with cancel");
+        FW_LOG("[AN] Save already committed; waiting for distribution. Cannot undo with cancel");
         return;
       }
       abort_ = true;
-      if (timeSlicing.busy()) Serial.println("[AN] Cancel requested; restoring mesh after this capture");
+      if (timeSlicing.busy()) FW_LOG("[AN] Cancel requested; restoring mesh after this capture");
       else finish(false);
       return;
     }
     if (text == "next" && state_ == State::Wait) {
       state_ = State::Settle; stateSince_ = millis(); attempt_ = 0;
       stepSinceMs_ = millis();
-      Serial.println("[AN] Settling for 2 seconds; keep boards stationary");
+      FW_LOG("[AN] Settling for 2 seconds; keep boards stationary");
     } else if (text == "retry" && state_ == State::Review) {
+      forward_.fill(NAN);reverse_.fill(NAN);
+      candidate_={};forwardFit_={};reverseFit_={};validationRun_=false;
       point_ = attempt_ = 0; remeasuring_ = acceptable_ = false; prompt();
     } else if (state_ == State::Review && std::strncmp(text.c_str(), "remeasure ", 10) == 0) {
       const char *distance = text.c_str() + 10;
       while (*distance == ' ' || *distance == '\t') ++distance;
       if (*distance < '1' || *distance > '5' || distance[1]) {
-        Serial.println("[AN] Use remeasure <distance 1..5>");
+        FW_LOG("[AN] Use remeasure <distance 1..5>");
         return;
       }
       point_ = uint8_t(*distance - '1'); attempt_ = 0;
+      validationRun_=false;
       remeasuring_ = true; acceptable_ = false;
-      Serial.println("[AN] Reposition the pair and check antenna orientation/path; other distance readings are retained");
+      FW_LOG("[AN] Reposition the pair and check antenna orientation/path; other distance readings are retained");
       prompt();
     } else if (text == "save" && state_ == State::Review && acceptable_) {
       // Commit one blob before changing the active globals. A failed write
       // leaves the previous runtime model untouched.
       const uint32_t revision = newId();
       if (!store(candidate_.a, candidate_.n, revision)) {
-        Serial.println("[AN] NVS write failed; old A/n remain active. Retry save or cancel");
+        FW_LOG("[AN] NVS write failed; old A/n remain active. Retry save or cancel");
         return;
       }
       A = candidate_.a; n = candidate_.n; revision_ = revision; persisted_ = true;
       state_ = State::Save; stateSince_ = millis(); lastSend_ = millis() - 1000;
       syncPending_ = true; syncAttempts_ = 0;
-      Serial.printf("[AN] Saved and updated root globals: A=%.4f n=%.4f; waiting for node acknowledgements\n", A, n);
+      FW_LOG("[AN] Saved and updated root globals: A=%.4f n=%.4f; waiting for node acknowledgements\n", A, n);
     } else {
-      Serial.println(state_ == State::Review
+      FW_LOG(state_ == State::Review
           ? (acceptable_ ? "[AN] Use save | remeasure <1..5> | retry | cancel"
                          : "[AN] Save blocked: use remeasure <1..5> | retry | cancel")
           : "[AN] Use next when prompted, or cancel; conf/sniff are unavailable during calibration");
@@ -132,7 +206,7 @@ class CalibrationMode {
       }
       if (!peer) { peers_.push_back(Peer{}); peer = &peers_.back(); }
       if (peer->id && peer->id != from && mesh.isConnected(peer->id)) {
-        Serial.println("[AN] Duplicate board number; check BOARD_NUMBER on uploaded nodes");
+        FW_LOG("[AN] Duplicate board number; check BOARD_NUMBER on uploaded nodes");
         return false;
       }
       peer->board = board; peer->id = from; peer->seen = millis();
@@ -156,18 +230,18 @@ class CalibrationMode {
     if ((revision != revision_ || A != a || n != exponent) ||
         (doc["Persist"].as<bool>() && !persisted_)) {
       if (doc["Persist"].as<bool>() && !store(a, exponent, revision)) {
-        Serial.println("[AN] Cannot persist root model; withholding acknowledgement");
+        FW_LOG("[AN] Cannot persist root model; withholding acknowledgement");
         return false;
       }
       A = a; n = exponent; revision_ = revision; persisted_ = doc["Persist"].as<bool>();
-      Serial.printf("[AN] Updated globals from root: A=%.4f n=%.4f%s\n", A, n,
+      FW_LOG("[AN] Updated globals from root: A=%.4f n=%.4f%s\n", A, n,
                     persisted_ ? " (saved)" : "");
     }
     if (session != remoteSession_) {
       remoteSession_ = session; selected_ = selected; identifySince_ = millis();
       identificationAnnounced_ = false;
       if (session && selected_ == BOARD_NUMBER)
-        Serial.println("[AN] Selected with root: identifying for 7 seconds");
+        FW_LOG("[AN] Selected with root: identifying for 7 seconds");
     }
     remoteSeen_ = millis();
     remoteSyncEpoch_ = doc["SyncEpoch"] | uint32_t(0);
@@ -218,7 +292,7 @@ class CalibrationMode {
         remoteSeen_ = now;
       if (remoteSession_ && !timeSlicing.busy() && now - remoteSeen_ > 180000) {
         remoteSession_ = 0;
-        Serial.println("[AN] Root unreachable for 180 seconds; calibration lock released");
+        FW_LOG("[AN] Root unreachable for 180 seconds; calibration lock released");
       }
       return;
     }
@@ -228,14 +302,14 @@ class CalibrationMode {
       const Peer *selected = findPeer(selected_);
       if (now - identifySince_ >= 7000 && allLocked() && selected && selected->identified) prompt();
       else if (now - stateSince_ > 30000) {
-        Serial.println("[AN] Identification timed out: not all nodes acknowledged the lock"); finish(false);
+        FW_LOG("[AN] Identification timed out: not all nodes acknowledged the lock"); finish(false);
       }
     } else if (state_ == State::Settle) {
       if (now - stateSince_ < 2000) return;
       const Peer *peer = findPeer(selected_);
       if (!allLocked() || !peer || !timeSlicing.networkReadyForConfiguration(2)) {
         if (now - stateSince_ > 30000) {
-          Serial.println("[AN] Mesh not ready; enter next to retry this distance");
+          FW_LOG("[AN] Mesh not ready; enter next to retry this distance");
           state_ = State::Wait;
         }
         return;
@@ -246,15 +320,15 @@ class CalibrationMode {
         roundSinceMs_ = millis();
         ++attempt_;
         if (diagnostic_)
-          Serial.printf("[DIAG] Fixed %.1f m: window %u/5. Keep BOTH boards, antennas and cables fixed\n",
+          FW_LOG("[DIAG] Fixed %.1f m: window %u/5. Keep BOTH boards, antennas and cables fixed\n",
                         distance(), unsigned(diagnosticRound_ + 1));
-        else Serial.printf("[AN] %.1f m, capture %u/3; 10 seconds per direction, minimum 300 samples each\n", distance(), attempt_);
+        else FW_LOG("[AN] %.1f m, capture %u/3; 10 seconds per direction, minimum 300 samples each\n", distance(), attempt_);
       }
     } else if (state_ == State::Capture) {
       if (timeSlicing.busy()) return;
       if (timeSlicing.phase() == TimeSlicingController::Phase::FAILED) {
         if (now - stateSince_ >= 5000) {
-          Serial.println("[AN] Radio recovery pending; cancel or wait for mesh recovery");
+          FW_LOG("[AN] Radio recovery pending; cancel or wait for mesh recovery");
           stateSince_ = now;
         }
         return;
@@ -263,7 +337,7 @@ class CalibrationMode {
     } else if (state_ == State::Save) {
       if (networkSynced()) finish(true);
       else if (now - stateSince_ > 30000) {
-        Serial.println("[AN] Saved on root; waiting for missing acknowledgements or node reconnection");
+        FW_LOG("[AN] Saved on root; waiting for missing acknowledgements or node reconnection");
         stateSince_ = now;
       }
     }
@@ -288,6 +362,10 @@ class CalibrationMode {
   bool remeasuring_ = false;
   double baselineA_ = -60, baselineN_ = 2;
   bool diagnostic_ = false;
+  const char *outcome_ = "idle";
+  JsonDocument diagnosticEvidence_;
+  Calibration::ValidationCheck validation_;
+  bool validationRun_=false;
   uint8_t diagnosticDistance_ = 1, diagnosticRound_ = 0;
   std::array<double, 5> diagnosticForward_{}, diagnosticReverse_{};
   std::array<bool, 5> diagnosticForwardValid_{}, diagnosticReverseValid_{};
@@ -369,22 +447,26 @@ class CalibrationMode {
   void prompt() {
     state_ = State::Wait;
     if (diagnostic_) {
-      Serial.printf("[DIAG] Place the pair %.1f m apart. Keep both boards fixed for ALL five windows. Enter next | cancel\n", distance());
+      FW_LOG("[DIAG] Place the pair %.1f m apart. Keep both boards fixed for ALL five windows. Enter next | cancel\n", distance());
       return;
     }
-    Serial.printf("[AN] %sPlace selected boards %.1f metres apart, same plane. Enter next | cancel\n",
+    FW_LOG("[AN] %sPlace selected boards %.1f metres apart, same plane. Enter next | cancel\n",
                   point_ == 5 ? "Validation: " : "", distance());
   }
   void finish(bool saved) {
     const bool diagnosticComplete = diagnostic_ && diagnosticRound_ == 5 && !abort_;
+    bool validDiagnostic = diagnosticComplete;
+    if (diagnosticComplete) for (unsigned i=0;i<5;++i)
+      validDiagnostic &= diagnosticForwardValid_[i] && diagnosticReverseValid_[i];
+    outcome_ = saved || validDiagnostic ? "success" : abort_ ? "cancelled" : "failed";
     state_ = State::Idle; session_ = 0; abort_ = false;
     syncPending_ = true; syncAttempts_ = 0;
     if (meshStarted) broadcastState();
     if (diagnostic_) {
-      Serial.println(diagnosticComplete ? "[DIAG] Complete. A/n and saved calibration unchanged"
+      FW_LOG(diagnosticComplete ? "[DIAG] Complete. A/n and saved calibration unchanged"
                                        : "[DIAG] Cancelled. A/n and saved calibration unchanged");
       diagnostic_ = false;
-    } else Serial.println(saved ? "[AN] Calibration saved; all configured nodes acknowledged active A/n"
+    } else FW_LOG(saved ? "[AN] Calibration saved; all configured nodes acknowledged active A/n"
                                 : "[AN] Calibration cancelled; previous model retained");
   }
   bool reading(JsonVariantConst report, const char *key, double &value) {
@@ -398,10 +480,10 @@ class CalibrationMode {
         !report["PacketSpanMs"][key].is<unsigned>()) return false;
     value = report["FilteredRSSI"][key];
     const double spread = report["RSSISpread"][key];
-    Serial.printf("[AN] %s receiver: RSSI=%.2f dBm, samples=%u/300 minimum, spread=%.2f dB\n",
+    FW_LOG("[AN] %s receiver: RSSI=%.2f dBm, samples=%u/300 minimum, spread=%.2f dB\n",
                   strcmp(key, "2") == 0 ? "root" : "selected node", value,
                   report["Samples"][key].as<unsigned>(), spread);
-    Serial.printf("[AN] Receiver observed window=%.3f s (scheduled 10.000 s), first-to-last packet span=%.3f s\n",
+    FW_LOG("[AN] Receiver observed window=%.3f s (scheduled 10.000 s), first-to-last packet span=%.3f s\n",
                   double(report["ObservedWindowMs"][key].as<unsigned>()) / 1000,
                   double(report["PacketSpanMs"][key].as<unsigned>()) / 1000);
     return report["Samples"][key].as<unsigned>() >= TimeSliceProtocol::CALIBRATION_MIN_SAMPLES &&
@@ -409,7 +491,7 @@ class CalibrationMode {
         std::isfinite(spread) && spread >= 0 && spread <= 4;
   }
   void readCapture() {
-    Serial.printf("[AN] Round exchange elapsed=%.3f s; elapsed since next=%.3f s (includes retries/reconnection)\n",
+    FW_LOG("[AN] Round exchange elapsed=%.3f s; elapsed since next=%.3f s (includes retries/reconnection)\n",
                   double(uint32_t(millis() - roundSinceMs_)) / 1000,
                   double(uint32_t(millis() - stepSinceMs_)) / 1000);
     double forward = NAN, reverse = NAN;
@@ -421,10 +503,10 @@ class CalibrationMode {
     }
     if (!gotForward || !gotReverse) {
       if (attempt_ < 3) {
-        Serial.println("[AN] Insufficient/unstable readings; automatically collecting another window");
+        FW_LOG("[AN] Insufficient/unstable readings; automatically collecting another window");
         state_ = State::Settle; stateSince_ = millis();
       } else {
-        Serial.println("[AN] Three captures failed. Keep path clear; enter next to retry, or cancel");
+        FW_LOG("[AN] Three captures failed. Keep path clear; enter next to retry, or cancel");
         state_ = State::Wait;
       }
       return;
@@ -437,87 +519,98 @@ class CalibrationMode {
       std::array<double, 5> shared{};
       for (unsigned i = 0; i < 5; ++i) shared[i] = (forward_[i] + reverse_[i]) / 2;
       candidate_ = Calibration::fit(shared);
+      validationRun_=false;
       printFit("Root receiving", forwardFit_); printFit("Node receiving", reverseFit_);
       printFit("Shared baseline", candidate_);
       acceptable_ = forwardFit_.valid() && reverseFit_.valid() && candidate_.valid();
       const auto check = Calibration::checkTraining(candidate_, forward_, reverse_);
-      Serial.println("[AN] Distance checks (candidate estimates; old model remains active):");
+      FW_LOG("[AN] Distance checks (candidate estimates; old model remains active):");
       for (unsigned i = 0; i < 5; ++i) {
-        Serial.printf("[AN] Actual %u m -> %.2f / %.2f m%s\n", i + 1,
+        FW_LOG("[AN] Actual %u m -> %.2f / %.2f m%s\n", i + 1,
                       check.forward[i], check.reverse[i], check.recheck[i] ? " RECHECK (>30% error)" : "");
       }
       if (!check.passed) {
         acceptable_ = false;
-        Serial.println("[AN] Model cannot explain all distances within 30%; remeasure flagged distances. No readings were discarded");
+        FW_LOG("[AN] Model cannot explain all distances within 30%; remeasure flagged distances. No readings were discarded");
       }
       if (std::fabs(forwardFit_.a - reverseFit_.a) > 6 ||
           std::fabs(forwardFit_.n - reverseFit_.n) > 1) {
-        Serial.println("[AN] Large directional disagreement; shared model rejected"); acceptable_ = false;
+        FW_LOG("[AN] Large directional disagreement; shared model rejected"); acceptable_ = false;
       }
       if (!acceptable_) {
-        Serial.println("[AN] Fit rejected: requires A -100..-10, n 0.5..6, RMSE <=4 dB and all distance checks. Use remeasure <1..5> | retry | cancel");
+        FW_LOG("[AN] Fit rejected: requires A -100..-10, n 0.5..6, RMSE <=4 dB and all distance checks. Use remeasure <1..5> | retry | cancel");
         state_ = State::Review;
       } else prompt();
     } else {
       const auto check = Calibration::checkValidation(candidate_, baselineA_, baselineN_, forward, reverse);
-      Serial.printf("[AN] Validation actual=2.50 m; fitted=%.2f / %.2f m; previous=%.2f / %.2f m\n",
+      validation_=check;validationRun_=true;
+      FW_LOG("[AN] Validation actual=2.50 m; fitted=%.2f / %.2f m; previous=%.2f / %.2f m\n",
                     check.forward, check.reverse, check.previousForward, check.previousReverse);
-      Serial.printf("[AN] Validation mean absolute error: fitted=%.3f m, previous=%.3f m\n",
+      FW_LOG("[AN] Validation mean absolute error: fitted=%.3f m, previous=%.3f m\n",
                     check.mae, check.previousMae);
       acceptable_ = check.passed();
       state_ = State::Review;
-      if (!check.withinTolerance) Serial.println("[AN] Validation failed: exceeds 30% distance error");
-      if (!check.noRegression) Serial.println("[AN] Validation failed: candidate error exceeds previous model (2 cm allowance)");
-      Serial.println(acceptable_
+      if (!check.withinTolerance) FW_LOG("[AN] Validation failed: exceeds 30% distance error");
+      if (!check.noRegression) FW_LOG("[AN] Validation failed: candidate error exceeds previous model (2 cm allowance)");
+      FW_LOG(acceptable_
           ? "[AN] Validation accepted at this point; no accuracy claim for other locations. Use save | remeasure <1..5> | retry | cancel"
           : "[AN] Previous globals/NVS retained. Use remeasure <1..5> | retry | cancel");
     }
   }
   static void printFit(const char *label, const Calibration::Fit &fit) {
-    Serial.printf("[AN] %s: A=%.4f dBm, n=%.4f, RMSE=%.3f dB\n", label, fit.a, fit.n, fit.rmse);
+    FW_LOG("[AN] %s: A=%.4f dBm, n=%.4f, RMSE=%.3f dB\n", label, fit.a, fit.n, fit.rmse);
   }
   void diagnosticCapture(double forward, double reverse, bool forwardValid, bool reverseValid) {
     const unsigned i = diagnosticRound_;
+    JsonObject evidence=diagnosticEvidence_[String(i+1)].to<JsonObject>();
+    evidence["rootSamples"].set(roundReports["1"]["Samples"]["2"]);
+    evidence["nodeSamples"].set(roundReports["2"]["Samples"]["1"]);
+    evidence["rootSpreadDb"].set(roundReports["1"]["RSSISpread"]["2"]);
+    evidence["nodeSpreadDb"].set(roundReports["2"]["RSSISpread"]["1"]);
+    evidence["rootObservedWindowMs"].set(roundReports["1"]["ObservedWindowMs"]["2"]);
+    evidence["nodeObservedWindowMs"].set(roundReports["2"]["ObservedWindowMs"]["1"]);
+    evidence["rootRadio"].set(roundReports["1"]["RadioConfig"]);
+    evidence["nodeRadio"].set(roundReports["2"]["RadioConfig"]);
     diagnosticForward_[i] = forward; diagnosticReverse_[i] = reverse;
     diagnosticForwardValid_[i] = forwardValid; diagnosticReverseValid_[i] = reverseValid;
-    Serial.printf("[DIAG] Window %u/5: root=%.2f dBm [%s], node=%.2f dBm [%s]\n", i + 1,
+    FW_LOG("[DIAG] Window %u/5: root=%.2f dBm [%s], node=%.2f dBm [%s]\n", i + 1,
         forward, forwardValid ? "valid" : "flagged/missing", reverse, reverseValid ? "valid" : "flagged/missing");
     printDiagnosticRadio(roundReports["1"], "2", "Root 01");
     printDiagnosticRadio(roundReports["2"], "1", "Selected node");
     if (++diagnosticRound_ < 5) {
       attempt_ = 0; state_ = State::Settle; stateSince_ = millis();
-      Serial.println("[DIAG] Next window will start automatically after mesh readiness. DO NOT move either board");
+      FW_LOG("[DIAG] Next window will start automatically after mesh readiness. DO NOT move either board");
       return;
     }
-    Serial.printf("[DIAG] Fixed-position summary at user-labelled %.1f m (not fitted distances):\n", distance());
+    FW_LOG("[DIAG] Fixed-position summary at user-labelled %.1f m (not fitted distances):\n", distance());
     for (unsigned row = 0; row < 5; ++row)
-      Serial.printf("[DIAG] %u: root=%.2f [%s], node=%.2f [%s] dBm\n", row + 1,
+      FW_LOG("[DIAG] %u: root=%.2f [%s], node=%.2f [%s] dBm\n", row + 1,
           diagnosticForward_[row], diagnosticForwardValid_[row] ? "valid" : "flagged/missing",
           diagnosticReverse_[row], diagnosticReverseValid_[row] ? "valid" : "flagged/missing");
     printWindowSummary("Root receiver", Calibration::summarizeWindows(diagnosticForward_, diagnosticForwardValid_));
     printWindowSummary("Node receiver", Calibration::summarizeWindows(diagnosticReverse_, diagnosticReverseValid_));
-    Serial.println("[DIAG] Compare config lines across windows/boards. TX cap is configured maximum, not measured RF output");
-    Serial.println("[DIAG] Repeat the same placement, or move to 2 m and run an diag <board> 2");
+    FW_LOG("[DIAG] Compare config lines across windows/boards. TX cap is configured maximum, not measured RF output");
+    FW_LOG("[DIAG] Repeat the same placement, or move to 2 m and run an diag <board> 2");
     finish(false);
   }
   static void printDiagnosticRadio(JsonVariantConst report, const char *key, const char *label) {
-    Serial.printf("[DIAG] %s radio configuration: ", label);
+    FW_LOG("[DIAG] %s radio configuration: ", label);
     if (report["RadioConfig"].is<JsonObjectConst>()) {
-      serializeJson(report["RadioConfig"], Serial); Serial.println();
+      FW_LOG(); FW_LOG();
       if (!(report["RadioConfig"]["ReadOK"] | false))
-        Serial.println("[DIAG] WARNING: one or more radio configuration reads failed");
-    } else Serial.println("unavailable (missing report or node firmware needs updating)");
+        FW_LOG("[DIAG] WARNING: one or more radio configuration reads failed");
+    } else FW_LOG("unavailable (missing report or node firmware needs updating)");
     if (report["ReceivedChannel"][key].is<unsigned>()) {
-      Serial.printf("[DIAG] Observed RX channel=%u, changed during capture=%s\n",
+      FW_LOG("[DIAG] Observed RX channel=%u, changed during capture=%s\n",
           report["ReceivedChannel"][key].as<unsigned>(), (report["ChannelChanged"][key] | false) ? "YES" : "no");
     }
   }
   static void printWindowSummary(const char *label, const Calibration::WindowSummary &summary) {
-    if (!summary.count) { Serial.printf("[DIAG] %s: no valid windows; no stability conclusion\n", label); return; }
-    Serial.printf("[DIAG] %s: valid=%u/5, mean=%.2f, min=%.2f, max=%.2f, between-window SD=%.2f, range=%.2f dB\n",
+    if (!summary.count) { FW_LOG("[DIAG] %s: no valid windows; no stability conclusion\n", label); return; }
+    FW_LOG("[DIAG] %s: valid=%u/5, mean=%.2f, min=%.2f, max=%.2f, between-window SD=%.2f, range=%.2f dB\n",
         label, summary.count, summary.mean, summary.minimum, summary.maximum, summary.spread, summary.maximum - summary.minimum);
-    if (summary.count < 3) Serial.println("[DIAG] Too few valid windows for a useful repeatability check");
+    if (summary.count < 3) FW_LOG("[DIAG] Too few valid windows for a useful repeatability check");
     else if (summary.maximum - summary.minimum > 3)
-      Serial.println("[DIAG] RSSI changed by >3 dB between valid windows at this fixed placement; investigate repeatability");
+      FW_LOG("[DIAG] RSSI changed by >3 dB between valid windows at this fixed placement; investigate repeatability");
   }
 };

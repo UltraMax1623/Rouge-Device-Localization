@@ -1,4 +1,5 @@
 #pragma once
+#include "firmware_log.h"
 
 #include <Arduino.h>
 #include "../root_node/time_slicing_protocol.h"
@@ -44,11 +45,11 @@ inline void beginModeIndicator() {
   // Report the real data GPIO using the same mapping as rgbLedWrite().
   if (physicalPin == RGB_BUILTIN) physicalPin -= SOC_GPIO_PIN_COUNT;
 #endif
-  Serial.printf("[LED] RGB driver, data GPIO %u\n", physicalPin);
-  Serial.println("[LED] If dark, check the selected board and its RGB data-pin revision");
+  FW_LOG("[LED] RGB driver, data GPIO %u\n", physicalPin);
+  FW_LOG("[LED] If dark, check the selected board and its RGB data-pin revision");
 #else
   pinMode(MODE_LED_PIN, OUTPUT);
-  Serial.printf("[LED] Monochrome driver, GPIO %u (active %s)\n",
+  FW_LOG("[LED] Monochrome driver, GPIO %u (active %s)\n",
                 unsigned(MODE_LED_PIN), MODE_LED_ACTIVE_LOW ? "low" : "high");
 #endif
   writeModeLed(false);
@@ -69,7 +70,7 @@ inline void updateModeIndicator(const String &mode, bool fault,
   if (pattern != previous) {
     previous = pattern;
     since = now;
-    Serial.printf("[LED] %s\n", fault ? "fault" : pattern == 6 ? "TX - measurement slot"
+    FW_LOG("[LED] %s\n", fault ? "fault" : pattern == 6 ? "TX - measurement slot"
         : pattern == 7 ? "RX - listening" : pattern == 8 ? "waiting - no active measurement slot"
         : pattern == 4
                                              ? "mesh broadcast" : mode.c_str());

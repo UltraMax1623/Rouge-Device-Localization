@@ -1,4 +1,5 @@
 #pragma once
+#include "../shared/firmware_log.h"
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -20,6 +21,20 @@
 // so repeated measurement rounds do not leak one mutex per mesh restart.
 class MeasurementMesh : public painlessMesh {
  public:
+#if ROOT_FIRMWARE
+  void configureRouterStation(const String &ssid, const String &password) {
+    // A mesh restart can leave a scan in flight or a delayed/yielded task.
+    // Reset that work before configuring the root's external station.
+    stationScan.task.disable();
+    esp_wifi_scan_stop();
+    WiFi.scanDelete();
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() != ssid)
+      WiFi.disconnect(false, false);
+    stationManual(ssid, password);
+    stationScan.task.enable();
+    stationScan.task.forceNextIteration();
+  }
+#endif
   bool sendBroadcast(String message, bool includeSelf = false) {
     const bool queued = painlessMesh::sendBroadcast(message, includeSelf);
     if (queued) {
@@ -82,6 +97,16 @@ class TimeSlicingController {
   Phase phase() const { return phase_; }
   bool timingCritical() const { return RoundSafety::timingCritical(phase_); }
   bool roundCancelled() const { return cancelled_; }
+  const char *resultReason() const { return resultReason_; }
+  uint8_t captureCycle() const { return captureCycle_; }
+  uint8_t targetChannel() const { return targetChannel_; }
+  bool requestCancellation() {
+    if (!isRoot() || timingCritical()) return false;
+    pendingCycle_ = 0;
+    if (busy() && phase_ != Phase::CANCELLING) beginCancellation("user cancelled");
+    else { cancelled_ = true; resultReason_ = "user cancelled"; }
+    return true;
+  }
   TimeSliceProtocol::RadioActivity radioActivity() const {
     using TimeSliceProtocol::RadioActivity;
     if (phase_ != Phase::MEASURING) return RadioActivity::None;
@@ -126,7 +151,7 @@ class TimeSlicingController {
     } else {
       phase_ = Phase::REPORTING;
     }
-    Serial.printf("[ROUND %u] Mesh recovered; resuming result exchange\n", round_);
+    FW_LOG("[ROUND %u] Mesh recovered; resuming result exchange\n", round_);
   }
 
   void topologyChanged() {
@@ -153,7 +178,7 @@ class TimeSlicingController {
     phaseSinceMs_ = millis();
     lastMessageMs_ = millis() - RETRY_MS;
     mode_ = "conf";
-    Serial.printf("[ROUND %u] Waiting for %u ready nodes\n", round_,
+    FW_LOG("[ROUND %u] Waiting for %u ready nodes\n", round_,
                   static_cast<unsigned>(table_.size()));
     return true;
   }
@@ -177,9 +202,9 @@ class TimeSlicingController {
       discoveredChannel = channel;
     }
     sniffReports.clear();
-    if (!discoveryRound_) Serial.printf("[SNIFF] Capture cycle %u/%u, %u seconds\n",
+    if (!discoveryRound_) FW_LOG("[SNIFF] Capture cycle %u/%u, %u seconds\n",
         captureCycle_, TimeSliceProtocol::SNIFF_CYCLES, unsigned(TimeSliceProtocol::SNIFF_US / 1000000));
-    Serial.printf("[SNIFF] %s for %s%s\n",
+    FW_LOG("[SNIFF] %s for %s%s\n",
                   discoveryRound_ ? "Channel discovery" : "Fixed-channel capture",
                   macString(target_).c_str(), discoveryRound_ ? "" : " scheduled");
     return true;
@@ -254,7 +279,7 @@ class TimeSlicingController {
       if (firstReady) {
         size_t count = 0;
         for (bool ready : ready_) if (ready) ++count;
-        Serial.printf("[ROUND %u] Ready: %s, slot %u (%u/%u including root)\n",
+        FW_LOG("[ROUND %u] Ready: %s, slot %u (%u/%u including root)\n",
                       round_, macString(table_[slot]).c_str(),
                       static_cast<unsigned>(slot + 1), static_cast<unsigned>(count),
                       static_cast<unsigned>(table_.size()));
@@ -275,7 +300,7 @@ class TimeSlicingController {
       meshStartUs_ = start;
       phase_ = Phase::ARMED;
       lastMessageMs_ = millis();
-      Serial.printf("[ROUND %u] Start scheduled at mesh time %u us\n",
+      FW_LOG("[ROUND %u] Start scheduled at mesh time %u us\n",
                     round_, meshStartUs_);
       return true;
     }
@@ -300,7 +325,7 @@ class TimeSlicingController {
           !macMatches(doc["StationMAC"], table_[slot]) ||
           (peerIds_[slot] && peerIds_[slot] != from)) return false;
       peerIds_[slot] = from;
-      if (!cancellation_.acknowledged(slot)) Serial.printf("[ROUND %u] Cancel acknowledged: %s\n",
+      if (!cancellation_.acknowledged(slot)) FW_LOG("[ROUND %u] Cancel acknowledged: %s\n",
                                                    round_, macString(table_[slot]).c_str());
       cancellation_.acknowledge(slot);
       return true;
@@ -311,7 +336,7 @@ class TimeSlicingController {
         size_t slot;
         if (!reporterSlot(doc, slot) || slot == selfIndex_ || peerIds_[slot] != from)
           return false;
-        Serial.printf("[ROUND %u] Ignored late report from %s: round cancelled\n",
+        FW_LOG("[ROUND %u] Ignored late report from %s: round cancelled\n",
                       round_, macString(table_[slot]).c_str());
         sendCancel(from);
         return true;
@@ -322,7 +347,7 @@ class TimeSlicingController {
       if (isRoot() || from != rootNodeId() || !validEnvelope(doc, 1) ||
           phase_ != Phase::REPORTING) return false;
       phase_ = Phase::IDLE;
-      Serial.printf("[ROUND %u] Root acknowledged results\n", round_);
+      FW_LOG("[ROUND %u] Root acknowledged results\n", round_);
       return true;
     }
     return false;
@@ -349,11 +374,11 @@ class TimeSlicingController {
     if (phase_ == Phase::CANCELLING) {
       if (cancellation_.status(nowMs) != RoundSafety::Cancellation::Status::Pending) {
         for (size_t i = 0; i < table_.size(); ++i) {
-          if (!cancellation_.acknowledged(i)) Serial.printf("[ROUND %u] Cancel ACK timeout: %s\n",
+          if (!cancellation_.acknowledged(i)) FW_LOG("[ROUND %u] Cancel ACK timeout: %s\n",
                                                    round_, macString(table_[i]).c_str());
         }
         phase_ = Phase::IDLE;
-        Serial.println("[ROUND] Cancelled; no result table or average produced. Commands enabled");
+        FW_LOG("[ROUND] Cancelled; no result table or average produced. Commands enabled");
       } else if (meshStarted_ && nowMs - lastMessageMs_ >= RETRY_MS) {
         sendCancel();
       }
@@ -362,21 +387,21 @@ class TimeSlicingController {
     if (phase_ == Phase::CHANNEL_WAIT) {
       if (nowMs - phaseSinceMs_ > READY_TIMEOUT_MS) {
         phase_ = Phase::IDLE;
-        Serial.println("[ERROR] Mesh did not settle before the next sniff cycle; operation stopped");
+        FW_LOG("[ERROR] Mesh did not settle before the next sniff cycle; operation stopped");
       } else if (nowMs - phaseSinceMs_ >= 3000 && settled() && meshStarted_ &&
                  mesh_.getNodeList().size() >= table_.size() - 1) {
         const auto table = table_;
         const auto target = target_;
         phase_ = Phase::IDLE;
         if (!beginSniff(table, target, pendingChannel_, pendingCycle_, true))
-          Serial.println("[ERROR] Could not start fixed-channel sniff");
+          FW_LOG("[ERROR] Could not start fixed-channel sniff");
       }
       return;
     }
     if (phase_ == Phase::WAIT_READY) {
       if (nowMs - phaseSinceMs_ > READY_TIMEOUT_MS) {
         for (size_t i = 0; i < table_.size(); ++i) {
-          if (!ready_[i]) Serial.printf("[ROUND %u] Missing ready: %s\n",
+          if (!ready_[i]) FW_LOG("[ROUND %u] Missing ready: %s\n",
                                        round_, macString(table_[i]).c_str());
         }
         beginCancellation("missing ready replies");
@@ -384,7 +409,7 @@ class TimeSlicingController {
         meshStartUs_ = mesh_.getNodeTime() + START_LEAD_US;
         phase_ = Phase::ARMED;
         lastMessageMs_ = nowMs - RETRY_MS;
-        Serial.printf("[ROUND %u] All stations ready; start in %u ms (mesh time %u us)\n",
+        FW_LOG("[ROUND %u] All stations ready; start in %u ms (mesh time %u us)\n",
                       round_, START_LEAD_US / 1000, meshStartUs_);
         sendControl("start", true);
       } else if (nowMs - lastMessageMs_ >= RETRY_MS) {
@@ -396,7 +421,7 @@ class TimeSlicingController {
       if (nowMs - phaseSinceMs_ > READY_TIMEOUT_MS + 20000) {
         phase_ = Phase::IDLE;
         mode_ = "mesh";
-        Serial.println("[ROUND] No start received; remaining in mesh");
+        FW_LOG("[ROUND] No start received; remaining in mesh");
       } else if (settled() && nowMs - lastMessageMs_ >= RETRY_MS) {
         sendReady();
       }
@@ -409,7 +434,7 @@ class TimeSlicingController {
       } else if (remaining <= static_cast<int32_t>(PREPARE_US)) {
         // Do not shift late slots: either meet the shared schedule or fail.
         if (remaining < static_cast<int32_t>(PREPARE_US - 250000)) {
-          Serial.printf("[TIMING] Preparation remaining=%ld us; controller max gap=%llu us\n",
+          FW_LOG("[TIMING] Preparation remaining=%ld us; controller max gap=%llu us\n",
                         static_cast<long>(remaining), static_cast<unsigned long long>(maxServiceGapUs_));
           finishRound(false, "missed radio preparation deadline", false);
           return;
@@ -425,10 +450,10 @@ class TimeSlicingController {
           portENTER_CRITICAL(&mux_);
           capturing_ = true;
           portEXIT_CRITICAL(&mux_);
-          if (sniffRound_) Serial.printf("[ROUND %u] Radio ready; %s for %u ms, channel=%u\n",
+          if (sniffRound_) FW_LOG("[ROUND %u] Radio ready; %s for %u ms, channel=%u\n",
               round_, discoveryRound_ ? "channel discovery" : "target capture",
               unsigned(sniffDurationUs(discoveryRound_) / 1000), targetChannel_);
-          else Serial.printf("[ROUND %u] Radio ready; %u ordered slots\n", round_,
+          else FW_LOG("[ROUND %u] Radio ready; %u ordered slots\n", round_,
                              static_cast<unsigned>(table_.size()));
         }
       } else if (isRoot() && nowMs - lastMessageMs_ >= RETRY_MS) {
@@ -445,10 +470,10 @@ class TimeSlicingController {
           const bool wasOpen = window.openedUs >= 0, wasClosed = window.closedUs >= 0;
           window.observe(nowUs, start, start + CALIBRATION_SAMPLE_US);
           if (!wasOpen && window.openedUs >= 0)
-            Serial.printf("[AN] %s window started: slot %u, local %.3f s, scheduled 10.000 s\n",
+            FW_LOG("[AN] %s window started: slot %u, local %.3f s, scheduled 10.000 s\n",
                 i == selfIndex_ ? "TX" : "RX", unsigned(i + 1), double(nowUs) / 1000000);
           if (!wasClosed && window.closedUs >= 0)
-            Serial.printf("[AN] %s window ended: slot %u, observed %.3f s\n",
+            FW_LOG("[AN] %s window ended: slot %u, observed %.3f s\n",
                 i == selfIndex_ ? "TX" : "RX", unsigned(i + 1), double(window.elapsedMs()) / 1000);
         }
       }
@@ -495,7 +520,7 @@ class TimeSlicingController {
     if (phase_ == Phase::REPORTING) {
       if (nowMs - phaseSinceMs_ > REPORT_TIMEOUT_MS) {
         phase_ = Phase::IDLE;
-        Serial.println("[ROUND] Report timeout; results remain available locally");
+        FW_LOG("[ROUND] Report timeout; results remain available locally");
       } else if (meshStarted_ && mesh_.isConnected(rootNodeId()) &&
                  nowMs - lastMessageMs_ >= RETRY_MS) {
         JsonDocument report;
@@ -506,10 +531,10 @@ class TimeSlicingController {
     }
     if (phase_ == Phase::COLLECTING) {
       if (allSet(reportReceived_)) {
-        Serial.println("[ROUND] All result reports received");
+        FW_LOG("[ROUND] All result reports received");
         completeCollection();
       } else if (nowMs - phaseSinceMs_ > REPORT_TIMEOUT_MS) {
-        Serial.println("[ROUND] Result collection timeout; missing reports retained as absent");
+        FW_LOG("[ROUND] Result collection timeout; missing reports retained as absent");
         completeCollection();
       }
     }
@@ -636,7 +661,7 @@ class TimeSlicingController {
       containsSelf |= memcmp(table[i].data(), selfStation_, 6) == 0;
       for (size_t j = 0; j < i; ++j) if (table[i] == table[j]) return false;
     }
-    if (!containsSelf) Serial.println("[ROUND] MacList must include this station MAC");
+    if (!containsSelf) FW_LOG("[ROUND] MacList must include this station MAC");
     return containsSelf;
   }
   static uint32_t hashTable(const std::vector<Mac> &table) {
@@ -751,7 +776,7 @@ class TimeSlicingController {
     sendJson(doc);
   }
   void sendReady() {
-    Serial.printf("[ROUND %u] Sending ready from slot %u to root %u\n",
+    FW_LOG("[ROUND %u] Sending ready from slot %u to root %u\n",
               round_,
               static_cast<unsigned>(selfIndex_ + 1),
               static_cast<unsigned>(rootNodeId()));
@@ -804,7 +829,7 @@ class TimeSlicingController {
     mode_ = "mesh";
     phaseSinceMs_ = millis();
     lastMessageMs_ = millis() - RETRY_MS;
-    Serial.printf("[ROUND %u] Cancelling: %s; waiting for node acknowledgements (up to %u ms)\n",
+    FW_LOG("[ROUND %u] Cancelling: %s; waiting for node acknowledgements (up to %u ms)\n",
                   round_, reason, cancelTimeoutMs_);
     sendCancel();
   }
@@ -886,14 +911,14 @@ class TimeSlicingController {
       captureChannel_ = discoveryRound_ ? scanFirst_ : targetChannel_;
       if (captureChannel_ < scanFirst_ || captureChannel_ >= scanFirst_ + scanCount_ ||
           esp_wifi_set_channel(captureChannel_, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
-        Serial.println("[ERROR] Target channel is not supported by this board's country settings");
+        FW_LOG("[ERROR] Target channel is not supported by this board's country settings");
         return false;
       }
       wifi_promiscuous_filter_t filter{};
       filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
-      if (discoveryRound_) Serial.printf("[SNIFF] Hopping channels %u..%u\n",
+      if (discoveryRound_) FW_LOG("[SNIFF] Hopping channels %u..%u\n",
           scanFirst_, scanFirst_ + scanCount_ - 1);
-      else Serial.printf("[SNIFF] Listening on channel %u\n", targetChannel_);
+      else FW_LOG("[SNIFF] Listening on channel %u\n", targetChannel_);
       return esp_wifi_set_promiscuous_filter(&filter) == ESP_OK &&
              esp_wifi_set_promiscuous_rx_cb(sniffCallback) == ESP_OK &&
              esp_wifi_set_promiscuous(true) == ESP_OK;
@@ -951,9 +976,9 @@ class TimeSlicingController {
     if (powerOK) radioConfig_["TxPowerCapQuarterDbm"] = txCap;
     radioConfig_["RequestedTxPowerCapQuarterDbm"] = 60;
     radioConfig_["TxIntervalMs"] = 20;
-    Serial.print("[RADIO] Calibration capture config: ");
-    serializeJson(radioConfig_, Serial);
-    Serial.println();
+    FW_LOG("[RADIO] Calibration capture config: ");
+    FW_LOG();
+    FW_LOG();
   }
   void makeReport(JsonDocument &doc) {
     envelope(doc, "mesh", sniffRound_ ? "sniff_report" : "rssi_report", 0);
@@ -1001,10 +1026,10 @@ class TimeSlicingController {
     }
     if (calibrationRound_ && phase_ == Phase::MEASURING) {
       radioElapsedMs_ = uint32_t((esp_timer_get_time() - localStartUs_) / 1000);
-      Serial.printf("[AN] Pair radio elapsed %.3f s; restoring mesh for reports\n", double(radioElapsedMs_) / 1000);
+      FW_LOG("[AN] Pair radio elapsed %.3f s; restoring mesh for reports\n", double(radioElapsedMs_) / 1000);
     }
     if (restoreRadio) endRadio();
-    Serial.printf("[TIMING] Round %u maximum controller gap=%llu us\n",
+    FW_LOG("[TIMING] Round %u maximum controller gap=%llu us\n",
                   round_, static_cast<unsigned long long>(maxServiceGapUs_));
     resultOK_ = ok;
     resultReason_ = reason;
@@ -1044,13 +1069,13 @@ class TimeSlicingController {
         }
       }
     }
-    Serial.printf("[ROUND %u] %s; RSSI: ", round_, reason);
-    serializeJson(slotRSSI, Serial);
-    Serial.println();
+    FW_LOG("[ROUND %u] %s; RSSI: ", round_, reason);
+    FW_LOG();
+    FW_LOG();
     if (restoreRadio && !restartMesh_()) {
       phase_ = Phase::FAILED;
       mode_ = "mesh";
-      Serial.println("[ROUND] Mesh restart failed; results preserved locally");
+      FW_LOG("[ROUND] Mesh restart failed; results preserved locally");
       return;
     }
     mode_ = "mesh";
@@ -1137,7 +1162,7 @@ class TimeSlicingController {
     JsonDocument reply;
     envelope(reply, "mesh", "report_ack", 1);
     sendJson(reply, from);
-    Serial.printf("[ROUND %u] Report stored for slot %u (%s)\n", round_,
+    FW_LOG("[ROUND %u] Report stored for slot %u (%s)\n", round_,
                   static_cast<unsigned>(reporter + 1), status);
     return true;
   }
@@ -1158,18 +1183,19 @@ class TimeSlicingController {
     }
     distanceReports[source].set(doc["Distances"]);
     if (distanceReports.overflowed()) return false;
-    Serial.printf("[ROUND %u] Distances stored from %s (A=%.2f, n=%.2f)\n",
+    FW_LOG("[ROUND %u] Distances stored from %s (A=%.2f, n=%.2f)\n",
                   round_, source.c_str(), doc["A"].as<double>(), doc["n"].as<double>());
     return true;
   }
 
   void printDistanceSummary() {
-    Serial.printf("\n[ROUND %u] Node distance results (metres)\n", round_);
+#if 0  // Preserve the old Serial table without formatting unused output.
+    FW_LOG("\n[ROUND %u] Node distance results (metres)\n", round_);
     for (size_t reporter = 0; reporter < table_.size(); ++reporter) {
       String source = macString(table_[reporter]);
       JsonObjectConst readings = distanceReports[source].as<JsonObjectConst>();
       source.replace(':', ' ');
-      Serial.printf("\n%s measures%s\n", source.c_str(),
+      FW_LOG("\n%s measures%s\n", source.c_str(),
                     reportReceived_[reporter] ? "" : " [NO REPORT]");
       if (sniffRound_) {
         String target = macString(target_);
@@ -1179,16 +1205,16 @@ class TimeSlicingController {
         if (!reportReceived_[reporter]) snprintf(value, sizeof(value), "no report");
         else if (distance.isNull()) snprintf(value, sizeof(value), "unavailable");
         else snprintf(value, sizeof(value), "%.4f", distance.as<double>());
-        Serial.println("+-------------------+----------------+");
-        Serial.println("| Target MAC        | Distance (m)   |");
-        Serial.println("+-------------------+----------------+");
-        Serial.printf("| %s | %14s |\n", target.c_str(), value);
-        Serial.println("+-------------------+----------------+");
+        FW_LOG("+-------------------+----------------+");
+        FW_LOG("| Target MAC        | Distance (m)   |");
+        FW_LOG("+-------------------+----------------+");
+        FW_LOG("| %s | %14s |\n", target.c_str(), value);
+        FW_LOG("+-------------------+----------------+");
         continue;
       }
-      Serial.println("+--------+----------------+");
-      Serial.println("| Target | Distance (m)   |");
-      Serial.println("+--------+----------------+");
+      FW_LOG("+--------+----------------+");
+      FW_LOG("| Target | Distance (m)   |");
+      FW_LOG("+--------+----------------+");
       for (size_t target = 0; target < table_.size(); ++target) {
         if (target == reporter) continue;
         JsonVariantConst distance = readings[macString(table_[target])];
@@ -1196,11 +1222,12 @@ class TimeSlicingController {
         if (!reportReceived_[reporter]) snprintf(value, sizeof(value), "no report");
         else if (distance.isNull()) snprintf(value, sizeof(value), "unavailable");
         else snprintf(value, sizeof(value), "%.4f", distance.as<double>());
-        Serial.printf("| %02X     | %14s |\n", table_[target][5], value);
+        FW_LOG("| %02X     | %14s |\n", table_[target][5], value);
       }
-      Serial.println("+--------+----------------+");
+      FW_LOG("+--------+----------------+");
     }
-    Serial.println();
+    FW_LOG();
+#endif
   }
 
   static bool validTargetReading(JsonVariantConst rssi, JsonVariantConst count,
@@ -1222,12 +1249,12 @@ class TimeSlicingController {
       if (sniffRound_) {
         sniffCycleReports[String(captureCycle_)].set(sniffReports.as<JsonObjectConst>());
         if (sniffCycleReports.overflowed()) {
-          Serial.println("[ERROR] Cannot retain sniff cycle reports; operation stopped");
+          FW_LOG("[ERROR] Cannot retain sniff cycle reports; operation stopped");
           return;
         }
         size_t received = 0;
         for (bool present : reportReceived_) if (present) ++received;
-        Serial.printf("[SNIFF] Capture cycle %u/%u: reports %u/%u\n",
+        FW_LOG("[SNIFF] Capture cycle %u/%u: reports %u/%u\n",
                       captureCycle_, TimeSliceProtocol::SNIFF_CYCLES,
                       static_cast<unsigned>(received), static_cast<unsigned>(table_.size()));
         const uint8_t next = TimeSliceProtocol::nextSniffCycle(captureCycle_);
@@ -1239,15 +1266,15 @@ class TimeSlicingController {
           mode_ = "mesh";
           return;
         }
-        printSniffAverage();
-        Serial.println("[COMMAND] All sniff cycles complete. Enter conf or sniff <12-hex-MAC>");
+        calculateSniffAverage();
+        FW_LOG("[COMMAND] All sniff cycles complete. Enter conf or sniff <12-hex-MAC>");
         return;
       }
       if (calibrationRound_) {
-        Serial.println("[AN] Pair capture complete; calibration will check the readings next");
+        FW_LOG("[AN] Pair capture complete; calibration will check the readings next");
       } else {
         printDistanceSummary();
-        Serial.println("[COMMAND] Round complete. Enter conf, sniff <12-hex-MAC>, or an opt <board>");
+        FW_LOG("[COMMAND] Round complete. Enter conf, sniff <12-hex-MAC>, or an opt <board>");
       }
       return;
     }
@@ -1257,15 +1284,15 @@ class TimeSlicingController {
       uint64_t count = 0;
       for (JsonPair report : channelDiscoveryReports.as<JsonObject>())
         count += report.value()["ChannelSamples"][String(channel)].as<uint32_t>();
-      if (count) Serial.printf("[SNIFF] Target channel %u: %llu observations\n",
+      if (count) FW_LOG("[SNIFF] Target channel %u: %llu observations\n",
                               channel, static_cast<unsigned long long>(count));
       if (count > best) { best = count; discoveredChannel = channel; }
     }
     if (!discoveredChannel) {
-      Serial.println("[ERROR] Target not heard during channel discovery. Check MAC, activity and range; retry sniff");
+      FW_LOG("[ERROR] Target not heard during channel discovery. Check MAC, activity and range; retry sniff");
       return;
     }
-    Serial.printf("[SNIFF] Detected channel %u for %s; redistributing over mesh before %u capture cycles\n",
+    FW_LOG("[SNIFF] Detected channel %u for %s; redistributing over mesh before %u capture cycles\n",
                   discoveredChannel, macString(target_).c_str(), TimeSliceProtocol::SNIFF_CYCLES);
     pendingChannel_ = discoveredChannel;
     pendingCycle_ = 1;
@@ -1274,13 +1301,15 @@ class TimeSlicingController {
     mode_ = "mesh";
   }
 
-  void printSniffAverage() {
+  void calculateSniffAverage() {
     const String target = macString(target_);
+#if 0  // Retain disabled presentation code.
     String displayTarget = target;
     displayTarget.replace(':', ' ');
-    Serial.printf("\n[SNIFF] Average distance across %u capture cycles (%u seconds each), channel %u\n",
+    FW_LOG("\n[SNIFF] Average distance across %u capture cycles (%u seconds each), channel %u\n",
                   TimeSliceProtocol::SNIFF_CYCLES,
                   unsigned(TimeSliceProtocol::SNIFF_US / 1000000), targetChannel_);
+#endif
     for (const Mac &station : table_) {
       const String reporter = macString(station);
       DistanceAverage average;
@@ -1293,18 +1322,20 @@ class TimeSlicingController {
       sniffAverageCounts[reporter] = average.count;
       if (average.count) sniffAverageDistances[reporter][target] = average.mean();
       else sniffAverageDistances[reporter][target] = nullptr;
+#if 0
       String displayReporter = reporter;
       displayReporter.replace(':', ' ');
-      Serial.printf("\n%s measures (average, valid cycles %u/%u)\n",
+      FW_LOG("\n%s measures (average, valid cycles %u/%u)\n",
                     displayReporter.c_str(), average.count, TimeSliceProtocol::SNIFF_CYCLES);
       char result[32];
       if (average.count) snprintf(result, sizeof(result), "%.4f", average.mean());
       else snprintf(result, sizeof(result), "unavailable");
-      Serial.println("+-------------------+----------------+");
-      Serial.println("| Target MAC        | Average (m)    |");
-      Serial.println("+-------------------+----------------+");
-      Serial.printf("| %s | %14s |\n", displayTarget.c_str(), result);
-      Serial.println("+-------------------+----------------+");
+      FW_LOG("+-------------------+----------------+");
+      FW_LOG("| Target MAC        | Average (m)    |");
+      FW_LOG("+-------------------+----------------+");
+      FW_LOG("| %s | %14s |\n", displayTarget.c_str(), result);
+      FW_LOG("+-------------------+----------------+");
+#endif
     }
   }
 };

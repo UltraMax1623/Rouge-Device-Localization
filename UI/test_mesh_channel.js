@@ -5,11 +5,14 @@ const { WebSocket } = require("ws");
 
 const server = spawn(process.execPath, [path.join(__dirname, "server.js")], {
   cwd: __dirname,
+  env: { ...process.env, PORT: "0" },
   stdio: ["ignore", "pipe", "pipe"]
 });
 const sockets = [];
 const timeout = setTimeout(() => finish(new Error("WebSocket test timed out")), 5000);
 let finished = false;
+let startupOutput = "";
+let started = false;
 
 function finish(error) {
   if (finished) return;
@@ -25,12 +28,16 @@ function finish(error) {
 
 server.once("error", finish);
 server.stdout.on("data", output => {
-  if (!output.toString().includes("Backend running")) return;
-  const ui = new WebSocket("ws://127.0.0.1:3000/ws?role=ui");
+  startupOutput += output.toString();
+  const match = startupOutput.match(/Backend running on port (\d+)\./);
+  if (!match || started) return;
+  started = true;
+  const base = `ws://127.0.0.1:${match[1]}`;
+  const ui = new WebSocket(`${base}/ws?role=ui`);
   sockets.push(ui);
   ui.once("open", () => {
     const device = new WebSocket(
-      "ws://127.0.0.1:3000/ws?role=device&token=local-device-token-change-me"
+      `${base}/ws?role=device&token=local-device-token-change-me`
     );
     sockets.push(device);
     device.once("open", () => device.send(JSON.stringify({

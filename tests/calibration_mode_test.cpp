@@ -14,6 +14,9 @@
 class String : public std::string {
  public:
   using std::string::string;
+  String() = default;
+  explicit String(unsigned value) : std::string(std::to_string(value)) {}
+  bool startsWith(const char *prefix) const { return compare(0, std::strlen(prefix), prefix) == 0; }
   void trim() {
     const auto first = find_first_not_of(" \t\r\n");
     if (first == npos) { clear(); return; }
@@ -63,6 +66,8 @@ struct TimeSlicingController {
   bool isRoot() const { return root; }
   uint32_t rootNodeId() const { return 1; }
   bool busy() const { return running; }
+  bool timingCritical() const { return false; }
+  bool requestCancellation() { running=false; return true; }
   Phase phase() const { return Phase::IDLE; }
   bool networkReadyForConfiguration(size_t) const { return !running && meshStarted; }
   bool beginCalibrationRound(const std::vector<MacAddress> &pair, uint32_t session) {
@@ -130,7 +135,7 @@ int main() {
   assert(mesh.broadcasts == idleBroadcasts + 5); // Idle retries stop after five attempts.
   acknowledge(mode); mode.update();
   assert(mode.start(2)); assert(mode.identifying());
-  mode.command("next"); assert(!timeSlicing.running); // No capture during identification.
+  assert(!mode.webControl("next")); assert(!timeSlicing.running); // No capture during identification.
   ticks += 7001; mode.update(); acknowledge(mode); mode.update();
   assert(!mode.identifying());
   const unsigned waitingBroadcasts = mesh.broadcasts;
@@ -144,9 +149,9 @@ int main() {
   mode.command("save"); assert(A == -60); // Validation required.
   startCapture(mode); completeCapture(2.5); mode.update();
   testNvsWriteFailure = true;
-  mode.command("save"); assert(A == -60 && testNvs.empty());
+  assert(!mode.webControl("save")); assert(A == -60 && testNvs.empty());
   testNvsWriteFailure = false;
-  mode.command("save"); assert(std::fabs(A + 50) < 1e-9 && !testNvs.empty());
+  assert(mode.webControl("save")); assert(std::fabs(A + 50) < 1e-9 && !testNvs.empty());
   mode.update(); assert(mode.active()); // Old peer revision cannot finish save.
   mesh.connected = false; ticks += 31000; mode.update();
   assert(mode.active() && std::fabs(A + 50) < 1e-9); // Save survives a disconnected node.
@@ -173,8 +178,8 @@ int main() {
   roundReports["1"]["Samples"]["2"] = 300;
   roundReports["2"]["Samples"]["1"] = 300;
   reboot.update();
-  assert(Serial.output.find("observed window=10.000 s") != std::string::npos);
-  assert(Serial.output.find("first-to-last packet span=9.980 s") != std::string::npos);
+  JsonDocument acceptedCapture; reboot.snapshot(acceptedCapture, false);
+  assert(acceptedCapture["canNext"].as<bool>() && acceptedCapture["distanceMeters"].as<double>() == 2);
   startCapture(reboot);
   reboot.command("cancel"); assert(reboot.active()); // Defer until mesh restored.
   completeCapture(1); reboot.update();
@@ -196,7 +201,8 @@ int main() {
     roundReports["2"]["FilteredRSSI"]["1"] = fieldReverse[i];
     observed.update();
   }
-  assert(Serial.output.find("RECHECK (>30% error)") != std::string::npos);
+  JsonDocument rejectedFit; observed.snapshot(rejectedFit, false);
+  assert(!rejectedFit["canSave"].as<bool>() && rejectedFit["canReview"].as<bool>());
   observed.command("save"); assert(A == -60 && n == 2 && testNvs == savedBeforeField);
   observed.command("remeasure 6"); // Invalid input cannot start capture.
   assert(!timeSlicing.running);
@@ -205,7 +211,8 @@ int main() {
   roundReports["1"]["FilteredRSSI"]["2"] = -75.1;
   roundReports["2"]["FilteredRSSI"]["1"] = -75.1;
   observed.update();
-  assert(Serial.output.find("Validation: Place selected boards 2.5") != std::string::npos);
+  JsonDocument validationPrompt; observed.snapshot(validationPrompt, false);
+  assert(validationPrompt["distanceMeters"].as<double>() == 2.5 && validationPrompt["canNext"].as<bool>());
   observed.command("save"); assert(A == -60 && n == 2 && testNvs == savedBeforeField);
   observed.command("cancel"); assert(!observed.active() && testNvs == savedBeforeField);
 
@@ -220,9 +227,13 @@ int main() {
     startCapture(regression); completeCapture(i, -58, 2); regression.update();
   }
   startCapture(regression); completeCapture(2.5, -60, 2); regression.update();
-  assert(Serial.output.find("candidate error exceeds previous model") != std::string::npos);
+  JsonDocument rejectedValidation; regression.snapshot(rejectedValidation, false);
+  assert(!rejectedValidation["canSave"].as<bool>());
   regression.command("save"); assert(A == -60 && n == 2 && testNvs == savedBeforeField);
-  regression.command("cancel");
+  assert(regression.webControl("retry"));
+  JsonDocument retried; regression.snapshot(retried, false);
+  assert(retried["canNext"].as<bool>() && retried["readings"][0]["rootRssi"].isNull());
+  assert(regression.webControl("cancel") && strcmp(regression.outcome(), "cancelled") == 0);
   A = -50; n = 2; // Restore the persisted model for node synchronization cases.
 
   // A node accepts only root state, acknowledges only after persistence,
@@ -247,8 +258,12 @@ int main() {
     }
   }
   assert(!diagnostic.active() && !timeSlicing.running);
-  assert(Serial.output.find("valid=4/5") != std::string::npos);
-  assert(Serial.output.find("A/n and saved calibration unchanged") != std::string::npos);
+  JsonDocument diagnosticResult; diagnostic.snapshot(diagnosticResult, true);
+  unsigned validWindows=0;
+  for (JsonVariant row : diagnosticResult["readings"].as<JsonArray>()) if (row["rootValid"].as<bool>()) ++validWindows;
+  assert(validWindows == 4 && diagnosticResult["distanceMeters"].as<double>() == 2);
+  assert(diagnosticResult["radioChecks"]["2"]["rootSpreadDb"].as<double>() == 7);
+  assert(strcmp(diagnostic.outcome(), "failed") == 0);
   timeSlicing.root = false;
   CalibrationMode node; node.begin();
   unsigned singles = mesh.singles;
