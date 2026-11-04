@@ -51,6 +51,8 @@ int main() {
   using namespace TimeSliceProtocol;
   assert(sniffDurationUs(true) == 10000000);
   assert(sniffDurationUs(false) == 20000000);
+  assert(sniffDurationUs(false, true) == 10000000);
+  assert(sniffDurationUs(true, true) == 10000000);
   assert(nextSniffCycle(0) == 1);
   assert(nextSniffCycle(1) == 2);
   assert(nextSniffCycle(2) == 3);

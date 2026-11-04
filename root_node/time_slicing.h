@@ -100,6 +100,9 @@ class TimeSlicingController {
   const char *resultReason() const { return resultReason_; }
   uint8_t captureCycle() const { return captureCycle_; }
   uint8_t targetChannel() const { return targetChannel_; }
+  int64_t captureDurationUs() const {
+    return TimeSliceProtocol::sniffDurationUs(discoveryRound_, collectionRound_);
+  }
   bool requestCancellation() {
     if (!isRoot() || timingCritical()) return false;
     pendingCycle_ = 0;
@@ -113,7 +116,7 @@ class TimeSlicingController {
     if (sniffRound_) {
       if (discoveryRound_) return RadioActivity::None;
       const int64_t elapsed = esp_timer_get_time() - localStartUs_;
-      return elapsed >= 0 && elapsed < TimeSliceProtocol::sniffDurationUs(false)
+      return elapsed >= 0 && elapsed < captureDurationUs()
           ? RadioActivity::Receive : RadioActivity::Waiting;
     }
     return TimeSliceProtocol::measurementActivity(esp_timer_get_time(), localStartUs_,
@@ -184,11 +187,14 @@ class TimeSlicingController {
   }
 
   bool beginSniff(const std::vector<Mac> &table, const Mac &target,
-                  uint8_t channel = 0, uint8_t cycle = 0, bool continuation = false) {
+                  uint8_t channel = 0, uint8_t cycle = 0, bool continuation = false,
+                  bool collection = false, bool discoveryOnly = false) {
     if (channel && cycle == 0) cycle = 1;
     if (cycle > TimeSliceProtocol::SNIFF_CYCLES || (!channel && cycle != 0)) return false;
     if (channel > 13 || !beginConfiguration(table)) return false;
     sniffRound_ = true;
+    collectionRound_ = collection;
+    discoveryOnly_ = discoveryOnly;
     discoveryRound_ = channel == 0;
     target_ = target;
     targetChannel_ = channel;
@@ -203,7 +209,7 @@ class TimeSlicingController {
     }
     sniffReports.clear();
     if (!discoveryRound_) FW_LOG("[SNIFF] Capture cycle %u/%u, %u seconds\n",
-        captureCycle_, TimeSliceProtocol::SNIFF_CYCLES, unsigned(TimeSliceProtocol::SNIFF_US / 1000000));
+        captureCycle_, TimeSliceProtocol::SNIFF_CYCLES, unsigned(captureDurationUs() / 1000000));
     FW_LOG("[SNIFF] %s for %s%s\n",
                   discoveryRound_ ? "Channel discovery" : "Fixed-channel capture",
                   macString(target_).c_str(), discoveryRound_ ? "" : " scheduled");
@@ -240,6 +246,8 @@ class TimeSlicingController {
     calibrationRound_ = calibration;
     calibrationSession_ = calibration ? doc["CalibrationSession"].as<uint32_t>() : 0;
     sniffRound_ = sniff;
+    collectionRound_ = doc["Collection"] | false;
+    discoveryOnly_ = doc["DiscoveryOnly"] | false;
     discoveryRound_ = discovery;
     target_ = target;
     targetChannel_ = channel;
@@ -393,7 +401,8 @@ class TimeSlicingController {
         const auto table = table_;
         const auto target = target_;
         phase_ = Phase::IDLE;
-        if (!beginSniff(table, target, pendingChannel_, pendingCycle_, true))
+        if (!beginSniff(table, target, pendingChannel_, pendingCycle_, true,
+                       collectionRound_, discoveryOnly_))
           FW_LOG("[ERROR] Could not start fixed-channel sniff");
       }
       return;
@@ -452,7 +461,7 @@ class TimeSlicingController {
           portEXIT_CRITICAL(&mux_);
           if (sniffRound_) FW_LOG("[ROUND %u] Radio ready; %s for %u ms, channel=%u\n",
               round_, discoveryRound_ ? "channel discovery" : "target capture",
-              unsigned(sniffDurationUs(discoveryRound_) / 1000), targetChannel_);
+              unsigned(captureDurationUs() / 1000), targetChannel_);
           else FW_LOG("[ROUND %u] Radio ready; %u ordered slots\n", round_,
                              static_cast<unsigned>(table_.size()));
         }
@@ -479,7 +488,8 @@ class TimeSlicingController {
       }
       if (sniffRound_) {
         const int64_t elapsed = nowUs - localStartUs_;
-        if (elapsed >= sniffDurationUs(discoveryRound_)) finishRound(true, "complete", true);
+        sniffTiming_.observe(nowUs, localStartUs_, localStartUs_ + captureDurationUs());
+        if (elapsed >= captureDurationUs()) finishRound(true, "complete", true);
         else if (discoveryRound_) {
           const uint8_t channel = sniffChannel(elapsed, scanFirst_, scanCount_);
           if (channel != captureChannel_) {
@@ -543,6 +553,7 @@ class TimeSlicingController {
  private:
   struct Sample {
     int64_t sum = 0;
+    int64_t sumSquares = 0;
     uint32_t count = 0, lastSequence = 0;
     Calibration::Histogram histogram;
     int64_t firstPacketUs = 0, lastPacketUs = 0;
@@ -573,6 +584,8 @@ class TimeSlicingController {
   uint32_t sequence_ = 0, sendErrors_ = 0;
   double roundA_ = -60.0, roundN_ = 2.0;
   bool sniffRound_ = false, discoveryRound_ = false;
+  bool collectionRound_ = false, discoveryOnly_ = false;
+  TimeSliceProtocol::WindowTiming sniffTiming_;
   bool calibrationRound_ = false;
   uint32_t calibrationSession_ = 0;
   std::array<TimeSliceProtocol::WindowTiming, 2> calibrationWindows_{};
@@ -625,10 +638,13 @@ class TimeSlicingController {
     }
     sniff = true;
     discovery = doc["DiscoverChannel"].as<bool>();
+    if ((!doc["Collection"].isNull() && !doc["Collection"].is<bool>()) ||
+        (!doc["DiscoveryOnly"].isNull() && !doc["DiscoveryOnly"].is<bool>()) ||
+        ((doc["DiscoveryOnly"] | false) && !discovery)) return false;
     channel = doc["SniffChannel"].as<unsigned>();
     cycle = doc["SniffCycle"].as<unsigned>();
     return doc["SniffMs"].as<unsigned>() ==
-               unsigned(TimeSliceProtocol::sniffDurationUs(discovery) / 1000) &&
+               unsigned(TimeSliceProtocol::sniffDurationUs(discovery, doc["Collection"] | false) / 1000) &&
            (discovery ? channel == 0 && cycle == 0 : channel >= 1 && cycle >= 1);
   }
   bool jobMatches(JsonDocument &doc) const {
@@ -639,6 +655,8 @@ class TimeSlicingController {
            (doc["Calibration"] | false) == calibrationRound_ &&
            (!calibrationRound_ || doc["CalibrationSession"].as<uint32_t>() == calibrationSession_) &&
            sniff == sniffRound_ && (!sniff || (discovery == discoveryRound_ &&
+           (doc["Collection"] | false) == collectionRound_ &&
+           (doc["DiscoveryOnly"] | false) == discoveryOnly_ &&
            channel == targetChannel_ && target == target_ && cycle == captureCycle_));
   }
   static bool macMatches(JsonVariantConst value, const Mac &mac) {
@@ -719,6 +737,8 @@ class TimeSlicingController {
     resultReason_ = "not finished";
     nextSendUs_ = 0;
     sniffRound_ = discoveryRound_ = false;
+    collectionRound_ = discoveryOnly_ = false;
+    sniffTiming_ = TimeSliceProtocol::WindowTiming{};
     calibrationRound_ = false;
     calibrationSession_ = 0;
     calibrationWindows_.fill(TimeSliceProtocol::WindowTiming{});
@@ -741,9 +761,11 @@ class TimeSlicingController {
     doc["Calibration"] = calibrationRound_;
     if (calibrationRound_) doc["CalibrationSession"] = calibrationSession_;
     if (sniffRound_) {
+      doc["Collection"] = collectionRound_;
+      doc["DiscoveryOnly"] = discoveryOnly_;
       doc["DiscoverChannel"] = discoveryRound_;
       doc["SniffChannel"] = targetChannel_;
-      doc["SniffMs"] = unsigned(TimeSliceProtocol::sniffDurationUs(discoveryRound_) / 1000);
+      doc["SniffMs"] = unsigned(captureDurationUs() / 1000);
       doc["SniffCycle"] = captureCycle_;
       doc["SniffCycles"] = TimeSliceProtocol::SNIFF_CYCLES;
       JsonArray target = doc["TargetMAC"].to<JsonArray>();
@@ -814,7 +836,7 @@ class TimeSlicingController {
   void beginCancellation(const char *reason) {
     const bool armed = phase_ == Phase::ARMED;
     const uint32_t durationMs = sniffRound_
-        ? uint32_t(TimeSliceProtocol::sniffDurationUs(discoveryRound_) / 1000)
+        ? uint32_t(captureDurationUs() / 1000)
         : uint32_t(table_.size() * int64_t(TimeSliceProtocol::slotDurationUs(calibrationRound_)) / 1000);
     // A peer may have already stopped its mesh and cannot hear cancel until
     // capture ends. Keep the old round identity until that return/report window.
@@ -856,10 +878,13 @@ class TimeSlicingController {
       const uint8_t channel = packet->rx_ctrl.channel;
       portENTER_CRITICAL(&self.mux_);
       if (self.capturing_ && now >= self.localStartUs_ &&
-          now < self.localStartUs_ + TimeSliceProtocol::sniffDurationUs(self.discoveryRound_) &&
+          now < self.localStartUs_ + self.captureDurationUs() &&
           channel >= 1 && channel <= 13 &&
           (self.discoveryRound_ || channel == self.targetChannel_)) {
         self.targetSample_.sum += packet->rx_ctrl.rssi;
+        self.targetSample_.sumSquares += int32_t(packet->rx_ctrl.rssi) * int32_t(packet->rx_ctrl.rssi);
+        if (!self.targetSample_.count) self.targetSample_.firstPacketUs = now;
+        self.targetSample_.lastPacketUs = now;
         ++self.targetSample_.count;
         ++self.channelSamples_[channel];
       }
@@ -999,6 +1024,14 @@ class TimeSlicingController {
     JsonObject counts = doc["Samples"].to<JsonObject>();
     if (sniffRound_) {
       counts[macString(target_)] = targetSample_.count;
+      if (collectionRound_) {
+        doc["ObservedWindowMs"] = sniffTiming_.elapsedMs();
+        doc["PacketSpanMs"] = targetSample_.count ? uint32_t((targetSample_.lastPacketUs-targetSample_.firstPacketUs)/1000) : 0;
+        const double mean = targetSample_.count ? double(targetSample_.sum)/targetSample_.count : 0;
+        if (targetSample_.count >= 2)
+          doc["RSSIStdDb"] = std::sqrt(std::max(0.0, double(targetSample_.sumSquares)/targetSample_.count-mean*mean));
+        else doc["RSSIStdDb"] = nullptr;
+      }
       if (discoveryRound_) {
         JsonObject channels = doc["ChannelSamples"].to<JsonObject>();
         for (unsigned channel = 1; channel <= 13; ++channel)
@@ -1292,6 +1325,7 @@ class TimeSlicingController {
       FW_LOG("[ERROR] Target not heard during channel discovery. Check MAC, activity and range; retry sniff");
       return;
     }
+    if (discoveryOnly_) return;
     FW_LOG("[SNIFF] Detected channel %u for %s; redistributing over mesh before %u capture cycles\n",
                   discoveredChannel, macString(target_).c_str(), TimeSliceProtocol::SNIFF_CYCLES);
     pendingChannel_ = discoveredChannel;

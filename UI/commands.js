@@ -1,4 +1,4 @@
-const names = new Set(["conf", "sniff", "status", "calibrate", "diagnose"]);
+const names = new Set(["conf", "sniff", "collect", "discover", "status", "calibrate", "diagnose"]);
 function parseCommand(body, json = false) {
   let value;
   if (json) value = JSON.parse(body);
@@ -6,16 +6,18 @@ function parseCommand(body, json = false) {
     const [command, first, second, ...extra] = body.trim().split(/\s+/);
     if (extra.length) throw new Error("Too many arguments.");
     if (["conf", "status"].includes(command) && first) throw new Error("This command takes no arguments.");
-    value = { command, params: command === "sniff" ? { mac: first, channel: second === undefined ? 0 : Number(second) }
+    value = { command, params: ["sniff","collect","discover"].includes(command) ? { mac: first, channel: second === undefined ? 0 : Number(second) }
       : { board: Number(first), distance: second === undefined ? 1 : Number(second) } };
   }
   if (!value || !names.has(value.command)) throw new Error("Unknown command.");
   const params = value.params || {};
-  if (value.command === "sniff") {
+  if (["sniff","collect","discover"].includes(value.command)) {
     const mac = String(params.mac || "").replace(/[:-]/g, "").toUpperCase();
     const channel = params.channel === undefined ? 0 : params.channel;
     if (!/^[0-9A-F]{12}$/.test(mac) || !Number.isInteger(channel) || channel < 0 || channel > 13)
       throw new Error("Enter a 12-digit Wi-Fi MAC and channel 0..13 (0 is automatic).");
+    if (value.command==="collect" && channel===0) throw new Error("Lock a channel before collection.");
+    if (value.command==="discover" && channel!==0) throw new Error("Discovery uses channel zero.");
     return { command: value.command, params: { mac, channel } };
   }
   if (["calibrate", "diagnose"].includes(value.command)) {

@@ -5,6 +5,8 @@ assert.equal(plan.training.length,25);
 assert.equal(plan.unseen.length,12);
 assert.equal(plan.trainingOrder.length,25);
 assert.equal(plan.trainingOrder[0],"T05");
+assert.equal(plan.unseenOrder.length,12);
+assert.equal(plan.unseenOrder[0],"U05");
 const keys=new Set(plan.training.map(p=>`${p.u}:${p.v}`));
 for(const p of plan.unseen) assert(!keys.has(`${p.u}:${p.v}`),"Test position overlaps a training point");
 assert.equal(new Set([...plan.training,...plan.unseen].map(p=>`${p.u}:${p.v}`)).size,37);

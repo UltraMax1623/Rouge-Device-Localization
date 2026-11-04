@@ -13,12 +13,19 @@ const PAGE_PATH = path.join(__dirname, "page.html");
 const DEVICE_TOKEN = "local-device-token-change-me";
 
 const { parseCommand, parseControl, names: allowedCommands } = require("./commands");
+const { CollectionStore } = require("./collection-store");
+const collection = new CollectionStore(process.env.COLLECTION_DATA_DIR || path.join(__dirname,"../data"));
 
 let deviceSocket = null;
 let deviceReady = false;
 let meshChannelStatus = null;
 let activeCommandId = null;
 let activeCommandName = "conf";
+if(collection.state.pending?.stage==="collecting") {
+  activeCommandId=collection.state.pending.id;activeCommandName="collect";
+} else if(collection.state.discovery) {
+  activeCommandId=collection.state.discovery.id;activeCommandName="discover";
+}
 let networkStatus = null;
 let pendingControl = null;
 function sendPendingControl() {
@@ -44,15 +51,39 @@ function finishTimedOutCommand() {
 const recentLogs = [];
 const MAX_RECENT_LOGS = 100;
 
+function jsonReply(res,status,value) {
+  res.writeHead(status,{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store"});res.end(JSON.stringify(value));
+}
+function publishCollection() {broadcast({type:"collection_state",...collection.snapshot()});}
+function ensureCommandReady() {
+  if(!deviceSocket||deviceSocket.readyState!==WebSocket.OPEN||!deviceReady)throw Error("Root is offline or restoring its state. Wait for reconnection.");
+  if(activeCommandId)throw Error("A command is already running. Wait for its confirmed outcome.");
+}
+function startCommand(command,params,commandId=randomUUID()) {
+  ensureCommandReady();commandHistory=[];activeCommandId=commandId;activeCommandName=command;pendingControl=null;
+  publishCommandLock();activeCommandTimer=setTimeout(finishTimedOutCommand,COMMAND_TIMEOUT_MS);
+  deviceSocket.send(JSON.stringify({type:"command",command,commandId,params}),error=>{
+    if(error&&activeCommandId===commandId) {
+      const end={type:"command_event",commandId,command,phase:"end",status:"interrupted"};
+      try{collection.event(end);}catch(error){logToUi("Could not retain capture outcome: "+error.message);return;}
+      publishCollection();broadcast(end);
+      activeCommandId=null;publishCommandLock();clearTimeout(activeCommandTimer);
+    }
+  });
+  return {command,commandId,status:"sent"};
+}
+
 const server = http.createServer((req, res) => {
   const assets = {
     "/assets/cytoscape.js": path.join(__dirname, "node_modules/cytoscape/dist/cytoscape.min.js"),
     "/assets/node-map.js": path.join(__dirname, "node-map.js"),
     "/assets/dashboard.js": path.join(__dirname, "dashboard.js")
+    ,"/assets/collection.js": path.join(__dirname,"collection.js")
+    ,"/assets/collection.css": path.join(__dirname,"collection.css")
   };
   if (req.method === "GET" && assets[req.url]) {
     if (!fs.existsSync(assets[req.url])) return sendText(res, 404, "Run npm install in UI.");
-    res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+    res.writeHead(200, { "Content-Type": req.url.endsWith(".css")?"text/css; charset=utf-8":"application/javascript; charset=utf-8" });
     return fs.createReadStream(assets[req.url]).pipe(res);
   }
   if (req.method === "GET" && req.url === "/") {
@@ -66,6 +97,45 @@ const server = http.createServer((req, res) => {
 
   if (req.method === "GET" && req.url === "/api/health") {
     return sendText(res, 200, "Backend is running.");
+  }
+  if(req.method==="GET"&&req.url==="/api/collection/state")return jsonReply(res,200,collection.snapshot());
+  if(req.method==="GET"&&req.url.startsWith("/api/collection/capture?")) {
+    const id=new URL(req.url,"http://localhost").searchParams.get("id");
+    const capture=collection.state.approved.find(a=>a.id===id);
+    return capture?jsonReply(res,200,capture):sendText(res,404,"Saved capture not found.");
+  }
+  if(req.method==="GET"&&req.url==="/api/collection/export") {
+    try{collection.exportCsv();collection.exportError=null;
+      res.writeHead(200,{"Content-Type":"text/csv; charset=utf-8","Content-Disposition":'attachment; filename="collection.csv"',"Cache-Control":"no-store"});
+      return fs.createReadStream(collection.csv).pipe(res);
+    }catch(error){return sendText(res,503,"CSV unavailable: "+error.message);}
+  }
+  if(req.method==="POST"&&req.url.startsWith("/api/collection/")) {
+    let body="",oversized=false;
+    req.on("data",chunk=>{if(body.length+chunk.length>2048)oversized=true;if(!oversized)body+=chunk;});
+    req.on("end",()=>{
+      try {
+        if(oversized)throw Error("Request is too large.");const value=JSON.parse(body||"{}");let response;
+        if(req.url==="/api/collection/session") {
+          if(activeCommandId)throw Error("Wait for the running command before changing the session.");
+          collection.configure(value);
+        } else if(req.url==="/api/collection/discover") {
+          ensureCommandReady();const id=randomUUID();collection.beginDiscovery(id);
+          response=startCommand("discover",{mac:collection.state.session.mac.replace(/:/g,""),channel:0},id);
+        } else if(req.url==="/api/collection/run") {
+          ensureCommandReady();
+          if(networkStatus?.nodes?.length!==4||![1,2,3,4].every(board=>networkStatus.nodes.some(n=>n.board===board&&n.online)))
+            throw Error("Collection requires root 01 and normal boards 02, 03, 04 online.");
+          const id=randomUUID();collection.prepare(id,value.physicalConfirmed);
+          response=startCommand("collect",{mac:collection.state.session.mac.replace(/:/g,""),channel:collection.state.session.channel},id);
+        } else if(req.url==="/api/collection/approve") {
+          if(activeCommandId)throw Error("Wait for the root to finish before approving.");collection.approve(value.collectionId);
+        } else if(req.url==="/api/collection/drop") {
+          if(activeCommandId)throw Error("Wait for the root to finish before dropping.");collection.drop(value.collectionId);
+        } else throw Error("Unknown collection action.");
+        publishCollection();jsonReply(res,200,{...collection.snapshot(),request:response});
+      } catch(error){publishCollection();sendText(res,409,error.message);}
+    });return;
   }
 
   if (req.method === "POST" && req.url === "/api/control") {
@@ -103,6 +173,8 @@ const server = http.createServer((req, res) => {
       try { parsed = parseCommand(body, (req.headers["content-type"] || "").includes("application/json")); }
       catch (error) { return sendText(res, 400, error.message); }
       const { command, params } = parsed;
+      if(command==="collect"||command==="discover")return sendText(res,409,"Use the Data Collection tab to associate captures with a setup.");
+      if(collection.state.pending)return sendText(res,409,"Approve or drop the collection review before starting another command.");
 
       if (!deviceSocket || deviceSocket.readyState !== WebSocket.OPEN || !deviceReady) {
         return sendText(res, 503, "Root is offline or restoring its command state. Wait for reconnection.");
@@ -143,7 +215,8 @@ const server = http.createServer((req, res) => {
 
 const webSockets = new WebSocketServer({
   server,
-  path: "/ws"
+  path: "/ws",
+  maxPayload: 64*1024
 });
 
 webSockets.on("connection", (socket, request) => {
@@ -173,6 +246,7 @@ webSockets.on("connection", (socket, request) => {
   }
 
   if (role === "ui") {
+    socket.send(JSON.stringify({type:"collection_state",...collection.snapshot()}));
     for (const event of commandHistory) socket.send(JSON.stringify(event));
     socket.send(JSON.stringify({ type: "command_lock", locked: Boolean(activeCommandId), commandId: activeCommandId, command: activeCommandName }));
     socket.send(JSON.stringify({
@@ -207,6 +281,12 @@ webSockets.on("connection", (socket, request) => {
         return;
       }
       if (message.type === "command_state") {
+        if(activeCommandId&&message.commandId&&message.commandId!==activeCommandId) {
+          const interrupted={type:"command_event",commandId:activeCommandId,command:activeCommandName,phase:"end",status:"interrupted",
+            message:"Root reports a different operation. The previous capture cannot be approved."};
+          collection.event(interrupted);broadcast(interrupted);publishCollection();
+          activeCommandId=null;clearTimeout(activeCommandTimer);
+        }
         if (!activeCommandId && typeof message.commandId === "string" && message.commandId) {
           activeCommandId = message.commandId;
           activeCommandName = allowedCommands.has(message.command) ? message.command : "conf";
@@ -218,6 +298,7 @@ webSockets.on("connection", (socket, request) => {
             command: activeCommandName, phase: "end", status: "interrupted",
             message: "The root has no active command or retained result; it may have restarted." };
           commandHistory.push(ended);
+          collection.event(ended);publishCollection();
           broadcast(ended);
           pendingControl = null;
           activeCommandId = null;
@@ -236,9 +317,9 @@ webSockets.on("connection", (socket, request) => {
           ["start", "log", "error", "data", "end"].includes(message.phase)) {
         const key = `${message.commandId}:${message.sequence}`;
         if (Number.isInteger(message.sequence)) {
-          socket.send(JSON.stringify({ type: "event_ack", commandId: message.commandId,
-            sequence: message.sequence }));
-          if (receivedEvents.has(key)) return;
+          if (receivedEvents.has(key)) {
+            socket.send(JSON.stringify({type:"event_ack",commandId:message.commandId,sequence:message.sequence}));return;
+          }
         }
         if (!activeCommandId) {
           activeCommandId = message.commandId;
@@ -247,12 +328,16 @@ webSockets.on("connection", (socket, request) => {
           activeCommandTimer = setTimeout(finishTimedOutCommand, COMMAND_TIMEOUT_MS);
         }
         if (message.commandId !== activeCommandId) return;
+        // Persist collection events before acknowledging them to the root.
+        collection.event(message);
+        if(Number.isInteger(message.sequence))socket.send(JSON.stringify({type:"event_ack",commandId:message.commandId,sequence:message.sequence}));
         if (Number.isInteger(message.sequence)) {
           receivedEvents.add(key);
           if (receivedEvents.size > 2048) receivedEvents.delete(receivedEvents.values().next().value);
         }
         commandHistory.push(message);
         broadcast(message);
+        if(message.command==="collect"||message.command==="discover")publishCollection();
         clearTimeout(activeCommandTimer);
         activeCommandTimer = setTimeout(finishTimedOutCommand, COMMAND_TIMEOUT_MS);
         if (message.phase === "end") {
@@ -348,6 +433,7 @@ function sendText(res, statusCode, text) {
   res.end(text);
 }
 
+if(activeCommandId)activeCommandTimer=setTimeout(finishTimedOutCommand,COMMAND_TIMEOUT_MS);
 server.listen(PORT, HOST, () => {
   const actualPort = server.address().port;
   logToUi(`Backend running on port ${actualPort}.`);

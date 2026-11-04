@@ -1,6 +1,7 @@
 const assert=require("node:assert/strict");
 const {spawn}=require("node:child_process");
 const path=require("node:path");
+const fs=require("node:fs"),os=require("node:os");
 const {WebSocket}=require("ws");
 const {parseCommand,parseControl}=require("./commands");
 assert.equal(parseCommand("sniff 11:22:33:44:55:66").params.mac,"112233445566");
@@ -24,7 +25,7 @@ async function connect(url, state = {}) {
   return {socket,next};
 }
 (async()=>{
- const server=spawn(process.execPath,[path.join(__dirname,"server.js")],{env:{...process.env,PORT:"0"}});
+ const server=spawn(process.execPath,[path.join(__dirname,"server.js")],{env:{...process.env,PORT:"0",COLLECTION_DATA_DIR:fs.mkdtempSync(path.join(os.tmpdir(),"rouge-command-test-"))}});
  const sockets=[];
  try{
   const port=await new Promise((resolve,reject)=>{let out="";server.stdout.on("data",chunk=>{out+=chunk;const match=out.match(/Backend running on port (\d+)/);if(match)resolve(match[1]);});server.once("error",reject);});

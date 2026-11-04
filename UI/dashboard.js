@@ -1,6 +1,6 @@
 (() => {
   const byId=id=>document.getElementById(id);
-  const labels={conf:"Node configuration",sniff:"Wi-Fi target capture",status:"Network status",calibrate:"A/n calibration",diagnose:"Measurement diagnostics"};
+  const labels={conf:"Node configuration",sniff:"Wi-Fi target capture",collect:"Dataset collection",discover:"Target channel discovery",status:"Network status",calibrate:"A/n calibration",diagnose:"Measurement diagnostics"};
   const terminal=byId("terminalOutput"), result=byId("commandResult");
   let online=false, locked=false, activeId=null, activeName="conf", sending=false, controlPending=false;
   let resultId=null, session=null;
@@ -119,6 +119,7 @@
     }
   }
   function receive(data) {
+    window.dispatchEvent(new CustomEvent("console-message",{detail:data}));
     if(data.type==="network_status"){network(data);return;}
     if(data.type==="command_lock") {
       const changed=locked!==data.locked;locked=data.locked;activeId=data.commandId;activeName=data.command||activeName;
@@ -155,7 +156,7 @@
     const socket=new WebSocket(`${location.protocol==="https:"?"wss:":"ws:"}//${location.host}/ws?role=ui`);
     socket.onmessage=event=>{try{receive(JSON.parse(event.data));}catch(error){log(`Dashboard could not display an update: ${error.message}`,"UI",true);}};
     socket.onopen=()=>log("Dashboard connected.");
-    socket.onclose=()=>{online=false;controls();byId("connectionStatus").textContent="Backend disconnected";setTimeout(connect,2000);};
+    socket.onclose=()=>{online=false;window.dispatchEvent(new CustomEvent("console-message",{detail:{type:"device_connection",connected:false}}));controls();byId("connectionStatus").textContent="Backend disconnected";setTimeout(connect,2000);};
     socket.onerror=()=>log("Backend WebSocket error.","UI",true);
   }
   async function send(command,params={}) {

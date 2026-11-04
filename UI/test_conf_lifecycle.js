@@ -1,12 +1,13 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const path = require("node:path");
+const fs = require("node:fs"), os = require("node:os");
 const { WebSocket } = require("ws");
 
 async function run() {
   const server = spawn(process.execPath, [path.join(__dirname, "server.js")], {
     cwd: __dirname,
-    env: { ...process.env, PORT: "0", COMMAND_TIMEOUT_MS: "500" },
+    env: { ...process.env, PORT: "0", COMMAND_TIMEOUT_MS: "500", COLLECTION_DATA_DIR:fs.mkdtempSync(path.join(os.tmpdir(),"rouge-conf-test-")) },
     stdio: ["ignore", "pipe", "pipe"]
   });
   const sockets = [];

@@ -87,6 +87,7 @@
     details.textContent = "Select a node or connection for details. Scroll to zoom; drag the background to pan.";
   }
   window.nodeMap = {
+    resize() {graph.resize();fitMap();},
     invalidateLayout() {
       reports.clear();sniffReports.clear();targetResult=null;graph.elements().remove();
       status.textContent="Calibration changed. Run Configure again to establish anchor positions.";
@@ -121,4 +122,85 @@
     }
     if(event.phase === "end" && reports.size) render();
   } };
+})();
+
+// Collection uses the same Cytoscape map component with measured square anchors.
+(() => {
+  if(typeof cytoscape!=="function")return;
+  let graph=null,context=null;
+  const details=()=>document.getElementById("collectionMapDetails");
+  const scale=450;
+  function fit(all=false){if(!graph)return;graph.resize();graph.fit(all?graph.elements():graph.elements().not(".estimate"),55);graph.center();}
+  function estimate(window,L) {
+    const a=window?.A,n=window?.n;
+    if(!Number.isFinite(a)||!Number.isFinite(n)||n<=0)return null;
+    const r=[1,2,3,4].map(board=>window.receivers?.find(r=>r.board===board)?.mean);
+    if(!r.every(Number.isFinite))return null;
+    const d=r.map(rssi=>10**((a-rssi)/(10*n)));
+    const x=(d[0]**2-d[1]**2+d[2]**2-d[3]**2+2*L*L)/(4*L);
+    const y=(d[0]**2-d[2]**2+d[1]**2-d[3]**2+2*L*L)/(4*L);
+    return Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null;
+  }
+  window.nodeMap=window.nodeMap||{};
+  window.nodeMap.collection=(container,state)=>{
+    if(!state||container.offsetParent===null)return;
+    if(!graph) {
+      graph=cytoscape({container,layout:{name:"preset"},autoungrabify:true,minZoom:.005,maxZoom:8,style:[
+        {selector:"node",style:{label:"data(label)","background-color":"#c5d1dd",width:17,height:17,color:"#415972","font-size":11,"text-valign":"bottom","text-margin-y":7,"text-wrap":"wrap","text-max-width":125,"border-width":2,"border-color":"white"}},
+        {selector:"node.anchor",style:{shape:"round-rectangle","background-color":"#078a95",width:32,height:32,color:"#155666","font-weight":"bold"}},
+        {selector:"node.saved",style:{"background-color":"#179b66"}},
+        {selector:"node.test",style:{shape:"diamond","border-color":"#326dd5"}},
+        {selector:"node.actual",style:{shape:"diamond","background-color":"#ef9e1b",width:28,height:28,"border-color":"#bb740c","font-weight":"bold"}},
+        {selector:"node.estimate",style:{shape:"star","background-color":"#357ee6",width:27,height:27,"font-weight":"bold","z-index":10}},
+        {selector:"edge",style:{width:2,"line-color":"#9aafc0"}},
+        {selector:":selected",style:{"border-color":"#6737c1","border-width":4}}
+      ]});
+      graph.on("tap","node",async event=>{
+        const data=event.target.data();details().textContent=data.description||data.label;
+        if(data.captureId)try {
+          const response=await fetch(`/api/collection/capture?id=${encodeURIComponent(data.captureId)}`);
+          if(!response.ok)return;const saved=await response.json();
+          details().textContent=data.description+"\n"+[1,2,3].map(index=>`W${index}: `+saved.windows[index].receivers.map(r=>`${r.board}: ${r.mean.toFixed(2)} dBm / SD ${r.std.toFixed(2)} / ${r.count} pkts`).join("; ")).join("\n");
+        }catch{}
+      });
+      document.getElementById("collectionMapFit").onclick=()=>fit();
+      document.getElementById("collectionMapEstimates").onclick=()=>fit(true);
+    }
+    const setup=state.setup||state.lastCapture?.setup;if(!setup)return;
+    const L=setup.side_length_m;
+    const key=`${setup.mesh_id}:${setup.environment_id}:${setup.dataset_split}:${state.session?.mac}:${state.pending?.id}:${state.pending?.stage}:${Object.keys(state.pending?.windows||{}).length}:${state.savedRows}`;
+    if(key===context){graph.resize();return;}context=key;
+    const elements=[];
+    [[0,0],[1,0],[0,1],[1,1]].forEach(([u,v],i)=>elements.push({data:{id:`anchor-${i+1}`,label:`Sniffer 0${i+1}`,description:`Sniffer 0${i+1}: (${(u*L).toFixed(3)}, ${(v*L).toFixed(3)}) m · measured corner`},position:{x:u*scale,y:v*scale},classes:"anchor"}));
+    for(const [i,j] of [[1,2],[2,4],[4,3],[3,1]])elements.push({data:{id:`side-${i}-${j}`,source:`anchor-${i}`,target:`anchor-${j}`}});
+    const points=setup.dataset_split==="test"?state.positions.unseen:state.positions.training;
+    for(const p of points) {
+      const saved=state.approved.find(a=>a.setup.mesh_id===setup.mesh_id&&a.setup.environment_id===setup.environment_id&&a.setup.target_id===p.id&&a.mac===state.session?.mac);
+      const current=p.id===setup.target_id;
+      elements.push({data:{id:p.id,label:current?`${p.id} · actual`:p.id,captureId:saved?.id,
+        description:`${p.id}: (${(p.u*L).toFixed(3)}, ${(p.v*L).toFixed(3)}) m · ${saved?"approved":"pending"} · ${setup.dataset_split}`},
+        position:{x:p.u*scale,y:p.v*scale},classes:`${saved?"saved ":""}${current?"actual ":""}${setup.dataset_split==="test"?"test":""}`});
+    }
+    const capture=state.pending||state.lastCapture;
+    const estimateList=document.getElementById("collectionWindowEstimates");estimateList.replaceChildren();
+    let count=0;
+    if(capture&&capture.setup.mesh_id===setup.mesh_id&&capture.setup.environment_id===setup.environment_id&&capture.setup.dataset_split===setup.dataset_split) {
+      for(let index=1;index<=3;index++) {
+        const w=capture.windows[index],check=capture.review?.find(r=>r.index===index);
+        if(!w||check?.errors.length)continue;const p=estimate(w,L);if(!p)continue;count++;
+        const button=document.createElement("button");button.type="button";
+        button.textContent=`W${index} · ${capture.setup.target_id}: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m · baseline estimate`;
+        const description=`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${capture.setup.target_id}: (${capture.setup.target_x_m}, ${capture.setup.target_y_m}) m\nRSSI A/n baseline estimate; not a trained ML prediction.`;
+        button.onclick=()=>{details().textContent=description;};estimateList.append(button);
+        const overlapping=elements.find(e=>e.classes==="estimate"&&Math.hypot(e.position.x-p.x/L*scale,e.position.y-p.y/L*scale)<1e-7);
+        if(overlapping){overlapping.data.label+=` / W${index}`;overlapping.data.description+="\n"+description;continue;}
+        elements.push({data:{id:`estimate-${index}`,label:`W${index} · ${capture.setup.target_id}`,
+          description:`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${capture.setup.target_id}: (${capture.setup.target_x_m}, ${capture.setup.target_y_m}) m\nRSSI A/n baseline estimate; not a trained ML prediction. Overlapping markers retain their real coordinates.`},
+          position:{x:p.x/L*scale,y:p.y/L*scale},classes:"estimate"});
+      }
+    }
+    graph.elements().remove();graph.add(elements);fit();
+    document.getElementById("collectionMapStatus").textContent=`Measured ${L} m square · y increases downward · ${count}/3 per-window baseline estimates available. Fit all estimates to include estimates beyond this view. Overlapping estimates share coordinates.`;
+    if(count)details().textContent="Select W1, W2 or W3 for estimated coordinates. Select a saved position for its three recorded windows.";
+  };
 })();

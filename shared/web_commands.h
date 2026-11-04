@@ -3,7 +3,7 @@
 
 // Root-only command handlers. Normal nodes continue using the existing mesh protocol.
 inline bool webCommandSupported(const String &name) {
-  return name=="conf" || name=="sniff" || name=="status" || name=="calibrate" || name=="diagnose";
+  return name=="conf" || name=="sniff" || name=="collect" || name=="discover" || name=="status" || name=="calibrate" || name=="diagnose";
 }
 
 void networkSnapshot(JsonDocument &doc) {
@@ -75,7 +75,7 @@ void dispatchWebCommand(const String &id,const String &name,JsonDocument &params
     rejectCommand(id,"MESH_NOT_READY","Wait for the configured nodes and A/n acknowledgements.");return;
   }
   if(name=="conf") { startWebConf(id);return; }
-  if(name=="sniff") {
+  if(name=="sniff" || name=="collect" || name=="discover") {
     const String target=params["mac"] | "";
     const unsigned channel=params["channel"] | 0u;
     const String text=String("sniff ")+target+(channel ? String(" ")+channel : "");
@@ -83,12 +83,18 @@ void dispatchWebCommand(const String &id,const String &name,JsonDocument &params
     if(command.kind!=UserCommand::Kind::Sniff || channel>13) {
       rejectCommand(id,"INVALID_ARGUMENT","Use a 12-digit hexadecimal MAC and channel 0..13 (0 means automatic).");return;
     }
+    if(name=="collect" && (TEST_BOARD_COUNT!=4 || channel==0)) {
+      rejectCommand(id,"COLLECTION_NOT_READY","Collection requires four boards and a locked channel 1..13.");return;
+    }
+    if(name=="discover" && channel!=0) {
+      rejectCommand(id,"INVALID_ARGUMENT","Channel discovery requires channel zero.");return;
+    }
     for(const auto &mac:macList) if(mac==command.target) {
       rejectCommand(id,"INVALID_TARGET","Choose an external Wi-Fi device, not a configured mesh station.");return;
     }
     if(!beginWebLifecycle(id))return;
     webSniffTarget=command.target;
-    if(!timeSlicing.beginSniff(macList,command.target,command.channel)) {
+    if(!timeSlicing.beginSniff(macList,command.target,command.channel,0,false,name=="collect",name=="discover")) {
       rejectCommand(id,"START_FAILED","Could not start sniffing.");webCommandRunning=false;activeCommandId="";
     }
     return;
@@ -168,13 +174,45 @@ void finishWebSniff() {
   endWebCommand(webCancelled ? "cancelled" : completeNodes==TEST_BOARD_COUNT ? "success" : validNodes ? "partial" : "failed");
 }
 
+void finishWebCollection() {
+  char target[18];snprintf(target,sizeof(target),"%02X:%02X:%02X:%02X:%02X:%02X",
+      webSniffTarget[0],webSniffTarget[1],webSniffTarget[2],webSniffTarget[3],webSniffTarget[4],webSniffTarget[5]);
+  unsigned complete=0;
+  for(unsigned window=1;window<=3;++window) {
+    JsonDocument data;commandEnvelope(data,activeCommandId,"data");
+    data["kind"]="collection_window";data["window"]=window;
+    data["targetMac"]=target;data["channel"]=timeSlicing.discoveredChannel;
+    data["durationMs"]=TimeSliceProtocol::COLLECTION_US/1000;
+    data["A"]=A;data["n"]=n;
+    JsonArray receivers=data["receivers"].to<JsonArray>();
+    bool good=true;
+    for(unsigned board=1;board<=4;++board) {
+      const String mac=configuredMac(board);
+      JsonVariantConst report=sniffCycleReports[String(window)][mac];
+      JsonObject row=receivers.add<JsonObject>();row["board"]=board;row["mac"]=mac;
+      row["status"]=report["Status"] | "missing";
+      row["roundId"]=report["RoundId"];
+      row["channel"]=report["SniffChannel"];
+      row["durationMs"]=report["SniffMs"];
+      row["observedMs"]=report["ObservedWindowMs"];
+      row["packetSpanMs"]=report["PacketSpanMs"];
+      row["count"]=report["Samples"][target];
+      row["mean"]=report["RSSI"][target];row["std"]=report["RSSIStdDb"];
+      good &= strcmp(report["Status"] | "", "ok")==0 && report["Samples"][target].as<unsigned>()>=20;
+    }
+    if(good)++complete;
+    queueCommandEvent(data);
+  }
+  endWebCommand(webCancelled ? "cancelled" : complete==3 ? "success" : "partial");
+}
+
 void updateWebCommand() {
   processWebControl();
   if(!webCommandRunning)return;
   const auto phase=timeSlicing.phase();
-  if(activeCommandName=="conf" || activeCommandName=="sniff") {
+  if(activeCommandName=="conf" || activeCommandName=="sniff" || activeCommandName=="collect" || activeCommandName=="discover") {
     if(timeSlicing.busy()) {
-      if(activeCommandName=="sniff" && !timeSlicing.timingCritical() && commandEvents.room(TEST_BOARD_COUNT+5)) {
+      if((activeCommandName=="sniff" || activeCommandName=="collect" || activeCommandName=="discover") && !timeSlicing.timingCritical() && commandEvents.room(TEST_BOARD_COUNT+5)) {
         String key=String(timeSlicing.captureCycle())+":"+timeSlicing.targetChannel();
         if(key!=webSnapshot) {
           webSnapshot=key;
@@ -188,6 +226,12 @@ void updateWebCommand() {
       return;
     }
     if(activeCommandName=="conf") { finishWebConf(phase);webCommandRunning=false; }
+    else if(activeCommandName=="collect") finishWebCollection();
+    else if(activeCommandName=="discover") {
+      JsonDocument event;commandEnvelope(event,activeCommandId,"data");event["kind"]="channel_discovery";
+      event["channel"]=timeSlicing.discoveredChannel;queueCommandEvent(event);
+      endWebCommand(webCancelled ? "cancelled" : timeSlicing.discoveredChannel ? "success" : "failed");
+    }
     else finishWebSniff();
     return;
   }

@@ -16,6 +16,7 @@ constexpr uint32_t START_LEAD_US = 10000000;
 constexpr size_t PAYLOAD_SIZE = 18;
 constexpr int64_t DISCOVERY_US = 10000000;
 constexpr int64_t SNIFF_US = 20000000;
+constexpr int64_t COLLECTION_US = 10000000;
 constexpr uint8_t SNIFF_CYCLES = 3;
 constexpr int64_t CHANNEL_DWELL_US = 200000;
 
@@ -39,7 +40,9 @@ struct WindowTiming {
   }
 };
 
-inline int64_t sniffDurationUs(bool discovery) { return discovery ? DISCOVERY_US : SNIFF_US; }
+inline int64_t sniffDurationUs(bool discovery, bool collection = false) {
+  return discovery ? DISCOVERY_US : collection ? COLLECTION_US : SNIFF_US;
+}
 inline uint8_t nextSniffCycle(uint8_t cycle) {
   return cycle < SNIFF_CYCLES ? uint8_t(cycle + 1) : 0;
 }

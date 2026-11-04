@@ -29,10 +29,12 @@ function positions(coordinates, prefix) {
 }
 const training = positions(trainingCoordinates,"T");
 const unseen = positions(unseenCoordinates,"U");
-const trainingOrder = Object.freeze([...training].sort((a,b) =>
+function outwardOrder(points) {return Object.freeze([...points].sort((a,b) =>
   Math.round(((a.u-.5)**2+(a.v-.5)**2)*1e8) -
   Math.round(((b.u-.5)**2+(b.v-.5)**2)*1e8) || a.id.localeCompare(b.id)
-).map(p=>p.id));
+).map(p=>p.id));}
+const trainingOrder = outwardOrder(training);
+const unseenOrder = outwardOrder(unseen);
 function coordinatesFor(id, sideLengthM) {
   if(![1,2,3,4,5].includes(sideLengthM)) throw new Error("Square side must be 1..5 metres.");
   const point = [...training,...unseen].find(p=>p.id===id);
@@ -40,4 +42,4 @@ function coordinatesFor(id, sideLengthM) {
   return Object.freeze({...point, x_m:Number((point.u*sideLengthM).toFixed(6)),
     y_m:Number((point.v*sideLengthM).toFixed(6))});
 }
-module.exports = Object.freeze({coordinatesVerified:false,outsideOffsetRatio,training,unseen,trainingOrder,coordinatesFor});
+module.exports = Object.freeze({coordinatesVerified:false,outsideOffsetRatio,training,unseen,trainingOrder,unseenOrder,coordinatesFor});
