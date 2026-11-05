@@ -11,18 +11,28 @@ if ($env:PORT) {
 }
 $dashboardUrl = "http://127.0.0.1:$port/"
 function Find-Browser {
+    # Resolve the user's HTTP association, including Brave's versioned ProgID.
+    $association = Get-ItemProperty -LiteralPath 'Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice' -ErrorAction SilentlyContinue
+    if ($association.ProgId) {
+        $commandKey = Get-Item -LiteralPath "Registry::HKEY_CLASSES_ROOT\$($association.ProgId)\shell\open\command" -ErrorAction SilentlyContinue
+        if ($commandKey) {
+            $command = [Environment]::ExpandEnvironmentVariables([string]$commandKey.GetValue(''))
+            $executable = $null
+            if ($command -match '^\s*"([^"]+\.exe)"') { $executable = $Matches[1] }
+            elseif ($command -match '^\s*(.+?\.exe)(?:\s|$)') { $executable = $Matches[1] }
+            if ($executable -and (Test-Path -LiteralPath $executable)) { return $executable }
+        }
+    }
+    # Brave is the requested fallback when Windows association details are unavailable.
     $candidates = @(
-        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
         "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
-        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
-        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+        "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe"
     )
     foreach ($candidate in $candidates) {
         if (Test-Path -LiteralPath $candidate) { return $candidate }
     }
-    throw 'A supported browser was not found. Install Edge, Brave, or Chrome.'
+    throw 'Could not find your default browser or Brave. Check the default HTTP browser in Windows settings.'
 }
 function Get-DashboardState {
     try {
@@ -74,7 +84,9 @@ try {
         }
     }
     # The visible browser window is explicitly requested; the server stays hidden.
-    Start-Process -FilePath $browser -ArgumentList @('--new-window', $dashboardUrl) | Out-Null
+    $windowArgument = '--new-window'
+    if ([IO.Path]::GetFileName($browser) -ieq 'firefox.exe') { $windowArgument = '-new-window' }
+    Start-Process -FilePath $browser -ArgumentList @($windowArgument, $dashboardUrl) | Out-Null
 } catch {
     if ($CheckOnly) { Write-Error $_; exit 1 }
     Add-Type -AssemblyName System.Windows.Forms
