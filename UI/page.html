@@ -343,7 +343,64 @@
       <section class="card"><div class="collect-foot"><div><h2>Your dataset</h2><p id="collectionSaved">0 approved rows</p><p id="collectionFile" class="muted">collection.csv</p></div><a href="/api/collection/export" download="collection.csv"><button class="secondary" type="button">Download CSV for Excel</button></a></div><progress id="collectionTotalProgress" class="collect-progress" max="5550" value="0"></progress><p class="muted">3,750 training rows + 1,800 unseen test rows. CSV and recovery state are saved on this laptop, outside Git.</p></section>
     </section>
 
-    <div id="operationsPanel" class="columns" hidden>
+    <div id="operationsPanel" hidden>
+      <section class="card command-controls">
+        <h2>Commands</h2>
+        <p id="commandAvailability" class="muted">Waiting for the root</p>
+        <div class="command-grid">
+          <section class="command-tile tile-configure">
+            <span class="command-category">Mesh layout</span>
+            <h3>Configure nodes</h3>
+            <p>Measure distances between the configured boards and update the node layout.</p>
+            <button id="configureButton" data-command type="button">Configure nodes</button>
+          </section>
+          <section class="command-tile tile-status">
+            <span class="command-category">Connection</span>
+            <h3>Network status</h3>
+            <p>Inspect connected boards, radio channels, and the current A/n model.</p>
+            <button id="statusButton" data-command class="secondary" type="button">Get network status</button>
+          </section>
+          <form id="sniffForm" class="command-tile tile-sniff">
+            <span class="command-category">Target capture</span>
+            <h3>Sniff a Wi-Fi device</h3>
+            <label for="targetMac">Target Wi-Fi MAC</label>
+            <input id="targetMac" placeholder="11:22:33:44:55:66" autocomplete="off" required>
+            <label for="targetChannel">Channel · 0 for automatic discovery</label>
+            <input id="targetChannel" type="number" min="0" max="13" value="0" required>
+            <p>Use an active 2.4 GHz device. Three capture cycles estimate its position.</p>
+            <button data-command type="submit">Sniff · 3 capture cycles</button>
+          </form>
+          <section class="command-tile tile-calibrate">
+            <span class="command-category">A/n model</span>
+            <h3>Calibrate A/n</h3>
+            <label for="boardSelect">Pair with normal board</label>
+            <select id="boardSelect"><option value="2">Node 02</option></select>
+            <p>Follow the 1–5 m placement prompts, then validate at 2.5 m. Review before saving.</p>
+            <button id="calibrateButton" data-command type="button">Start calibration</button>
+          </section>
+          <section class="command-tile tile-diagnose">
+            <span class="command-category">Repeatability</span>
+            <h3>Fixed-position diagnostics</h3>
+            <label for="diagnosticBoardSelect">Pair with normal board</label>
+            <select id="diagnosticBoardSelect"><option value="2">Node 02</option></select>
+            <label for="diagnosticDistance">Separation in metres</label>
+            <input id="diagnosticDistance" type="number" min="1" max="5" value="1">
+            <p>Keep the pair fixed for five captures and compare RSSI stability.</p>
+            <button id="diagnoseButton" data-command class="secondary" type="button">Run diagnostics</button>
+          </section>
+          <section class="command-tile tile-session">
+            <span class="command-category">Active operation</span>
+            <h3>Placement and review</h3>
+            <p id="sessionHint" class="muted">Placement and review actions appear during a session.</p>
+            <div class="buttons session-buttons"><button id="nextButton" type="button" disabled>Next placement</button><button id="saveButton" type="button" disabled>Save A/n</button><button id="retryButton" class="secondary" type="button" disabled>Retry calibration</button></div>
+            <label for="remeasureDistance">Remeasure distance in metres</label>
+            <div class="remeasure-row"><select id="remeasureDistance"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select><button id="remeasureButton" class="secondary" type="button" disabled>Remeasure</button></div>
+            <button id="cancelButton" class="cancel-button" type="button" disabled>Cancel active command</button>
+            <p>During capture, cancellation waits for the root to reconnect. A committed save cannot be undone.</p>
+          </section>
+        </div>
+      </section>
+      <div class="columns">
       <div class="left-column">
         <section class="card">
           <h2>Node layout</h2>
@@ -369,35 +426,7 @@
         </div>
         <div id="terminalOutput" aria-live="polite"></div>
       </aside>
-      <section class="card command-controls">
-        <h2>Commands</h2>
-        <p id="commandAvailability" class="muted">Waiting for the root</p>
-        <div class="buttons"><button id="configureButton" data-command type="button">Configure nodes</button><button id="statusButton" data-command class="secondary" type="button">Network status</button></div>
-        <form id="sniffForm" class="control-group">
-          <h3>Sniff a Wi-Fi device</h3>
-          <label for="targetMac">Target Wi-Fi MAC</label>
-          <input id="targetMac" placeholder="11:22:33:44:55:66" autocomplete="off" required>
-          <label for="targetChannel">Channel (0 = automatic discovery)</label>
-          <input id="targetChannel" type="number" min="0" max="13" value="0" required>
-          <button data-command type="submit">Sniff · 3 capture cycles</button>
-          <p class="muted">Use an active 2.4 GHz Wi-Fi device. A target position based on one or two receivers is an assumption.</p>
-        </form>
-        <div class="control-group">
-          <h3>Calibration &amp; diagnostics</h3>
-          <label for="boardSelect">Normal board</label><select id="boardSelect"><option value="2">Node 02</option></select>
-          <label for="diagnosticDistance">Diagnostic separation (metres)</label><input id="diagnosticDistance" type="number" min="1" max="5" value="1">
-          <div class="buttons"><button id="calibrateButton" data-command type="button">Calibrate A/n</button><button id="diagnoseButton" data-command class="secondary" type="button">Diagnose</button></div>
-          <p class="muted">Calibration prompts for 1–5 m placements, then validation at 2.5 m. Diagnostics keep the pair at one fixed distance for five captures.</p>
-        </div>
-        <div class="control-group">
-          <h3>Current session</h3><p id="sessionHint" class="muted">Placement and review actions appear during a session.</p>
-          <div class="buttons"><button id="nextButton" type="button" disabled>Next placement</button><button id="saveButton" type="button" disabled>Save A/n</button><button id="retryButton" class="secondary" type="button" disabled>Retry calibration</button></div>
-          <label for="remeasureDistance">Remeasure distance (metres)</label><select id="remeasureDistance"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
-          <button id="remeasureButton" class="secondary" type="button" disabled>Remeasure</button>
-          <button id="cancelButton" class="cancel-button" type="button" disabled>Cancel active command</button>
-          <p class="muted">During radio capture, a cancel request waits for the root to return to the network. A committed calibration save cannot be undone.</p>
-        </div>
-      </section>
+      </div>
       </div>
     </div>
   </main>

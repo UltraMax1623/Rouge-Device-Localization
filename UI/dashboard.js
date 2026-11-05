@@ -62,15 +62,16 @@
       `Uptime: ${data.uptimeSeconds}s`, `Updated ${new Date().toLocaleTimeString()}`];
     facts.forEach(text=>byId("networkFacts").append(element("span",text)));
     byId("overviewNodes").replaceChildren();
-    const selected=byId("boardSelect").value;
-    byId("boardSelect").replaceChildren();
+    const boardSelects=[byId("boardSelect"),byId("diagnosticBoardSelect")];
+    const selected=boardSelects.map(select=>select.value);
+    boardSelects.forEach(select=>select.replaceChildren());
     for(const node of data.nodes||[]) {
       const tile=element("div",undefined,"overview-node");tile.dataset.board=String(node.board);
       tile.append(element("strong",`${node.board===1?"Root":"Node"} ${String(node.board).padStart(2,"0")} · ${node.online?"Online":"Offline"}`),element("span",node.mac));
       byId("overviewNodes").append(tile);
-      if(node.board!==1){const option=element("option",`Node ${String(node.board).padStart(2,"0")}`);option.value=node.board;byId("boardSelect").append(option);}
+      if(node.board!==1)for(const select of boardSelects){const option=element("option",`Node ${String(node.board).padStart(2,"0")}`);option.value=node.board;select.append(option);}
     }
-    if([...byId("boardSelect").options].some(option=>option.value===selected))byId("boardSelect").value=selected;
+    boardSelects.forEach((select,index)=>{if([...select.options].some(option=>option.value===selected[index]))select.value=selected[index];});
   }
   function render(data) {
     if(data.kind==="network") {
@@ -179,7 +180,7 @@
   byId("configureButton").onclick=()=>send("conf");byId("statusButton").onclick=()=>send("status");
   byId("sniffForm").onsubmit=event=>{event.preventDefault();send("sniff",{mac:byId("targetMac").value,channel:Number(byId("targetChannel").value)});};
   byId("calibrateButton").onclick=()=>send("calibrate",{board:Number(byId("boardSelect").value)});
-  byId("diagnoseButton").onclick=()=>send("diagnose",{board:Number(byId("boardSelect").value),distance:Number(byId("diagnosticDistance").value)});
+  byId("diagnoseButton").onclick=()=>send("diagnose",{board:Number(byId("diagnosticBoardSelect").value),distance:Number(byId("diagnosticDistance").value)});
   for(const [id,name]of[["nextButton","next"],["saveButton","save"],["retryButton","retry"],["cancelButton","cancel"]])byId(id).onclick=()=>action(name);
   byId("remeasureButton").onclick=()=>action(`remeasure ${byId("remeasureDistance").value}`);
   byId("clearTerminalButton").onclick=()=>terminal.replaceChildren();
