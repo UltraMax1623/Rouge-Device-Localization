@@ -1,0 +1,4 @@
+# Keep demo datasets; omit authoring previews, inspections, and Excel lock files.
+**/preview_*.png
+**/*.inspect.ndjson
+**/~$*
