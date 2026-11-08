@@ -60,15 +60,17 @@ struct TestMesh {
   void sendSingle(uint32_t, const String &) { ++singles; }
 } mesh;
 struct TimeSlicingController {
-  enum class Phase { IDLE, FAILED };
+  enum class Phase { IDLE, MEASURING, COLLECTING, FAILED };
   bool root = true, running = false;
+  Phase activePhase = Phase::MEASURING;
   uint32_t round = 0;
   bool isRoot() const { return root; }
   uint32_t rootNodeId() const { return 1; }
   bool busy() const { return running; }
   bool timingCritical() const { return false; }
   bool requestCancellation() { running=false; return true; }
-  Phase phase() const { return Phase::IDLE; }
+  Phase phase() const { return running ? activePhase : Phase::IDLE; }
+  String reportWaitMessage() const { return ""; }
   bool networkReadyForConfiguration(size_t) const { return !running && meshStarted; }
   bool beginCalibrationRound(const std::vector<MacAddress> &pair, uint32_t session) {
     assert(pair.size() == 2 && session); ++round; running = true; return true;
@@ -134,6 +136,9 @@ int main() {
   for (unsigned i = 0; i < 10; ++i) { ticks += 1001; mode.update(); }
   assert(mesh.broadcasts == idleBroadcasts + 5); // Idle retries stop after five attempts.
   acknowledge(mode); mode.update();
+  macList.push_back({0x44,0x33,0x22,0x11,0,3}); // Offline bystander.
+  assert(!mode.networkSynced());
+  assert(!mode.start(3)); // The selected board still must acknowledge the model.
   assert(mode.start(2)); assert(mode.identifying());
   assert(!mode.webControl("next")); assert(!timeSlicing.running); // No capture during identification.
   ticks += 7001; mode.update(); acknowledge(mode); mode.update();
@@ -143,6 +148,10 @@ int main() {
   assert(!timeSlicing.running && mesh.broadcasts == waitingBroadcasts); // Silent ten-minute placement wait.
   for (unsigned point = 1; point <= 5; ++point) {
     startCapture(mode);
+    assert(!mode.backendSafe());
+    timeSlicing.activePhase = TimeSlicingController::Phase::COLLECTING;
+    assert(mode.backendSafe()); // The radio window is over and reports can be shown.
+    timeSlicing.activePhase = TimeSlicingController::Phase::MEASURING;
     completeCapture(point); mode.update();
     assert(A == -60 && n == 2); // Fits remain provisional.
   }
@@ -154,9 +163,12 @@ int main() {
   assert(mode.webControl("save")); assert(std::fabs(A + 50) < 1e-9 && !testNvs.empty());
   mode.update(); assert(mode.active()); // Old peer revision cannot finish save.
   mesh.connected = false; ticks += 31000; mode.update();
-  assert(mode.active() && std::fabs(A + 50) < 1e-9); // Save survives a disconnected node.
+  assert(!mode.active() && strcmp(mode.outcome(), "partial") == 0);
+  assert(std::fabs(A + 50) < 1e-9); // Saved model survives pending distribution.
   mesh.connected = true;
-  acknowledge(mode); mode.update(); assert(!mode.active());
+  acknowledge(mode); mode.update(); assert(!mode.networkSynced()); // Board 03 still pending.
+  macList.pop_back();
+  assert(mode.networkSynced());
   A = -60; n = 2;
   CalibrationMode reboot; reboot.begin(); assert(std::fabs(A + 50) < 1e-9);
   reboot.topologyChanged(); ticks += 1001; reboot.update(); acknowledge(reboot);

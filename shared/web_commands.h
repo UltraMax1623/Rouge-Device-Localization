@@ -35,8 +35,9 @@ void publishNetworkStatus() {
   String payload;serializeJson(doc,payload);webSocket.sendTXT(payload);
 }
 
-void endWebCommand(const char *status) {
+void endWebCommand(const char *status, const char *message = nullptr) {
   JsonDocument end;commandEnvelope(end,activeCommandId,"end");end["status"]=status;
+  if(message)end["message"]=message;
   queueCommandEvent(end);webCommandRunning=false;activeCommandId="";
 }
 
@@ -71,7 +72,8 @@ void dispatchWebCommand(const String &id,const String &name,JsonDocument &params
     JsonDocument data;networkSnapshot(data);commandEnvelope(data,id,"data");queueCommandEvent(data);
     endWebCommand("success");return;
   }
-  if(!calibrationMode.networkSynced() || !timeSlicing.networkReadyForConfiguration(macList.size())) {
+  const bool pairCommand = name=="calibrate" || name=="diagnose";
+  if(!pairCommand && (!calibrationMode.networkSynced() || !timeSlicing.networkReadyForConfiguration(macList.size()))) {
     rejectCommand(id,"MESH_NOT_READY","Wait for the configured nodes and A/n acknowledgements.");return;
   }
   if(name=="conf") { startWebConf(id);return; }
@@ -102,6 +104,11 @@ void dispatchWebCommand(const String &id,const String &name,JsonDocument &params
   unsigned board=params["board"] | 0u, distance=params["distance"] | 1u;
   if(board<2 || board>TEST_BOARD_COUNT || distance<1 || distance>5) {
     rejectCommand(id,"INVALID_ARGUMENT","Select a configured normal board and distance 1..5 m.");return;
+  }
+  if(!calibrationMode.modelAcknowledged(board)) {
+    char message[96];
+    snprintf(message, sizeof(message), "Waiting for selected board %02X to join and acknowledge the active A/n.", board);
+    rejectCommand(id,"MESH_NOT_READY",message);return;
   }
   if(!beginWebLifecycle(id))return;
   if(!calibrationMode.start(board,name=="diagnose",distance)) {
@@ -167,7 +174,7 @@ void finishWebSniff() {
   data["message"]=!lastNodeCoordinates.valid ? "Run Configure to establish anchor positions before locating a target." :
       targetPosition.ambiguous ? "Positive-quadrant position selected by convention; the ranges do not determine a unique position." : "Target fitted to the last configuration layout.";
   queueCommandEvent(data);
-  if(!validNodes && !webCancelled) {
+  if(!webCancelled && !timeSlicing.captureFailure().length() && !validNodes) {
     JsonDocument error;commandEnvelope(error,activeCommandId,"error");error["code"]="TARGET_NOT_HEARD";
     error["message"]="No valid target averages. Check the Wi-Fi MAC, 2.4 GHz traffic, activity, and range.";queueCommandEvent(error);
   }
@@ -206,48 +213,61 @@ void finishWebCollection() {
   endWebCommand(webCancelled ? "cancelled" : complete==3 ? "success" : "partial");
 }
 
+void publishCaptureFailure() {
+  if (webCancelled || !timeSlicing.captureFailure().length()) return;
+  JsonDocument event;
+  commandEnvelope(event,activeCommandId,"error");
+  event["code"]="CAPTURE_MESH_FAILURE";
+  event["message"]=timeSlicing.captureFailure();
+  queueCommandEvent(event);
+}
+
 void updateWebCommand() {
   processWebControl();
   if(!webCommandRunning)return;
   const auto phase=timeSlicing.phase();
   if(activeCommandName=="conf" || activeCommandName=="sniff" || activeCommandName=="collect" || activeCommandName=="discover") {
     if(timeSlicing.busy()) {
-      if((activeCommandName=="sniff" || activeCommandName=="collect" || activeCommandName=="discover") && !timeSlicing.timingCritical() && commandEvents.room(TEST_BOARD_COUNT+5)) {
-        String key=String(timeSlicing.captureCycle())+":"+timeSlicing.targetChannel();
-        if(key!=webSnapshot) {
-          webSnapshot=key;
+      if(backendServiceAllowed() && commandEvents.room(TEST_BOARD_COUNT+6)) {
+        String message=timeSlicing.reportWaitMessage();
+        if(message.length() && timeSlicing.captureCycle())
+          message=String("Cycle ")+timeSlicing.captureCycle()+": "+message;
+        if(message.length() && message!=webSnapshot) {
+          webSnapshot=message;
           JsonDocument event;commandEnvelope(event,activeCommandId,"log");
-          event["message"]=timeSlicing.captureCycle() ?
-              String("Capture cycle ")+timeSlicing.captureCycle()+"/"+TimeSliceProtocol::SNIFF_CYCLES+
-              " on channel "+timeSlicing.targetChannel() : String("Discovering the target Wi-Fi channel.");
+          event["message"]=message;
           queueCommandEvent(event);
         }
       }
       return;
     }
     if(activeCommandName=="conf") { finishWebConf(phase);webCommandRunning=false; }
-    else if(activeCommandName=="collect") finishWebCollection();
+    else if(activeCommandName=="collect") { publishCaptureFailure(); finishWebCollection(); }
     else if(activeCommandName=="discover") {
+      publishCaptureFailure();
       JsonDocument event;commandEnvelope(event,activeCommandId,"data");event["kind"]="channel_discovery";
       event["channel"]=timeSlicing.discoveredChannel;queueCommandEvent(event);
-      endWebCommand(webCancelled ? "cancelled" : timeSlicing.discoveredChannel ? "success" : "failed");
+      endWebCommand(webCancelled ? "cancelled" : timeSlicing.discoveredChannel &&
+                    !timeSlicing.captureFailure().length() ? "success" : "failed");
     }
-    else finishWebSniff();
+    else { publishCaptureFailure(); finishWebSniff(); }
     return;
   }
   if(activeCommandName=="calibrate" || activeCommandName=="diagnose") {
     const bool finished=!calibrationMode.localSession();
-    if(!finished && (!calibrationMode.backendSafe() || !backendServiceAllowed() || !commandEvents.room(5)))return;
+    if(!finished && (!backendServiceAllowed() || !commandEvents.room(5)))return;
     JsonDocument snapshot;calibrationMode.snapshot(snapshot,activeCommandName=="diagnose");
     String serialized;serializeJson(snapshot,serialized);
     if(serialized!=webSnapshot || finished) {
       webSnapshot=serialized;commandEnvelope(snapshot,activeCommandId,"data");queueCommandEvent(snapshot);
     }
     if(finished) {
-      if(activeCommandName=="calibrate" && strcmp(calibrationMode.outcome(),"success")==0) {
+      const char *outcome=calibrationMode.outcome();
+      const bool partial=strcmp(outcome,"partial")==0;
+      if(activeCommandName=="calibrate" && (strcmp(outcome,"success")==0 || partial)) {
         lastNodeCoordinates={};lastCoordinateRound=0;
       }
-      endWebCommand(calibrationMode.outcome());
+      endWebCommand(outcome,partial ? snapshot["message"].as<const char *>() : nullptr);
     }
   }
 }

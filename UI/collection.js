@@ -14,8 +14,8 @@
     $("startCollectionSession").disabled=locked||busy||sending||Boolean(pending);
     $("changeCollectionSession").disabled=!session||busy||sending||Boolean(pending);
     $("fetchCollectionChannel").disabled=!locked||session.channel!==0||busy||!online||sending;
-    const nodesReady=network?.nodes?.length===4&&[1,2,3,4].every(b=>network.nodes.some(n=>n.board===b&&n.online));
-    $("collectConnection").textContent=!online?"Root offline / radio capture":nodesReady?"4 / 4 sniffers online":"Waiting for four configured sniffers";
+    const nodesReady=!network?.stale&&network?.nodes?.length===4&&[1,2,3,4].every(b=>network.nodes.some(n=>n.board===b&&n.online));
+    $("collectConnection").textContent=!online?"Root unavailable / radio capture":!network||network.stale?"Waiting for fresh mesh status":nodesReady?"4 / 4 sniffers online":"Waiting for four configured sniffers";
     $("collectionSetup").replaceChildren();
     if(setup)for(const [name,value,sub] of [["MeshID",String(setup.mesh_id).padStart(2,"0"),`${setup.side_length_m} m square`],
       ["TargetID",setup.target_id,`Position ${setup.ordinal} of ${setup.total} · centre outward`],
@@ -86,7 +86,7 @@
   window.addEventListener("console-message",event=>{
     const data=event.detail;
     if(data.type==="collection_state")state=data;
-    if(data.type==="device_connection")online=data.connected;
+    if(data.type==="device_connection"){online=data.connected;if(!online)network=null;}
     if(data.type==="network_status")network=data;
     if(data.type==="command_lock"){busy=data.locked;activeId=data.commandId;activeName=data.command;}
     render();

@@ -64,9 +64,20 @@ async function connect(url, state = {}) {
   device.socket.send(JSON.stringify({type:"command_event",commandId:pending.commandId,command:"sniff",sequence:sequence++,phase:"end",status:"cancelled"}));
   await ui.next(value=>value.type==="command_event"&&value.commandId===pending.commandId&&value.phase==="end");
   const telemetry={type:"network_status",nodes:[{board:1,mac:"44:33:22:11:00:01",online:true}],meshChannel:11};
-  device.socket.send(JSON.stringify(telemetry));await ui.next(value=>value.type==="network_status");
+  device.socket.send(JSON.stringify(telemetry));
+  const live=await ui.next(value=>value.type==="network_status");
+  assert.equal(live.stale,false);
+  assert.ok(Number.isInteger(live.receivedAt));
   const refreshed=await connect(`ws://127.0.0.1:${port}/ws?role=ui`);sockets.push(refreshed.socket);
-  assert.equal((await refreshed.next(value=>value.type==="network_status")).meshChannel,11);
-  console.log("PASS command validation, all command lifecycles, session controls, and telemetry replay");
+  assert.deepEqual(await refreshed.next(value=>value.type==="network_status"),live);
+  device.socket.close();
+  const stale=await ui.next(value=>value.type==="network_status"&&value.stale);
+  assert.equal(stale.receivedAt,live.receivedAt);
+  device=await connect(`ws://127.0.0.1:${port}/ws?role=device&token=local-device-token-change-me`);sockets.push(device.socket);
+  const reopened=await connect(`ws://127.0.0.1:${port}/ws?role=ui`);sockets.push(reopened.socket);
+  assert.deepEqual(await reopened.next(value=>value.type==="network_status"),stale);
+  device.socket.send(JSON.stringify(telemetry));
+  assert.equal((await ui.next(value=>value.type==="network_status"&&!value.stale)).meshChannel,11);
+  console.log("PASS command lifecycles, session controls, and telemetry freshness across reconnection");
  }finally{sockets.forEach(socket=>socket.terminate());server.kill();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

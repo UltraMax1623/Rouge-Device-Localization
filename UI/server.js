@@ -7,6 +7,7 @@ const { WebSocketServer, WebSocket } = require("ws");
 const HOST = "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 const COMMAND_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 300000);
+const NETWORK_STATUS_TTL_MS = 15000;
 const PAGE_PATH = path.join(__dirname, "page.html");
 
 // Keep this token identical to the one in the ESP32-S3 firmware.
@@ -27,6 +28,21 @@ if(collection.state.pending?.stage==="collecting") {
   activeCommandId=collection.state.discovery.id;activeCommandName="discover";
 }
 let networkStatus = null;
+let networkStatusTimer = null;
+function markNetworkStatusStale() {
+  clearTimeout(networkStatusTimer);
+  if (!networkStatus || networkStatus.stale) return;
+  networkStatus = { ...networkStatus, stale: true };
+  broadcast(networkStatus);
+}
+
+function recordNetworkStatus(message) {
+  clearTimeout(networkStatusTimer);
+  networkStatus = { ...message, receivedAt: Date.now(), stale: false };
+  networkStatusTimer = setTimeout(markNetworkStatusStale, NETWORK_STATUS_TTL_MS);
+  networkStatusTimer.unref();
+  broadcast(networkStatus);
+}
 let pendingControl = null;
 function sendPendingControl() {
   if (pendingControl && deviceReady && deviceSocket?.readyState === WebSocket.OPEN) deviceSocket.send(JSON.stringify(pendingControl));
@@ -124,7 +140,9 @@ const server = http.createServer((req, res) => {
           response=startCommand("discover",{mac:collection.state.session.mac.replace(/:/g,""),channel:0},id);
         } else if(req.url==="/api/collection/run") {
           ensureCommandReady();
-          if(networkStatus?.nodes?.length!==4||![1,2,3,4].every(board=>networkStatus.nodes.some(n=>n.board===board&&n.online)))
+          if (!networkStatus || networkStatus.stale)
+            throw Error("Waiting for a fresh mesh status update from the root.");
+          if(networkStatus.nodes?.length!==4||![1,2,3,4].every(board=>networkStatus.nodes.some(n=>n.board===board&&n.online)))
             throw Error("Collection requires root 01 and normal boards 02, 03, 04 online.");
           const id=randomUUID();collection.prepare(id,value.physicalConfirmed);
           response=startCommand("collect",{mac:collection.state.session.mac.replace(/:/g,""),channel:collection.state.session.channel},id);
@@ -237,8 +255,11 @@ webSockets.on("connection", (socket, request) => {
     }
 
     deviceSocket = socket;
+    const wasReady = deviceReady;
     deviceReady = false;
     meshChannelStatus = null;
+    if (wasReady) broadcast({ type: "device_connection", connected: false });
+    markNetworkStatusStale();
     logToUi("ESP32-S3 connected by WebSocket.");
   } else if (role !== "ui") {
     socket.close(1008, "Unknown connection role");
@@ -272,7 +293,7 @@ webSockets.on("connection", (socket, request) => {
       const message = JSON.parse(data.toString());
 
       if (message.type === "network_status") {
-        networkStatus = message; broadcast(message); return;
+        recordNetworkStatus(message); return;
       }
       if (message.type === "control_ack") {
         if (pendingControl && message.controlId === pendingControl.controlId) {
@@ -389,6 +410,7 @@ webSockets.on("connection", (socket, request) => {
       meshChannelStatus = null;
       logToUi("ESP32-S3 disconnected.");
       broadcast({ type: "device_connection", connected: false });
+      markNetworkStatusStale();
     }
   });
 });

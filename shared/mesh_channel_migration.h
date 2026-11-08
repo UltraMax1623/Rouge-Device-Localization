@@ -26,7 +26,10 @@ class MeshChannelMigration {
   uint32_t debugRetryMs() const {
     return int32_t(retryAfterMs_ - millis()) > 0 ? retryAfterMs_ - millis() : 0;
   }
-  void bridgeConfigured(bool configured) { bridgeConfigured_ = configured; }
+  void bridgeConfigured(bool configured) {
+    bridgeConfigured_ = configured;
+    if (configured) bridgeRequestedMs_ = millis();
+  }
 
   void discoverAtBoot() {
 #if ROOT_FIRMWARE
@@ -78,6 +81,8 @@ class MeshChannelMigration {
           calibrationMode.active()) return false;
       if (phase_ != Phase::Idle &&
           (phase_ != Phase::Preparing || epoch_ != epoch || target_ != target)) return false;
+      if (phase_ == Phase::Idle)
+        deviceLogf("[CHANNEL] Board %u received prepare %u -> %u", BOARD_NUMBER, old, target);
       epoch_ = epoch;
       target_ = uint8_t(target);
       oldChannel_ = uint8_t(old);
@@ -109,14 +114,18 @@ class MeshChannelMigration {
   void update() {
     const uint32_t now = millis();
 #if ROOT_FIRMWARE
+    const bool hotspotConnected = WiFi.status() == WL_CONNECTED && WiFi.SSID() == ROUTER_SSID;
+    const int hotspotChannel = hotspotConnected ? WiFi.channel() : 0;
+    const bool routerRejoining = bridgeConfigured_ && routerChannel_ == meshChannel &&
+        now - bridgeRequestedMs_ < ROUTER_REJOIN_GRACE_MS;
     if (!scanning_ && meshStarted && meshChannel == routerChannel_ &&
         !timeSlicing.busy() && !calibrationMode.active() &&
-        WiFi.status() == WL_CONNECTED && WiFi.SSID() != ROUTER_SSID &&
+        !routerRejoining && WiFi.status() == WL_CONNECTED && !hotspotConnected &&
         now - lastRouterRepairMs_ >= 10000) {
       lastRouterRepairMs_ = now;
       deviceLog("[CHANNEL] Root joined a mesh AP instead of hotspot; resetting router station scan");
       mesh.configureRouterStation(ROUTER_SSID, ROUTER_PASSWORD);
-      bridgeConfigured_ = true;
+      bridgeConfigured(true);
     }
     if (scanning_) {
       const int result = WiFi.scanComplete();
@@ -131,25 +140,15 @@ class MeshChannelMigration {
     if (phase_ == Phase::Idle) {
       if (meshStarted && routerChannel_ == meshChannel && !bridgeConfigured_) {
         mesh.configureRouterStation(ROUTER_SSID, ROUTER_PASSWORD);
-        bridgeConfigured_ = true;
+        bridgeConfigured(true);
         deviceLogf("[CHANNEL] Router connection requested on mesh channel %u", meshChannel);
       }
-      if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ROUTER_SSID && WiFi.channel() >= 1 &&
-          WiFi.channel() <= 13 && WiFi.channel() != meshChannel) {
-        const uint8_t movedChannel = WiFi.channel();
-        if (timeSlicing.busy() || calibrationMode.active() ||
-            (movedChannel == failedChannel_ &&
-             (failureCount_ >= 3 || int32_t(now - retryAfterMs_) < 0))) return;
-        routerChannel_ = movedChannel;
-        deviceLogf("[CHANNEL] Router moved the radio to %u; restarting mesh there", movedChannel);
-        if (switchTo(movedChannel)) {
-          failedChannel_ = 0;
-          failureCount_ = 0;
-        } else {
-          target_ = movedChannel;
-          markFailure();
-          deviceLog("[CHANNEL] Could not follow router channel; bootstrap mesh retained");
-        }
+      if (meshStarted && hotspotChannel >= 1 && hotspotChannel <= 13 && hotspotChannel != meshChannel) {
+        if (timeSlicing.busy() || calibrationMode.active()) return;
+        routerChannel_ = uint8_t(hotspotChannel);
+        deviceLogf("[CHANNEL] Hotspot moved to %u; restoring mesh on %u before coordinated migration",
+                   unsigned(routerChannel_), unsigned(meshChannel));
+        switchTo(meshChannel);
         return;
       }
       if (routerChannel_ && routerChannel_ != meshChannel &&
@@ -166,8 +165,7 @@ class MeshChannelMigration {
         lastSendMs_ = now - 500;
         deviceLogf("[CHANNEL] Preparing mesh migration %u -> %u", oldChannel_, target_);
       } else if (meshStarted && !timeSlicing.busy() && !calibrationMode.active() &&
-                 now - lastScanMs_ >= 60000 &&
-                 (routerChannel_ == 0 || WiFi.status() != WL_CONNECTED || WiFi.SSID() != ROUTER_SSID)) {
+                 !routerRejoining && now - lastScanMs_ >= 60000 && !hotspotConnected) {
         lastScanMs_ = now;
         if (WiFi.scanNetworks(true) == WIFI_SCAN_RUNNING) {
           scanning_ = true;
@@ -204,22 +202,29 @@ class MeshChannelMigration {
       if (int32_t(now - switchAtMs_) >= 0) {
         if (!switchTo(target_)) { rollback("mesh restart failed"); return; }
         phase_ = Phase::Verifying;
-        phaseSinceMs_ = now;
+        phaseSinceMs_ = millis();
+        return; // Read channel and association again after restarting the radio.
       }
+    }
+    if ((phase_ == Phase::Verifying || phase_ == Phase::Confirming) &&
+        hotspotChannel >= 1 && hotspotChannel <= 13 && hotspotChannel != target_) {
+      routerChannel_ = uint8_t(hotspotChannel);
+      deviceLogf("[CHANNEL] Hotspot moved to %u during migration to %u", unsigned(routerChannel_), unsigned(target_));
+      rollback("hotspot channel changed");
+      return;
     }
     if (phase_ == Phase::Verifying) {
       if (meshStarted && mesh.getNodeList().size() >= TEST_BOARD_COUNT - 1 &&
-          allPeersRejoined() &&
-          WiFi.status() == WL_CONNECTED && WiFi.SSID() == ROUTER_SSID && WiFi.channel() == target_) {
+          allPeersRejoined() && hotspotChannel == target_) {
         phase_ = Phase::Confirming;
         phaseSinceMs_ = now;
         lastSendMs_ = now - 500;
         for (unsigned i = 2; i <= TEST_BOARD_COUNT; ++i) acknowledged_[i] = false;
         deviceLogf("[CHANNEL] Router and %u peers rejoined on channel %u",
                    TEST_BOARD_COUNT - 1, target_);
-      } else if (now - phaseSinceMs_ > 65000) {
-        rollback(WiFi.status() != WL_CONNECTED || WiFi.SSID() != ROUTER_SSID
-            ? "root did not join hotspot within 65 seconds" : "mesh peers did not rejoin within 65 seconds");
+      } else if (now - phaseSinceMs_ >= ROOT_VERIFY_MS) {
+        rollback(!hotspotConnected ? "root did not join hotspot within 30 seconds"
+                                   : "mesh peers did not rejoin within 30 seconds");
       }
     }
     if (phase_ == Phase::Confirming) {
@@ -239,6 +244,7 @@ class MeshChannelMigration {
       if (peer == timeSlicing.rootNodeId()) rootReachable = true;
     if (rootReachable) {
       lastRootSeenMs_ = now;
+      lastRootChannel_ = meshChannel;
       searching_ = false;
     }
     if (phase_ == Phase::Preparing && now - phaseSinceMs_ > 25000) {
@@ -248,31 +254,64 @@ class MeshChannelMigration {
     if (phase_ == Phase::SwitchPending && int32_t(now - switchAtMs_) >= 0) {
       if (!switchTo(target_)) { rollback("mesh restart failed"); return; }
       phase_ = Phase::Verifying;
-      phaseSinceMs_ = now;
+      phaseSinceMs_ = millis();
+      return;
     }
-    if (phase_ == Phase::Verifying && now - phaseSinceMs_ > 80000)
+    if (phase_ == Phase::Verifying &&
+        (now - phaseSinceMs_ >= ROOT_VERIFY_MS + 20000 ||
+         (!rootReachable && now - phaseSinceMs_ >= ROOT_VERIFY_MS + 5000 &&
+          now - lastRootSeenMs_ >= 5000))) {
       rollback("root confirmation missing");
+      lastSearchMs_ = millis();
+      searching_ = true; // Hold the old rendezvous channel before moving again.
+      return;
+    }
+#if NORMAL_CHANNEL_DEBUG
+    if (phase_ == Phase::Verifying && now - lastTraceMs_ >= 5000) {
+      lastTraceMs_ = now;
+      deviceLogf("[CHANNEL] Board %u verifying: configured=%u radio=%d peers=%u root=%s",
+                 BOARD_NUMBER, meshChannel, WiFi.channel(),
+                 unsigned(mesh.getNodeList().size()), rootReachable ? "seen" : "missing");
+    }
+#endif
     // A rebooted node starts on the bootstrap channel; search only after
     // prolonged absence of the root and stop immediately on reconnection.
     if (phase_ == Phase::Idle && !rootReachable && !timeSlicing.busy() &&
-        !calibrationMode.active() && now - lastRootSeenMs_ > 20000 &&
-        (!searching_ || now - lastSearchMs_ > 8000)) {
+        !calibrationMode.active() && now - lastRootSeenMs_ >= ROOT_SEARCH_DWELL_MS &&
+        (!searching_ || now - lastSearchMs_ >= ROOT_SEARCH_DWELL_MS)) {
+      wifi_country_t country{};
+      if (esp_wifi_get_country(&country) != ESP_OK || country.schan < 1 || country.nchan < 1) return;
+      const unsigned first = country.schan;
+      const unsigned last = std::min(13u, first + country.nchan - 1);
+      if (first > last) return;
+      // When already on the last known channel, the initial wait was its dwell.
+      const bool tryKnown = !searching_ && lastRootChannel_ != meshChannel &&
+          lastRootChannel_ >= first && lastRootChannel_ <= last;
+      const uint8_t next = tryKnown ? lastRootChannel_ :
+          (meshChannel < first || meshChannel >= last ? first : meshChannel + 1);
       searching_ = true;
       lastSearchMs_ = now;
-      const uint8_t next = meshChannel == 13 ? 1 : meshChannel + 1;
-      deviceLogf("[CHANNEL] Searching for root on channel %u", next);
-      switchTo(next);
+      deviceLogf("[CHANNEL] Searching for Root 01 on channel %u (25 s dwell)", unsigned(next));
+      if (next != meshChannel) switchTo(next);
     }
 #endif
   }
 
  private:
+  static constexpr uint32_t ROOT_VERIFY_MS = 30000;
+  static constexpr uint32_t ROUTER_REJOIN_GRACE_MS = 20000;
+  static constexpr uint32_t ROOT_SEARCH_DWELL_MS = 25000;
   Phase phase_ = Phase::Idle;
   uint8_t target_ = 0, oldChannel_ = 0, routerChannel_ = 0, failedChannel_ = 0;
   uint32_t epoch_ = 0, phaseSinceMs_ = 0, switchAtMs_ = 0, lastSendMs_ = 0;
   uint32_t lastScanMs_ = 0, scanStartedMs_ = 0, lastRootSeenMs_ = 0, lastSearchMs_ = 0;
+#if !ROOT_FIRMWARE && NORMAL_CHANNEL_DEBUG
+  uint32_t lastTraceMs_ = 0;
+#endif
   bool scanning_ = false, searching_ = false;
+  uint8_t lastRootChannel_ = 0;
   bool bridgeConfigured_ = false;
+  uint32_t bridgeRequestedMs_ = 0;
   uint32_t retryAfterMs_ = 0;
   uint8_t failureCount_ = 0;
   uint32_t lastRouterRepairMs_ = 0;
@@ -326,7 +365,7 @@ class MeshChannelMigration {
   bool switchTo(uint8_t channel) {
     if (channel < 1 || channel > 13 || timeSlicing.busy() || calibrationMode.active()) return false;
     const uint8_t previous = meshChannel;
-    stopMeshForMeasurement();
+    if (meshStarted) stopMeshForMeasurement();
     meshChannel = channel;
     if (restartMesh()) {
       deviceLogf("[CHANNEL] Mesh restarted on channel %u", channel);

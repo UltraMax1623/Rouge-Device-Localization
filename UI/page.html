@@ -285,6 +285,10 @@
     .overview-nodes { display:flex;gap:10px;flex-wrap:wrap;flex:1 1 100%; }
     .overview-node { border:1px solid #dce6ee;border-radius:10px;padding:10px 14px;font-size:13px; }
     .overview-node span { display:block;color:#738498;font-size:11px;margin-top:4px; }
+    .overview-node[data-state="online"] { background:#e9f8f1;border-color:#b9e4d2;color:#125d4c; }
+    .overview-node[data-state="offline"] { background:#fff1ed;border-color:#efcbc0;color:#943e2e; }
+    .overview-node[data-state="unknown"], .overview-node[data-state="unavailable"],
+    .network-facts .network-stale { background:#fff5df;border-color:#ebd7a5;color:#775515; }
     .control-group { border-top:1px solid #e5edf4;margin-top:20px;padding-top:18px; }
     .control-group h3 { font-size:15px;margin:0 0 12px; }
     .control-group label { display:block;font-size:12px;color:#60758a;margin:12px 0 6px; }
@@ -308,7 +312,7 @@
       <div>
         <strong>Network overview</strong>
         <div class="muted">ESP32-S3 root and configured mesh nodes</div>
-        <div id="connectionStatus" class="muted">S3: offline</div>
+        <div id="connectionStatus" class="muted" role="status">Connecting to backend…</div>
       </div>
 
       <div id="networkFacts" class="network-facts"><span>Waiting for root telemetry</span></div>
@@ -357,8 +361,8 @@
           <section class="command-tile tile-status">
             <span class="command-category">Connection</span>
             <h3>Network status</h3>
-            <p>Inspect connected boards, radio channels, and the current A/n model.</p>
-            <button id="statusButton" data-command class="secondary" type="button">Get network status</button>
+            <p>The overview updates automatically. Request a one-time report with the root's current connection and model details.</p>
+            <button id="statusButton" data-command class="secondary" type="button">Get network report</button>
           </section>
           <form id="sniffForm" class="command-tile tile-sniff">
             <span class="command-category">Target capture</span>

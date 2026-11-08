@@ -14,13 +14,18 @@ class CalibrationMode {
   bool active() const { return state_ != State::Idle || remoteSession_ != 0; }
   bool localSession() const { return state_ != State::Idle; }
   bool backendSafe() const {
-    return !timeSlicing.busy() && (state_ == State::Idle || state_ == State::Identify ||
-        state_ == State::Wait || state_ == State::Settle || state_ == State::Review || state_ == State::Save);
+    // The controller has released the measurement radio during report collection.
+    return !timeSlicing.busy() || (state_ == State::Capture &&
+        timeSlicing.phase() == TimeSlicingController::Phase::COLLECTING);
   }
   bool nodeOnline(unsigned board) const {
     if (board == 1) return meshStarted;
     const Peer *peer = findPeer(board);
     return peer && fresh(*peer);
+  }
+  bool modelAcknowledged(unsigned board) const {
+    const Peer *peer = findPeer(board);
+    return meshStarted && peer && fresh(*peer) && peer->revision == revision_ && peer->sync == syncEpoch_;
   }
   const char *outcome() const { return outcome_; }
   bool webControl(const String &action) {
@@ -58,11 +63,21 @@ class CalibrationMode {
       doc["validation"]["passed"]=validation_.passed();
     }
     if (diagnostic) doc["radioChecks"].set(diagnosticEvidence_);
-    doc["message"] = state_ == State::Wait ? "Place root and selected node at the indicated separation, then press Next." :
+    doc["message"] = state_ == State::Wait ? placementMessage_ :
         state_ == State::Review ? (acceptable_ ? "Validation accepted. Save, retry, or remeasure a distance." : "Fit rejected. Retry or remeasure; the current model is retained.") :
-        state_ == State::Identify ? "Identifying selected boards for 7 seconds; waiting for mesh acknowledgements." :
-        state_ == State::Save ? "Saved on root; waiting for nodes to acknowledge the model." :
-        state_ == State::Idle ? "Session ended." : "Capturing readings. Keep both boards stationary.";
+        state_ == State::Identify ? "Identifying the selected pair; waiting for the selected board's reply." :
+        state_ == State::Settle ? "Keep the pair stationary. The root checks the mesh, then measures for 10 seconds in each direction." :
+        state_ == State::Save ? "Saved on root; waiting for nodes to acknowledge the model." : "Session ended.";
+    if (state_ == State::Settle && millis() - stateSince_ >= 2000 && !selectedLocked())
+      doc["message"] = String("Waiting for calibration lock reply from node ") + boardLabel(selected_);
+    if (state_ == State::Capture) {
+      String wait = timeSlicing.reportWaitMessage();
+      doc["message"] = wait.length() ? wait : String("Capture in progress. Keep the pair stationary.");
+    }
+    if (state_ == State::Save || (state_ == State::Idle && strcmp(outcome_, "partial") == 0)) {
+      const String pending = pendingModelBoards();
+      if (pending.length()) doc["message"] = String("Model saved on Root 01. Waiting for A/n acknowledgements from ") + pending;
+    }
     JsonArray readings = doc["readings"].to<JsonArray>();
     for (unsigned i=0;i<5;++i) {
       JsonObject row=readings.add<JsonObject>(); row["distanceMeters"]=diagnostic ? double(diagnosticDistance_) : double(i+1);
@@ -108,8 +123,9 @@ class CalibrationMode {
 
   bool start(uint8_t board, bool diagnostic = false, uint8_t fixedDistance = 1) {
     if (!timeSlicing.isRoot() || active() || timeSlicing.busy() ||
-        board < 2 || board > macList.size() || !networkSynced() || fixedDistance < 1 || fixedDistance > 5) {
-      FW_LOG("[AN] Wait for all configured boards to connect and acknowledge the model");
+        board < 2 || board > macList.size() || fixedDistance < 1 || fixedDistance > 5) return false;
+    if (!modelAcknowledged(board)) {
+      FW_LOG("[AN] Waiting for selected board %02X to join and acknowledge the active A/n", unsigned(board));
       return false;
     }
     selected_ = board; session_ = newId(); point_ = attempt_ = 0;
@@ -122,7 +138,7 @@ class CalibrationMode {
     diagnosticForwardValid_.fill(false); diagnosticReverseValid_.fill(false);
     baselineA_ = A; baselineN_ = n; remeasuring_ = acceptable_ = false;
     abort_ = false; state_ = State::Identify; identifySince_ = millis();
-    stateSince_ = millis(); lastSend_ = millis() - 1000;
+    stateSince_ = lastWaitLogMs_ = millis(); lastSend_ = millis() - 1000;
     syncPending_ = true; syncAttempts_ = 0;
     for (auto &peer : peers_) { peer.lock = 0; peer.identified = false; }
     FW_LOG("[AN] Root 01 and node %02u: blink for 7 seconds, then wait for placement\n", board);
@@ -148,7 +164,7 @@ class CalibrationMode {
       return;
     }
     if (text == "next" && state_ == State::Wait) {
-      state_ = State::Settle; stateSince_ = millis(); attempt_ = 0;
+      state_ = State::Settle; stateSince_ = lastWaitLogMs_ = millis(); attempt_ = 0;
       stepSinceMs_ = millis();
       FW_LOG("[AN] Settling for 2 seconds; keep boards stationary");
     } else if (text == "retry" && state_ == State::Review) {
@@ -176,7 +192,7 @@ class CalibrationMode {
         return;
       }
       A = candidate_.a; n = candidate_.n; revision_ = revision; persisted_ = true;
-      state_ = State::Save; stateSince_ = millis(); lastSend_ = millis() - 1000;
+      state_ = State::Save; stateSince_ = lastWaitLogMs_ = millis(); lastSend_ = millis() - 1000;
       syncPending_ = true; syncAttempts_ = 0;
       FW_LOG("[AN] Saved and updated root globals: A=%.4f n=%.4f; waiting for node acknowledgements\n", A, n);
     } else {
@@ -262,10 +278,8 @@ class CalibrationMode {
   uint32_t session() const { return timeSlicing.isRoot() ? session_ : remoteSession_; }
   bool networkSynced() const {
     if (!meshStarted) return false;
-    for (unsigned board = 2; board <= macList.size(); ++board) {
-      const Peer *peer = findPeer(board);
-      if (!peer || !fresh(*peer) || peer->revision != revision_ || peer->sync != syncEpoch_) return false;
-    }
+    for (unsigned board = 2; board <= macList.size(); ++board)
+      if (!modelAcknowledged(board)) return false;
     return true;
   }
 
@@ -300,17 +314,23 @@ class CalibrationMode {
     if (abort_ && !timeSlicing.busy()) { finish(false); return; }
     if (state_ == State::Identify) {
       const Peer *selected = findPeer(selected_);
-      if (now - identifySince_ >= 7000 && allLocked() && selected && selected->identified) prompt();
+      if (now - identifySince_ >= 7000 && selectedLocked() && selected->identified) prompt();
       else if (now - stateSince_ > 30000) {
-        FW_LOG("[AN] Identification timed out: not all nodes acknowledged the lock"); finish(false);
+        FW_LOG("[AN] Identification timed out waiting for board %02X", unsigned(selected_)); finish(false);
+      } else if (waitLogDue(now)) {
+        FW_LOG("[AN] Waiting for identification reply from board %02X (%u s)", unsigned(selected_), unsigned((now - stateSince_) / 1000));
       }
     } else if (state_ == State::Settle) {
       if (now - stateSince_ < 2000) return;
-      const Peer *peer = findPeer(selected_);
-      if (!allLocked() || !peer || !timeSlicing.networkReadyForConfiguration(2)) {
+      const bool locked = selectedLocked();
+      if (!locked || !timeSlicing.networkReadyForConfiguration(2)) {
         if (now - stateSince_ > 30000) {
-          FW_LOG("[AN] Mesh not ready; enter next to retry this distance");
+          FW_LOG("[AN] Mesh not ready with board %02X; enter next to retry this distance", unsigned(selected_));
+          placementMessage_ = "Selected board or mesh did not become ready. Keep the current distance and retry Next once it reconnects.";
           state_ = State::Wait;
+        } else if (waitLogDue(now)) {
+          FW_LOG("[AN] Waiting for %s with board %02X (%u s)", locked ? "mesh to settle" : "calibration lock reply",
+                 unsigned(selected_), unsigned((now - stateSince_) / 1000));
         }
         return;
       }
@@ -337,8 +357,11 @@ class CalibrationMode {
     } else if (state_ == State::Save) {
       if (networkSynced()) finish(true);
       else if (now - stateSince_ > 30000) {
-        FW_LOG("[AN] Saved on root; waiting for missing acknowledgements or node reconnection");
-        stateSince_ = now;
+        FW_LOG("[AN] Saved on root; distribution still pending for %s", pendingModelBoards().c_str());
+        finish(true, false);
+      } else if (waitLogDue(now)) {
+        FW_LOG("[AN] Waiting for A/n acknowledgements from %s (%u s)", pendingModelBoards().c_str(),
+               unsigned((now - stateSince_) / 1000));
       }
     }
   }
@@ -358,6 +381,8 @@ class CalibrationMode {
   uint32_t session_ = 0, remoteSession_ = 0, revision_ = 0, round_ = 0;
   uint32_t lastSend_ = 0, identifySince_ = 0, stateSince_ = 0, remoteSeen_ = 0;
   uint32_t stepSinceMs_ = 0, roundSinceMs_ = 0;
+  uint32_t lastWaitLogMs_ = 0;
+  const char *placementMessage_ = "";
   bool persisted_ = false, acceptable_ = false, abort_ = false;
   bool remeasuring_ = false;
   double baselineA_ = -60, baselineN_ = 2;
@@ -409,12 +434,26 @@ class CalibrationMode {
     }
     return true;
   }
-  bool allLocked() const {
+  bool selectedLocked() const {
+    return modelAcknowledged(selected_) && findPeer(selected_)->lock == session_;
+  }
+  static String boardLabel(unsigned board) {
+    char label[3];
+    snprintf(label, sizeof(label), "%02X", board);
+    return String(label);
+  }
+  String pendingModelBoards() const {
+    String pending;
     for (unsigned board = 2; board <= macList.size(); ++board) {
-      const Peer *peer = findPeer(board);
-      if (!peer || !fresh(*peer) || peer->lock != session_ ||
-          peer->revision != revision_ || peer->sync != syncEpoch_) return false;
+      if (modelAcknowledged(board)) continue;
+      if (pending.length()) pending += ", ";
+      pending += boardLabel(board);
     }
+    return pending;
+  }
+  bool waitLogDue(uint32_t now) {
+    if (now - lastWaitLogMs_ < 5000) return false;
+    lastWaitLogMs_ = now;
     return true;
   }
   void send(JsonDocument &doc) {
@@ -446,6 +485,7 @@ class CalibrationMode {
   }
   void prompt() {
     state_ = State::Wait;
+    placementMessage_ = "Place root and selected node at the indicated separation, then press Next.";
     if (diagnostic_) {
       FW_LOG("[DIAG] Place the pair %.1f m apart. Keep both boards fixed for ALL five windows. Enter next | cancel\n", distance());
       return;
@@ -453,12 +493,13 @@ class CalibrationMode {
     FW_LOG("[AN] %sPlace selected boards %.1f metres apart, same plane. Enter next | cancel\n",
                   point_ == 5 ? "Validation: " : "", distance());
   }
-  void finish(bool saved) {
+  void finish(bool saved, bool distributed = true) {
     const bool diagnosticComplete = diagnostic_ && diagnosticRound_ == 5 && !abort_;
     bool validDiagnostic = diagnosticComplete;
     if (diagnosticComplete) for (unsigned i=0;i<5;++i)
       validDiagnostic &= diagnosticForwardValid_[i] && diagnosticReverseValid_[i];
-    outcome_ = saved || validDiagnostic ? "success" : abort_ ? "cancelled" : "failed";
+    outcome_ = saved ? (distributed ? "success" : "partial") :
+        validDiagnostic ? "success" : abort_ ? "cancelled" : "failed";
     state_ = State::Idle; session_ = 0; abort_ = false;
     syncPending_ = true; syncAttempts_ = 0;
     if (meshStarted) broadcastState();
@@ -466,8 +507,8 @@ class CalibrationMode {
       FW_LOG(diagnosticComplete ? "[DIAG] Complete. A/n and saved calibration unchanged"
                                        : "[DIAG] Cancelled. A/n and saved calibration unchanged");
       diagnostic_ = false;
-    } else FW_LOG(saved ? "[AN] Calibration saved; all configured nodes acknowledged active A/n"
-                                : "[AN] Calibration cancelled; previous model retained");
+    } else if (saved && distributed) FW_LOG("[AN] Calibration saved; all configured nodes acknowledged active A/n");
+    else if (!saved) FW_LOG("[AN] Calibration ended; previous model retained");
   }
   bool reading(JsonVariantConst report, const char *key, double &value) {
     if (report["RoundId"].as<uint32_t>() != round_ ||
@@ -507,6 +548,7 @@ class CalibrationMode {
         state_ = State::Settle; stateSince_ = millis();
       } else {
         FW_LOG("[AN] Three captures failed. Keep path clear; enter next to retry, or cancel");
+        placementMessage_ = "Three captures failed. Keep the current distance and press Next to retry, or cancel.";
         state_ = State::Wait;
       }
       return;

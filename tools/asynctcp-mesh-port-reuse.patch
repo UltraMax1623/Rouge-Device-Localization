@@ -1,0 +1,17 @@
+diff --git a/src/AsyncTCP.cpp b/src/AsyncTCP.cpp
+--- a/src/AsyncTCP.cpp
++++ b/src/AsyncTCP.cpp
+@@ -727,6 +727,13 @@
+ static err_t _tcp_bind_api(struct tcpip_api_call_data *api_call_msg) {
+   tcp_api_call_t *msg = (tcp_api_call_t *)api_call_msg;
+   tcp_pcb *pcb = *msg->pcb;
++#if SO_REUSE
++  if (msg->bind.port == 5555) {
++    // Measurement closes and reopens the mesh listener on this port.
++    // Allow it to rebind while old mesh connections are in TIME_WAIT.
++    ip_set_option(pcb, SOF_REUSEADDR);
++  }
++#endif
+   msg->err = tcp_bind(pcb, msg->bind.addr, msg->bind.port);
+   if (msg->err != ERR_OK) {
+     // Close the pcb on behalf of the server without an extra round-trip through the LwIP lock
