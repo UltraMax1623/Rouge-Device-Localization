@@ -1,0 +1,10 @@
+{
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test_collection_positions.js && node test_collection_store.js && node test_collection_lifecycle.js && node test_commands.js && node test_conf_lifecycle.js && node test_mesh_channel.js"
+  },
+  "dependencies": {
+    "cytoscape": "^3.30.4",
+    "ws": "^8.22.0"
+  }
+}
