@@ -167,7 +167,7 @@
 // Collection uses the same Cytoscape map component with measured square anchors.
 (() => {
   if(typeof cytoscape!=="function")return;
-  let graph=null;
+  let graph=null,context=null;
   const details=()=>document.getElementById("collectionMapDetails");
   const scale=450;
   function fit(all=false){if(!graph)return;graph.resize();graph.fit(all?graph.elements():graph.elements().not(".estimate"),55);graph.center();}
@@ -185,8 +185,8 @@
     return Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null;
   }
   window.nodeMap=window.nodeMap||{};
-  window.nodeMap.collection=(container,setup,target,windows)=>{
-    if(container.offsetParent===null)return;
+  window.nodeMap.collection=(container,state)=>{
+    if(!state||container.offsetParent===null)return;
     if(!graph) {
       graph=cytoscape({container,layout:{name:"preset"},autoungrabify:true,minZoom:.005,maxZoom:8,style:[
         {selector:"node",style:{label:"data(label)","background-color":"#c5d1dd",width:17,height:17,color:"#415972","font-size":11,"text-valign":"bottom","text-margin-y":7,"text-wrap":"wrap","text-max-width":125,"border-width":2,"border-color":"white"}},
@@ -199,37 +199,47 @@
         {selector:":selected",style:{"border-color":"#6737c1","border-width":4}}
       ]});
       graph.on("tap","node",event=>{
-        details().textContent=event.target.data("description")||event.target.data("label");
+        const data=event.target.data();
+        details().textContent=data.description||data.label;
       });
       document.getElementById("collectionMapFit").onclick=()=>fit();
       document.getElementById("collectionMapEstimates").onclick=()=>fit(true);
     }
+    const setup=state.setup||state.lastCapture?.setup;if(!setup)return;
     const L=setup.side_length_m;
+    const key=`${setup.mesh_id}:${setup.environment_id}:${setup.dataset_split}:${state.session?.mac}:${state.pending?.id}:${state.pending?.attemptId}:${state.pending?.stage}:${Object.keys(state.pending?.windows||{}).length}:${state.savedRows}`;
+    if(key===context){graph.resize();return;}context=key;
     const elements=[];
     [[0,0],[1,0],[0,1],[1,1]].forEach(([u,v],i)=>elements.push({data:{id:`anchor-${i+1}`,label:`Sniffer 0${i+1}`,description:`Sniffer 0${i+1}: (${(u*L).toFixed(3)}, ${(v*L).toFixed(3)}) m · measured corner`},position:{x:u*scale,y:v*scale},classes:"anchor"}));
     for(const [i,j] of [[1,2],[2,4],[4,3],[3,1]])elements.push({data:{id:`side-${i}-${j}`,source:`anchor-${i}`,target:`anchor-${j}`}});
-    elements.push({data:{id:target.id,label:target.id,
-      description:`Known target: (${target.u}, ${target.v}) m`},
-      position:{x:target.u*scale,y:target.v*scale},classes:"actual"});
-    const estimateList=document.getElementById("collectionWindowEstimates");
-    estimateList.replaceChildren();
+    const points=setup.dataset_split==="test"?state.positions.unseen:state.positions.training;
+    for(const p of points) {
+      const saved=state.approved.find(a=>a.setup.mesh_id===setup.mesh_id&&a.setup.environment_id===setup.environment_id&&a.setup.target_id===p.id);
+      const current=p.id===setup.target_id;
+      elements.push({data:{id:p.id,label:current?`${p.id} · actual`:p.id,
+        description:`${p.id}: (${(p.u*L).toFixed(3)}, ${(p.v*L).toFixed(3)}) m · ${saved?"approved":"pending"} · ${setup.dataset_split}`},
+        position:{x:p.u*scale,y:p.v*scale},classes:`${saved?"saved ":""}${current?"actual ":""}${setup.dataset_split==="test"?"test":""}`});
+    }
+    const capture=state.pending||state.lastCapture;
+    const estimateList=document.getElementById("collectionWindowEstimates");estimateList.replaceChildren();
     let count=0;
-    for(const [index, window] of Object.entries(windows)) {
-        const p=estimate(window,L);
-        if(!p)continue;
-        count++;
+    if(capture&&capture.setup.mesh_id===setup.mesh_id&&capture.setup.environment_id===setup.environment_id&&capture.setup.dataset_split===setup.dataset_split) {
+      for(let index=1;index<=3;index++) {
+        const w=capture.windows[index],check=capture.review?.find(r=>r.index===index);
+        if(!w||check?.errors.length)continue;const p=estimate(w,L);if(!p)continue;count++;
         const button=document.createElement("button");button.type="button";
-        button.textContent=`W${index} · ${target.id}: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m · baseline estimate`;
-        const description=`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${target.id}: (${target.u}, ${target.v}) m\nRSSI A/n baseline estimate; not a trained ML prediction.`;
+        button.textContent=`W${index} · ${capture.setup.target_id}: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m · baseline estimate`;
+        const description=`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${capture.setup.target_id}: (${capture.setup.target_x_m}, ${capture.setup.target_y_m}) m\nRSSI A/n baseline estimate; not a trained ML prediction.`;
         button.onclick=()=>{details().textContent=description;};estimateList.append(button);
         const overlapping=elements.find(e=>e.classes==="estimate"&&Math.hypot(e.position.x-p.x/L*scale,e.position.y-p.y/L*scale)<1e-7);
         if(overlapping){overlapping.data.label+=` / W${index}`;overlapping.data.description+="\n"+description;continue;}
-        elements.push({data:{id:`estimate-${index}`,label:`W${index} · ${target.id}`,
-          description:`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${target.id}: (${target.u}, ${target.v}) m\nRSSI A/n baseline estimate; not a trained ML prediction. Overlapping markers retain their real coordinates.`},
+        elements.push({data:{id:`estimate-${index}`,label:`W${index} · ${capture.setup.target_id}`,
+          description:`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${capture.setup.target_id}: (${capture.setup.target_x_m}, ${capture.setup.target_y_m}) m\nRSSI A/n baseline estimate; not a trained ML prediction. Overlapping markers retain their real coordinates.`},
           position:{x:p.x/L*scale,y:p.y/L*scale},classes:"estimate"});
+      }
     }
     graph.elements().remove();graph.add(elements);fit();
-    document.getElementById("collectionMapStatus").textContent=`Sample ${L} m square · y increases downward · ${count}/3 per-window baseline estimates available. Fit all estimates to include estimates beyond this view. Overlapping estimates share coordinates.`;
-    if(count)details().textContent="Select W1, W2 or W3 for estimated coordinates.";
+    document.getElementById("collectionMapStatus").textContent=`Measured ${L} m square · y increases downward · ${count}/3 per-window baseline estimates available. Fit all estimates to include estimates beyond this view. Overlapping estimates share coordinates.`;
+    if(count)details().textContent="Select W1, W2 or W3 for estimated coordinates. Select a saved position for its three recorded windows.";
   };
 })();

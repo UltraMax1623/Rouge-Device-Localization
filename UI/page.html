@@ -325,23 +325,26 @@
       <button id="operationsTab" class="selected" type="button">Configuration and calibration</button>
     </nav>
     <section id="collectionPanel" hidden>
-      <div class="collect-hero">
-        <div><h1>Data Collection Demo</h1><p>Place a target at a known point, capture three windows, and review the receiver readings.</p></div>
-        <span class="collect-tag">Sample data</span>
+      <div class="collect-hero"><div><h1>Build your RSSI dataset</h1><p class="muted">Read-only snapshot of a recorded three-window capture.</p></div><span id="collectConnection" class="collect-tag">Recorded snapshot</span></div>
+      <section class="card collect-session">
+        <h2>Wireless collection session</h2>
+        <div class="collect-fields"><label>Target Wi-Fi MAC<input disabled id="collectMac" placeholder="Hidden in snapshot" autocomplete="off"></label><label>Channel · 0 to fetch<input disabled id="collectChannel" type="number" min="0" max="13" value="6"></label><div><p class="muted">Target and channel stay fixed for this session.</p><button disabled id="fetchCollectionChannel" class="secondary" type="button">Fetch channel</button></div></div>
+        <label class="collect-check"><input disabled id="confirmCollectionLayout" type="checkbox"><span>I verified the proposed scaled coordinates with a tape, with sniffers 01 / 02 / 03 / 04 at upper-left / upper-right / lower-left / lower-right. All antennas are in the same plane.</span></label>
+        <div class="collect-actions"><button disabled id="startCollectionSession" type="button">Lock session</button><button disabled id="changeCollectionSession" class="secondary" type="button">Change target or channel</button></div>
+        <p class="muted">Keep target Wi-Fi traffic active. Channel discovery runs once per session and may take longer than a second.</p>
+      </section>
+      <section class="card">
+        <div class="collect-hero"><h2>Current setup</h2><span id="collectSplit" class="collect-tag">Training</span></div>
+        <div id="collectionSetup" class="setup-facts"></div>
+        <label class="collect-check"><input disabled id="confirmCollectionPlacement" type="checkbox"><span>I placed the target at the displayed coordinate and prepared this environment. The operator and laptop are away from the measurement area.</span></label>
+        <div class="collect-actions"><button disabled id="runCollection" type="button">Run Setup · 3 × 10 seconds</button><button disabled id="preflightCollection" type="button">Capture first window only</button><button disabled id="cancelCollection" class="collect-drop" type="button">Cancel capture</button></div>
+        <p class="muted">IDs advance only after approval is saved. After 25 training positions, change environment; after 10 environments, change square size. Unseen testing follows all training setups.</p>
+      </section>
+      <div class="collect-grid">
+        <section class="card"><h2>Review captured windows</h2><div id="collectionProgress" class="collect-info" role="status">Recorded windows from an approved setup.</div><div id="collectionReview" class="collect-scroll"></div><div class="collect-actions"><button disabled id="approveCollection" class="collect-ok" type="button">Approve and save 3 rows</button><button disabled id="retryCollection" type="button">Capture missing or failed windows</button><button disabled id="dropCollection" class="collect-drop" type="button">Drop and retry this setup</button></div><p id="collectionRequirements" class="muted"></p></section>
+        <section class="card"><h2>Collection node map</h2><div class="collect-legend"><span class="green">● Saved</span><span class="orange">◆ Actual target</span><span class="blue">◆ W1 / W2 / W3 estimates</span><span>○ Pending</span></div><div class="collect-actions" style="margin-top:12px"><button id="collectionMapFit" class="secondary" type="button">Fit planned positions</button><button id="collectionMapEstimates" class="secondary" type="button">Fit all estimates</button></div><div id="collectionNodeMap" class="map" style="margin-top:12px;height:490px"></div><p id="collectionMapStatus" class="muted">Measured square coordinates; outside points are 0.25 × side length from the boundary.</p><div id="collectionWindowEstimates" class="collect-estimates"></div><pre id="collectionMapDetails" style="white-space:pre-wrap">Select a position or estimate to inspect it.</pre><p class="muted">W1–W3 use the existing A/n distance baseline, not a trained ML model. Estimates may overlap or be unavailable. Known target coordinates are the CSV labels.</p></section>
       </div>
-      <button id="showSampleCapture" type="button">Show sample capture</button>
-      <div id="sampleCapture" class="collect-grid" hidden style="margin-top:16px">
-        <section class="card">
-          <h2>Review sample windows</h2>
-          <p>Target at (0.35, 0.65) m in a 1 m square. Each window represents 10 seconds.</p>
-          <div class="collect-scroll"><table class="collect-table">
-            <thead><tr><th scope="col">Window</th><th scope="col">Receiver</th><th scope="col">RSSI (dBm)</th><th scope="col">Packets</th></tr></thead>
-            <tbody id="sampleReadings"></tbody>
-          </table></div>
-          <p>Live collection is available on <code>codex/data-collection</code>.</p>
-        </section>
-        <section class="card"><h2>Collection node map</h2><div class="collect-legend"><span class="orange">◆ Actual target</span><span class="blue">◆ W1 / W2 / W3 estimates</span></div><div class="collect-actions" style="margin-top:12px"><button id="collectionMapFit" class="secondary" type="button">Fit sample positions</button><button id="collectionMapEstimates" class="secondary" type="button">Fit all estimates</button></div><div id="collectionNodeMap" class="map" style="margin-top:12px;height:490px"></div><p id="collectionMapStatus" class="muted">Illustrative 1 m square.</p><div id="collectionWindowEstimates" class="collect-estimates"></div><pre id="collectionMapDetails" style="white-space:pre-wrap">Select a position or estimate to inspect it.</pre><p class="muted">W1–W3 show RSSI baseline estimates calculated from sample readings.</p></section>
-      </div>
+      <section class="card"><div class="collect-foot"><div><h2>Your dataset</h2><p id="collectionSaved">0 approved rows</p><p id="collectionFile" class="muted">collection.csv</p></div><button disabled class="secondary" type="button">Download CSV for Excel</button></div><progress id="collectionTotalProgress" class="collect-progress" max="5550" value="0"></progress><p class="muted">3,750 training rows + 1,800 unseen test rows. This snapshot contains recorded readings from one setup.</p></section>
     </section>
 
     <div id="operationsPanel">
