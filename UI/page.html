@@ -337,11 +337,11 @@
         <div class="collect-hero"><h2>Current setup</h2><span id="collectSplit" class="collect-tag">Training</span></div>
         <div id="collectionSetup" class="setup-facts"></div>
         <label class="collect-check"><input id="confirmCollectionPlacement" type="checkbox"><span>I placed the target at the displayed coordinate and prepared this environment. The operator and laptop are away from the measurement area.</span></label>
-        <div class="collect-actions"><button id="runCollection" type="button">Run Setup · 3 × 10 seconds</button><button id="cancelCollection" class="collect-drop" type="button">Cancel capture</button></div>
+        <div class="collect-actions"><button id="runCollection" type="button">Run Setup · 3 × 10 seconds</button><button id="preflightCollection" type="button">Capture first window only</button><button id="cancelCollection" class="collect-drop" type="button">Cancel capture</button></div>
         <p class="muted">IDs advance only after approval is saved. After 25 training positions, change environment; after 10 environments, change square size. Unseen testing follows all training setups.</p>
       </section>
       <div class="collect-grid">
-        <section class="card"><h2>Review captured windows</h2><div id="collectionProgress" class="collect-info" role="status">Start a session to collect your first setup.</div><div id="collectionReview" class="collect-scroll"></div><div class="collect-actions"><button id="approveCollection" class="collect-ok" type="button">Approve and save 3 rows</button><button id="dropCollection" class="collect-drop" type="button">Drop and retry this setup</button></div><p class="muted">Green means complete, orange needs attention. Spread is retained as measured, including environmental variation. Each receiver needs at least 20 packets and a full 10-second capture.</p></section>
+        <section class="card"><h2>Review captured windows</h2><div id="collectionProgress" class="collect-info" role="status">Start a session to collect your first setup.</div><div id="collectionReview" class="collect-scroll"></div><div class="collect-actions"><button id="approveCollection" class="collect-ok" type="button">Approve and save 3 rows</button><button id="retryCollection" type="button">Capture missing or failed windows</button><button id="dropCollection" class="collect-drop" type="button">Drop and retry this setup</button></div><p id="collectionRequirements" class="muted"></p></section>
         <section class="card"><h2>Collection node map</h2><div class="collect-legend"><span class="green">● Saved</span><span class="orange">◆ Actual target</span><span class="blue">◆ W1 / W2 / W3 estimates</span><span>○ Pending</span></div><div class="collect-actions" style="margin-top:12px"><button id="collectionMapFit" class="secondary" type="button">Fit planned positions</button><button id="collectionMapEstimates" class="secondary" type="button">Fit all estimates</button></div><div id="collectionNodeMap" class="map" style="margin-top:12px;height:490px"></div><p id="collectionMapStatus" class="muted">Measured square coordinates; outside points are 0.25 × side length from the boundary.</p><div id="collectionWindowEstimates" class="collect-estimates"></div><pre id="collectionMapDetails" style="white-space:pre-wrap">Select a position or estimate to inspect it.</pre><p class="muted">W1–W3 use the existing A/n distance baseline, not a trained ML model. Estimates may overlap or be unavailable. Known target coordinates are the CSV labels.</p></section>
       </div>
       <section class="card"><div class="collect-foot"><div><h2>Your dataset</h2><p id="collectionSaved">0 approved rows</p><p id="collectionFile" class="muted">collection.csv</p></div><a href="/api/collection/export" download="collection.csv"><button class="secondary" type="button">Download CSV for Excel</button></a></div><progress id="collectionTotalProgress" class="collect-progress" max="5550" value="0"></progress><p class="muted">3,750 training rows + 1,800 unseen test rows. CSV and recovery state are saved on this laptop, outside Git.</p></section>
@@ -352,12 +352,37 @@
         <h2>Commands</h2>
         <p id="commandAvailability" class="muted">Waiting for the root</p>
         <div class="command-grid">
-          <section class="command-tile tile-configure">
+          <form id="configureForm" class="command-tile tile-configure">
             <span class="command-category">Mesh layout</span>
             <h3>Configure nodes</h3>
-            <p>Measure distances between the configured boards and update the node layout.</p>
-            <button id="configureButton" data-command type="button">Configure nodes</button>
-          </section>
+            <label for="layoutMode">Anchor positions</label>
+            <select id="layoutMode">
+              <option value="auto">Estimate from RSSI</option>
+              <option value="square">Measured square</option>
+              <option value="manual">Enter each side</option>
+            </select>
+            <fieldset id="squareLayoutFields" hidden disabled>
+              <legend>Measured square</legend>
+              <p>Place 02 and 03 next to 01, with 04 diagonally opposite 01.</p>
+              <label for="squareSide">Side length (m)</label>
+              <input id="squareSide" type="number" min="0" step="any" placeholder="1" required>
+            </fieldset>
+            <fieldset id="manualLayoutFields" hidden disabled>
+              <legend>Measured sides and diagonal (m)</legend>
+              <p>Place nodes in perimeter order 01 → 02 → 04 → 03. Measure the diagonal so the map can determine the shape.</p>
+              <label for="side0102">Side 01–02</label>
+              <input id="side0102" type="number" min="0" step="any" required>
+              <label for="side0204">Side 02–04</label>
+              <input id="side0204" type="number" min="0" step="any" required>
+              <label for="side0403">Side 04–03</label>
+              <input id="side0403" type="number" min="0" step="any" required>
+              <label for="side0301">Side 03–01</label>
+              <input id="side0301" type="number" min="0" step="any" required>
+              <label for="diagonal0104">Diagonal 01–04</label>
+              <input id="diagonal0104" type="number" min="0" step="any" required>
+            </fieldset>
+            <button id="configureButton" data-command type="submit">Configure nodes</button>
+          </form>
           <section class="command-tile tile-status">
             <span class="command-category">Connection</span>
             <h3>Network status</h3>
@@ -372,6 +397,8 @@
             <label for="targetChannel">Channel · 0 for automatic discovery</label>
             <input id="targetChannel" type="number" min="0" max="13" value="0" required>
             <p>Use an active 2.4 GHz device. Three capture cycles estimate its position.</p>
+            <label class="collect-check"><input id="sniffMlDemo" type="checkbox"><span>Synthetic ML demo · measured 1 m square, 20 packets per receiver</span></label>
+            <p>For the demo, put 01 at the origin, 02 and 03 on adjacent corners, and 04 diagonally opposite 01. Run Configure after placing the nodes.</p>
             <button data-command type="submit">Sniff · 3 capture cycles</button>
           </form>
           <section class="command-tile tile-calibrate">

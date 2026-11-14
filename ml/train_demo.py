@@ -103,12 +103,7 @@ def summarize(errors):
             "max_error_m": float(np.max(errors))}
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--csv", type=Path, default=ROOT / "outputs/ml-demo-20261108/synthetic_collection_1m.csv")
-    parser.add_argument("--out", type=Path, default=ROOT / "ml/artifacts/demo_1m")
-    args = parser.parse_args()
-    train, test = read_demo(args.csv)
+def select_models(train):
     x_train, y_train = arrays(train)
     groups = np.array([row["target_id"] for row in train])
     if len(np.unique(groups)) < 5:
@@ -129,6 +124,17 @@ def main():
         trials.append({"parameters": parameters, **summarize(validation_errors)})
     best = min(trials, key=lambda trial: trial["mean_error_m"])
     models = fit_models(x_train, y_train, best["parameters"])
+    return models, trials, best, groups
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--csv", type=Path, default=ROOT / "outputs/ml-demo-20261108/synthetic_collection_1m.csv")
+    parser.add_argument("--out", type=Path, default=ROOT / "ml/artifacts/demo_1m")
+    args = parser.parse_args()
+    train, test = read_demo(args.csv)
+    models, trials, best, groups = select_models(train)
+    _, y_train = arrays(train)
     # Test labels are used for evaluation only after configuration selection.
     x_test, y_test = arrays(test)
     predicted = predict(models, x_test)

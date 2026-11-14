@@ -4,9 +4,10 @@ const path = require("node:path");
 const fs = require("node:fs"), os = require("node:os");
 const { WebSocket } = require("ws");
 
+const directory=fs.mkdtempSync(path.join(os.tmpdir(),"rouge-channel-test-"));
 const server = spawn(process.execPath, [path.join(__dirname, "server.js")], {
   cwd: __dirname,
-  env: { ...process.env, PORT: "0", COLLECTION_DATA_DIR:fs.mkdtempSync(path.join(os.tmpdir(),"rouge-channel-test-")) },
+  env: { ...process.env, PORT: "0", COLLECTION_DATA_DIR:directory },
   stdio: ["ignore", "pipe", "pipe"]
 });
 const sockets = [];
@@ -38,7 +39,7 @@ server.stdout.on("data", output => {
   sockets.push(ui);
   ui.once("open", () => {
     const device = new WebSocket(
-      `${base}/ws?role=device&token=local-device-token-change-me`
+      `${base}/ws?role=device`
     );
     sockets.push(device);
     device.once("open", () => device.send(JSON.stringify({

@@ -36,11 +36,31 @@ try {
  assert.equal(csv.length,4);assert.equal(csv[0].split(",").length,24);
  assert(csv[1].includes('"T05"'));assert(csv[1].endsWith('"train"'));
  store=new CollectionStore(directory);assert.equal(store.snapshot().savedRows,3);
+ // Load the original all-in-one journal and migrate without losing captures.
+ const legacy=structuredClone(store.state);delete legacy.storageVersion;
+ fs.writeFileSync(store.file,JSON.stringify(legacy));
+ store=new CollectionStore(directory);
+ assert.equal(store.snapshot().savedRows,3);
+ assert.equal(JSON.parse(fs.readFileSync(store.file)).storageVersion,2);
+ assert.deepEqual(JSON.parse(fs.readFileSync(store.file)).approved,["one"]);
+ const captureFile=path.join(directory,"captures","0.json");
+ const retainedCapture=fs.readFileSync(captureFile,"utf8");
  assert.notEqual(store.setup().target_id,"T05");
- store.prepare("bad",true);const bad=window("bad",1);bad.receivers[2].count=0;
+ store.prepare("bad",true);const bad=window("bad",1);bad.receivers[2].count=4;
+ assert.equal(fs.readFileSync(captureFile,"utf8"),retainedCapture);
+ assert.equal(store.snapshot(false).approved,undefined);
  store.event(bad);store.event(window("bad",2));store.event(window("bad",3));
  store.event({command:"collect",commandId:"bad",phase:"end",status:"success"});
  assert.equal(store.snapshot().pending.canApprove,false);assert.throws(()=>store.approve("bad"));
+ const retained=store.snapshot().pending.windows[2];
+ assert.equal(store.retry("bad","retry-one",true),1);
+ store=new CollectionStore(directory);
+ const retryWindow=window("retry-one",1);retryWindow.receivers.forEach(receiver=>receiver.roundId=123);
+ store.event(retryWindow);store.event(retryWindow);
+ store.event({command:"collect",commandId:"retry-one",phase:"end",status:"success"});
+ assert.equal(store.snapshot().pending.canApprove,true);
+ assert.deepEqual(store.snapshot().pending.windows[2],retained);
+ assert.equal(store.snapshot().pending.windows[1].receivers[0].roundId,123);
  const previous=store.setup().target_id;store.drop("bad");assert.equal(store.setup().target_id,previous);
  for(const [name,patch] of [["duration",{durationMs:20000}],["identity",{targetMac:"00:11:22:33:44:55"}],["channel",{channel:11}]]) {
    store.prepare(name,true);store.event(window(name,1,patch));store.event(window(name,2));store.event(window(name,3));

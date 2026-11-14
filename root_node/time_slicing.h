@@ -92,8 +92,6 @@ class TimeSlicingController {
   uint32_t distanceRoundId = 0;
   JsonDocument sniffReports;  // Reporter MAC -> full target capture report.
   JsonDocument sniffCycleReports;  // Cycle -> reporter MAC -> full report.
-  JsonDocument sniffAverageDistances;  // Reporter MAC -> target MAC -> mean metres.
-  JsonDocument sniffAverageCounts;     // Reporter MAC -> number of valid cycles.
   JsonDocument channelDiscoveryReports;
   uint8_t discoveredChannel = 0;
 
@@ -122,6 +120,9 @@ class TimeSlicingController {
     return String("Waiting for capture reports from ") + missing;
   }
   uint8_t captureCycle() const { return captureCycle_; }
+  uint32_t captureEndElapsedMs(unsigned cycle) const {
+    return cycle>=1 && cycle<=captureLimit_ ? captureEndElapsedMs_[cycle-1] : 0;
+  }
   uint8_t targetChannel() const { return targetChannel_; }
   int64_t captureDurationUs() const {
     return TimeSliceProtocol::sniffDurationUs(discoveryRound_, collectionRound_);
@@ -211,10 +212,14 @@ class TimeSlicingController {
 
   bool beginSniff(const std::vector<Mac> &table, const Mac &target,
                   uint8_t channel = 0, uint8_t cycle = 0, bool continuation = false,
-                  bool collection = false, bool discoveryOnly = false) {
+                  bool collection = false, bool discoveryOnly = false,
+                  uint8_t captureCount = TimeSliceProtocol::SNIFF_CYCLES) {
     if (channel && cycle == 0) cycle = 1;
-    if (cycle > TimeSliceProtocol::SNIFF_CYCLES || (!channel && cycle != 0)) return false;
+    if (cycle > TimeSliceProtocol::SNIFF_CYCLES || (!channel && cycle != 0) ||
+        captureCount < 1 || captureCount > TimeSliceProtocol::SNIFF_CYCLES) return false;
+    const uint32_t completedRound = continuation ? round_ : 0;
     if (channel > 13 || !beginConfiguration(table)) return false;
+    previousCaptureRound_ = completedRound;
     sniffRound_ = true;
     collectionRound_ = collection;
     discoveryOnly_ = discoveryOnly;
@@ -224,16 +229,17 @@ class TimeSlicingController {
     captureCycle_ = cycle;
     mode_ = discoveryRound_ ? "scan" : "sniff";
     if (!continuation) {
+      captureLimit_ = captureCount;
+      captureStartedMs_ = millis();
+      captureEndElapsedMs_.fill(0);
       captureFailure_ = "";
       channelDiscoveryReports.clear();
       sniffCycleReports.clear();
-      sniffAverageDistances.clear();
-      sniffAverageCounts.clear();
       discoveredChannel = channel;
     }
     sniffReports.clear();
     if (!discoveryRound_) FW_LOG("[SNIFF] Capture cycle %u/%u, %u seconds\n",
-        captureCycle_, TimeSliceProtocol::SNIFF_CYCLES, unsigned(captureDurationUs() / 1000000));
+        captureCycle_, captureLimit_, unsigned(captureDurationUs() / 1000000));
     FW_LOG("[SNIFF] %s for %s%s\n",
                   discoveryRound_ ? "Channel discovery" : "Fixed-channel capture",
                   macString(target_).c_str(), discoveryRound_ ? "" : " scheduled");
@@ -265,7 +271,18 @@ class TimeSlicingController {
       lastMessageMs_ = millis() - RETRY_MS;
       return true;
     }
-    if (busy()) return false;
+    if (busy()) {
+      // The root only prepares a continuation after collecting this round's reports.
+      const bool acknowledged = phase_ == Phase::REPORTING && sniffRound_ && sniff &&
+          !discovery && !discoveryOnly_ && !(doc["DiscoveryOnly"] | false) &&
+          table == table_ && target == target_ && (discoveryRound_ || channel == targetChannel_) &&
+          (doc["Collection"] | false) == collectionRound_ &&
+          doc["PreviousCaptureRoundId"].is<uint32_t>() &&
+          TimeSliceProtocol::acknowledgesPreviousCapture(
+              round_, doc["PreviousCaptureRoundId"].as<uint32_t>(), captureCycle_, cycle);
+      if (!acknowledged) return false;
+      FW_LOG("[ROUND %u] Root confirmed results in prepare for next capture %u", round_, unsigned(cycle));
+    }
     resetRound(table, round);
     calibrationRound_ = calibration;
     calibrationSession_ = calibration ? doc["CalibrationSession"].as<uint32_t>() : 0;
@@ -319,12 +336,26 @@ class TimeSlicingController {
       return true;
     }
 
+    if (strcmp(action, "start_ack") == 0) {
+      size_t slot;
+      if (!isRoot() || phase_ != Phase::ARMED || !validEnvelope(doc, 0) ||
+          !reporterSlot(doc, slot) || slot == selfIndex_ || peerIds_[slot] != from ||
+          !doc["StartTimeUs"].is<uint32_t>() || doc["StartTimeUs"].as<uint32_t>() != meshStartUs_)
+        return false;
+      startAcknowledged_[slot] = true;
+      return true;
+    }
+
     if (strcmp(action, "start") == 0) {
       if (isRoot() || from != rootNodeId() || !validEnvelope(doc, 1) ||
           !parametersMatch(doc, hash_) || !doc["StartTimeUs"].is<uint32_t>())
         return false;
       uint32_t start = doc["StartTimeUs"];
-      if (phase_ == Phase::ARMED) return start == meshStartUs_;
+      if (phase_ == Phase::ARMED) {
+        if (start != meshStartUs_ || scheduleInvalid_) return false;
+        sendStartAck();
+        return true;
+      }
       if (phase_ != Phase::PREPARED ||
           TimeSliceProtocol::remainingUs(start, mesh_.getNodeTime()) <=
               static_cast<int32_t>(TimeSliceProtocol::PREPARE_US + 250000))
@@ -332,6 +363,7 @@ class TimeSlicingController {
       meshStartUs_ = start;
       phase_ = Phase::ARMED;
       lastMessageMs_ = millis();
+      sendStartAck();
       FW_LOG("[ROUND %u] Start scheduled at mesh time %u us\n",
                     round_, meshStartUs_);
       return true;
@@ -410,7 +442,7 @@ class TimeSlicingController {
                                                    round_, macString(table_[i]).c_str());
         }
         phase_ = Phase::IDLE;
-        FW_LOG("[ROUND] Cancelled; no result table or average produced. Commands enabled");
+        FW_LOG("[ROUND] Current round cancelled. Commands enabled");
       } else if (meshStarted_ && nowMs - lastMessageMs_ >= RETRY_MS) {
         sendCancel();
       }
@@ -438,14 +470,17 @@ class TimeSlicingController {
       if (!allSet(ready_) && waitLogDue(nowMs))
         logWait(nowMs, String("Waiting for ready replies from ") + missingBoards(ready_));
       if (nowMs - phaseSinceMs_ > READY_TIMEOUT_MS) {
+        const String missing = missingBoards(ready_);
         for (size_t i = 0; i < table_.size(); ++i) {
           if (!ready_[i]) FW_LOG("[ROUND %u] Missing ready: %s\n",
                                        round_, macString(table_[i]).c_str());
         }
-        beginCancellation("missing ready replies");
+        beginCancellation(missing.length() ? "missing ready replies" : "mesh clock did not settle");
+        if(sniffRound_ && missing.length()) captureFailure_ = String("Prepare not acknowledged by board(s) ") + missing;
       } else if (allSet(ready_) && settled()) {
         meshStartUs_ = mesh_.getNodeTime() + START_LEAD_US;
         phase_ = Phase::ARMED;
+        startAcknowledged_[selfIndex_] = true;
         lastMessageMs_ = nowMs - RETRY_MS;
         FW_LOG("[ROUND %u] All stations ready; start in %u ms (mesh time %u us)\n",
                       round_, START_LEAD_US / 1000, meshStartUs_);
@@ -469,6 +504,11 @@ class TimeSlicingController {
       int32_t remaining = remainingUs(meshStartUs_, mesh_.getNodeTime());
       if (scheduleInvalid_) {
         finishRound(false, "clock changed after scheduling", false);
+      } else if (isRoot() && remaining <= static_cast<int32_t>(PREPARE_US + 1000000) &&
+                 !allSet(startAcknowledged_)) {
+        const String missing = missingBoards(startAcknowledged_);
+        beginCancellation("start acknowledgement missing");
+        if(sniffRound_) captureFailure_ = String("Start time not acknowledged by board(s) ") + missing;
       } else if (remaining <= static_cast<int32_t>(PREPARE_US)) {
         // Do not shift late slots: either meet the shared schedule or fail.
         if (remaining < static_cast<int32_t>(PREPARE_US - 250000)) {
@@ -648,6 +688,11 @@ class TimeSlicingController {
   JsonDocument radioConfig_;
   Mac target_{};
   uint8_t targetChannel_ = 0, captureChannel_ = 0, scanFirst_ = 1, scanCount_ = 11;
+  uint32_t previousCaptureRound_ = 0;
+  uint8_t captureLimit_ = TimeSliceProtocol::SNIFF_CYCLES;
+  uint32_t captureStartedMs_ = 0;
+  std::array<uint32_t, TimeSliceProtocol::SNIFF_CYCLES> captureEndElapsedMs_{};
+  std::vector<bool> startAcknowledged_;
   uint8_t captureCycle_ = 0, pendingCycle_ = 1, pendingChannel_ = 0;
   Sample targetSample_;
   std::array<uint32_t, 14> channelSamples_{};
@@ -807,6 +852,7 @@ class TimeSlicingController {
     samples_.assign(table.size(), Sample{});
     slotPacketCounts.assign(table.size(), 0);
     ready_.assign(table.size(), false);
+    startAcknowledged_.assign(table.size(), false);
     reportReceived_.assign(table.size(), false);
     reportMeshRetried_ = false;
     lastWaitLogMs_ = lastReportCheckMs_ = millis();
@@ -843,6 +889,7 @@ class TimeSlicingController {
     channelSamples_.fill(0);
     targetChannel_ = captureChannel_ = 0;
     captureCycle_ = 0;
+    previousCaptureRound_ = 0;
   }
   void envelope(JsonDocument &doc, const char *mode, const char *action,
                 int direction) const {
@@ -884,6 +931,7 @@ class TimeSlicingController {
   void sendConfiguration() {
     JsonDocument doc;
     envelope(doc, "conf", "prepare", 1);
+    if (previousCaptureRound_) doc["PreviousCaptureRoundId"] = previousCaptureRound_;
     parameters(doc);
     JsonObject list = doc["MacList"].to<JsonObject>();
     for (size_t i = 0; i < table_.size(); ++i) {
@@ -904,6 +952,14 @@ class TimeSlicingController {
     for (uint8_t byte : table_[selfIndex_]) bytes.add(byte);
     sendJson(doc, rootNodeId());
   }
+  void sendStartAck() {
+    JsonDocument doc;
+    envelope(doc, "conf", "start_ack", 0);
+    doc["ReporterSlot"] = selfIndex_ + 1;
+    doc["StartTimeUs"] = meshStartUs_;
+    sendJson(doc, rootNodeId());
+  }
+
   void sendControl(const char *action, bool broadcast) {
     JsonDocument doc;
     envelope(doc, "conf", action, 1);
@@ -1157,6 +1213,8 @@ class TimeSlicingController {
       radioElapsedMs_ = uint32_t((esp_timer_get_time() - localStartUs_) / 1000);
       FW_LOG("[AN] Pair radio elapsed %.3f s; restoring mesh for reports\n", double(radioElapsedMs_) / 1000);
     }
+    if (isRoot() && ok && collectionRound_ && captureCycle_>=1 && captureCycle_<=captureLimit_)
+      captureEndElapsedMs_[captureCycle_-1] = millis() - captureStartedMs_;
     if (restoreRadio) endRadio();
     FW_LOG("[TIMING] Round %u maximum controller gap=%llu us\n",
                   round_, static_cast<unsigned long long>(maxServiceGapUs_));
@@ -1322,48 +1380,6 @@ class TimeSlicingController {
     return true;
   }
 
-  void printDistanceSummary() {
-#if 0  // Preserve the old Serial table without formatting unused output.
-    FW_LOG("\n[ROUND %u] Node distance results (metres)\n", round_);
-    for (size_t reporter = 0; reporter < table_.size(); ++reporter) {
-      String source = macString(table_[reporter]);
-      JsonObjectConst readings = distanceReports[source].as<JsonObjectConst>();
-      source.replace(':', ' ');
-      FW_LOG("\n%s measures%s\n", source.c_str(),
-                    reportReceived_[reporter] ? "" : " [NO REPORT]");
-      if (sniffRound_) {
-        String target = macString(target_);
-        JsonVariantConst distance = readings[target];
-        target.replace(':', ' ');
-        char value[32];
-        if (!reportReceived_[reporter]) snprintf(value, sizeof(value), "no report");
-        else if (distance.isNull()) snprintf(value, sizeof(value), "unavailable");
-        else snprintf(value, sizeof(value), "%.4f", distance.as<double>());
-        FW_LOG("+-------------------+----------------+");
-        FW_LOG("| Target MAC        | Distance (m)   |");
-        FW_LOG("+-------------------+----------------+");
-        FW_LOG("| %s | %14s |\n", target.c_str(), value);
-        FW_LOG("+-------------------+----------------+");
-        continue;
-      }
-      FW_LOG("+--------+----------------+");
-      FW_LOG("| Target | Distance (m)   |");
-      FW_LOG("+--------+----------------+");
-      for (size_t target = 0; target < table_.size(); ++target) {
-        if (target == reporter) continue;
-        JsonVariantConst distance = readings[macString(table_[target])];
-        char value[32];
-        if (!reportReceived_[reporter]) snprintf(value, sizeof(value), "no report");
-        else if (distance.isNull()) snprintf(value, sizeof(value), "unavailable");
-        else snprintf(value, sizeof(value), "%.4f", distance.as<double>());
-        FW_LOG("| %02X     | %14s |\n", table_[target][5], value);
-      }
-      FW_LOG("+--------+----------------+");
-    }
-    FW_LOG();
-#endif
-  }
-
   static bool validTargetReading(JsonVariantConst rssi, JsonVariantConst count,
                                  JsonVariantConst distance, double modelA, double modelN) {
     if (rssi.isUnbound() || distance.isUnbound() || !count.is<uint32_t>()) return false;
@@ -1383,15 +1399,16 @@ class TimeSlicingController {
       if (sniffRound_) {
         sniffCycleReports[String(captureCycle_)].set(sniffReports.as<JsonObjectConst>());
         if (sniffCycleReports.overflowed()) {
+          captureFailure_ = "Could not retain the latest capture reports in memory.";
           FW_LOG("[ERROR] Cannot retain sniff cycle reports; operation stopped");
           return;
         }
         size_t received = 0;
         for (bool present : reportReceived_) if (present) ++received;
         FW_LOG("[SNIFF] Capture cycle %u/%u: reports %u/%u\n",
-                      captureCycle_, TimeSliceProtocol::SNIFF_CYCLES,
+                      captureCycle_, captureLimit_,
                       static_cast<unsigned>(received), static_cast<unsigned>(table_.size()));
-        const uint8_t next = TimeSliceProtocol::nextSniffCycle(captureCycle_);
+        const uint8_t next = captureCycle_ < captureLimit_ ? captureCycle_ + 1 : 0;
         if (next && !captureFailure_.length()) {
           pendingCycle_ = next;
           pendingChannel_ = targetChannel_;
@@ -1400,7 +1417,6 @@ class TimeSlicingController {
           mode_ = "mesh";
           return;
         }
-        calculateSniffAverage();
         FW_LOG(captureFailure_.length() ? "[COMMAND] Capture stopped with incomplete reports"
                                        : "[COMMAND] All sniff cycles complete. Enter conf or sniff <12-hex-MAC>");
         return;
@@ -1408,7 +1424,6 @@ class TimeSlicingController {
       if (calibrationRound_) {
         FW_LOG("[AN] Pair capture complete; calibration will check the readings next");
       } else {
-        printDistanceSummary();
         FW_LOG("[COMMAND] Round complete. Enter conf, sniff <12-hex-MAC>, or an opt <board>");
       }
       return;
@@ -1437,41 +1452,4 @@ class TimeSlicingController {
     mode_ = "mesh";
   }
 
-  void calculateSniffAverage() {
-    const String target = macString(target_);
-#if 0  // Retain disabled presentation code.
-    String displayTarget = target;
-    displayTarget.replace(':', ' ');
-    FW_LOG("\n[SNIFF] Average distance across %u capture cycles (%u seconds each), channel %u\n",
-                  TimeSliceProtocol::SNIFF_CYCLES,
-                  unsigned(TimeSliceProtocol::SNIFF_US / 1000000), targetChannel_);
-#endif
-    for (const Mac &station : table_) {
-      const String reporter = macString(station);
-      DistanceAverage average;
-      for (unsigned cycle = 1; cycle <= TimeSliceProtocol::SNIFF_CYCLES; ++cycle) {
-        JsonObjectConst report = sniffCycleReports[String(cycle)][reporter].as<JsonObjectConst>();
-        JsonVariantConst value = report["Distances"][target];
-        if (strcmp(report["Status"] | "", "ok") == 0 && value.is<double>())
-          average.add(value.as<double>());
-      }
-      sniffAverageCounts[reporter] = average.count;
-      if (average.count) sniffAverageDistances[reporter][target] = average.mean();
-      else sniffAverageDistances[reporter][target] = nullptr;
-#if 0
-      String displayReporter = reporter;
-      displayReporter.replace(':', ' ');
-      FW_LOG("\n%s measures (average, valid cycles %u/%u)\n",
-                    displayReporter.c_str(), average.count, TimeSliceProtocol::SNIFF_CYCLES);
-      char result[32];
-      if (average.count) snprintf(result, sizeof(result), "%.4f", average.mean());
-      else snprintf(result, sizeof(result), "unavailable");
-      FW_LOG("+-------------------+----------------+");
-      FW_LOG("| Target MAC        | Average (m)    |");
-      FW_LOG("+-------------------+----------------+");
-      FW_LOG("| %s | %14s |\n", displayTarget.c_str(), result);
-      FW_LOG("+-------------------+----------------+");
-#endif
-    }
-  }
 };

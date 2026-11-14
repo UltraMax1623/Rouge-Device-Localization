@@ -25,9 +25,11 @@ class CalibrationMode {
   }
   bool modelAcknowledged(unsigned board) const {
     const Peer *peer = findPeer(board);
-    return meshStarted && peer && fresh(*peer) && peer->revision == revision_ && peer->sync == syncEpoch_;
+    return meshStarted && peer && fresh(*peer) && peer->revision == revision_ &&
+           peer->sync == syncEpoch_ && peer->lock == (localSession() ? session_ : 0);
   }
   const char *outcome() const { return outcome_; }
+  uint32_t modelRevision() const { return revision_; }
   bool webControl(const String &action) {
     if (!localSession()) return false;
     if (action == "cancel") {
@@ -292,12 +294,13 @@ class CalibrationMode {
       syncPending_ = true; syncAttempts_ = 0; lastSend_ = now - 1000;
     }
     if (timeSlicing.isRoot() && syncPending_ && connectedPeersSynced()) syncPending_ = false;
-    if (meshStarted && !timeSlicing.busy() && syncPending_ &&
-        now - lastSend_ >= 1000) {
+    const bool retryIdleSync = timeSlicing.isRoot() && !localSession() && !connectedPeersSynced();
+    if (meshStarted && !timeSlicing.busy() && (syncPending_ || retryIdleSync) &&
+        now - lastSend_ >= (syncPending_ ? 1000u : 15000u)) {
       lastSend_ = now;
       if (timeSlicing.isRoot()) broadcastState(); else hello();
-      // Every event has bounded delivery retries, including calibration.
-      if (++syncAttempts_ >= 5) syncPending_ = false;
+      // Continue idle synchronization at the longer interval after quick retries.
+      if (syncPending_ && ++syncAttempts_ >= 5) syncPending_ = false;
     }
     if (!timeSlicing.isRoot()) {
       // Mesh connectivity keeps placement waits alive without radio messages.
@@ -527,7 +530,10 @@ class CalibrationMode {
     FW_LOG("[AN] Receiver observed window=%.3f s (scheduled 10.000 s), first-to-last packet span=%.3f s\n",
                   double(report["ObservedWindowMs"][key].as<unsigned>()) / 1000,
                   double(report["PacketSpanMs"][key].as<unsigned>()) / 1000);
-    return report["Samples"][key].as<unsigned>() >= TimeSliceProtocol::CALIBRATION_MIN_SAMPLES &&
+    const unsigned observed = report["ObservedWindowMs"][key];
+    const unsigned span = report["PacketSpanMs"][key];
+    return observed >= 9900 && observed <= 10100 && span >= 8000 && span <= observed &&
+        report["Samples"][key].as<unsigned>() >= TimeSliceProtocol::CALIBRATION_MIN_SAMPLES &&
         std::isfinite(value) && value >= -127 && value <= 0 &&
         std::isfinite(spread) && spread >= 0 && spread <= 4;
   }

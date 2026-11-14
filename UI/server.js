@@ -10,12 +10,17 @@ const COMMAND_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 300000);
 const NETWORK_STATUS_TTL_MS = 15000;
 const PAGE_PATH = path.join(__dirname, "page.html");
 
-// Keep this token identical to the one in the ESP32-S3 firmware.
-const DEVICE_TOKEN = "local-device-token-change-me";
-
 const { parseCommand, parseControl, names: allowedCommands } = require("./commands");
 const { CollectionStore } = require("./collection-store");
 const collection = new CollectionStore(process.env.COLLECTION_DATA_DIR || path.join(__dirname,"../data"));
+
+function localOperator(request) {
+  const address = request.socket.remoteAddress;
+  if (!["127.0.0.1","::1","::ffff:127.0.0.1"].includes(address)) return false;
+  const host = request.headers.host || "";
+  if (!/^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(host)) return false;
+  return !request.headers.origin || request.headers.origin === `http://${host}`;
+}
 
 let deviceSocket = null;
 let deviceReady = false;
@@ -23,7 +28,7 @@ let meshChannelStatus = null;
 let activeCommandId = null;
 let activeCommandName = "conf";
 if(collection.state.pending?.stage==="collecting") {
-  activeCommandId=collection.state.pending.id;activeCommandName="collect";
+  activeCommandId=collection.state.pending.attemptId||collection.state.pending.id;activeCommandName="collect";
 } else if(collection.state.discovery) {
   activeCommandId=collection.state.discovery.id;activeCommandName="discover";
 }
@@ -58,10 +63,18 @@ let commandHistory = [];
 
 function finishTimedOutCommand() {
   if (!activeCommandId) return;
+  clearTimeout(activeCommandTimer);
   const commandId = activeCommandId;
-  activeCommandTimer = null;
   broadcast({ type: "command_event", commandId, command: activeCommandName, phase: "error",
-    code: "OUTCOME_UNKNOWN", message: "Waiting for the root to reconnect and confirm the outcome." });
+    code: "OUTCOME_UNKNOWN", message: "Waiting for the root to confirm whether it is still running or has retained results." });
+  requestCommandState();
+  activeCommandTimer = setInterval(requestCommandState, 5000);
+  activeCommandTimer.unref();
+}
+
+function requestCommandState() {
+  if (activeCommandId && deviceSocket?.readyState === WebSocket.OPEN)
+    deviceSocket.send(JSON.stringify({type:"command_state_request"}));
 }
 
 const recentLogs = [];
@@ -70,7 +83,12 @@ const MAX_RECENT_LOGS = 100;
 function jsonReply(res,status,value) {
   res.writeHead(status,{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store"});res.end(JSON.stringify(value));
 }
-function publishCollection() {broadcast({type:"collection_state",...collection.snapshot()});}
+let publishedApprovalCount=collection.state.approved.length;
+function publishCollection() {
+  const approvedAdded=collection.state.approved.slice(publishedApprovalCount).map(a=>({id:a.id,setup:a.setup,mac:a.session.mac}));
+  publishedApprovalCount=collection.state.approved.length;
+  broadcast({type:"collection_update",...collection.snapshot(false),approvedAdded});
+}
 function ensureCommandReady() {
   if(!deviceSocket||deviceSocket.readyState!==WebSocket.OPEN||!deviceReady)throw Error("Root is offline or restoring its state. Wait for reconnection.");
   if(activeCommandId)throw Error("A command is already running. Wait for its confirmed outcome.");
@@ -79,17 +97,13 @@ function startCommand(command,params,commandId=randomUUID()) {
   ensureCommandReady();commandHistory=[];activeCommandId=commandId;activeCommandName=command;pendingControl=null;
   publishCommandLock();activeCommandTimer=setTimeout(finishTimedOutCommand,COMMAND_TIMEOUT_MS);
   deviceSocket.send(JSON.stringify({type:"command",command,commandId,params}),error=>{
-    if(error&&activeCommandId===commandId) {
-      const end={type:"command_event",commandId,command,phase:"end",status:"interrupted"};
-      try{collection.event(end);}catch(error){logToUi("Could not retain capture outcome: "+error.message);return;}
-      publishCollection();broadcast(end);
-      activeCommandId=null;publishCommandLock();clearTimeout(activeCommandTimer);
-    }
+    if(error&&activeCommandId===commandId)finishTimedOutCommand();
   });
   return {command,commandId,status:"sent"};
 }
 
 const server = http.createServer((req, res) => {
+  if (!localOperator(req)) return sendText(res,403,"Open the dashboard on the PC running the backend.");
   const assets = {
     "/assets/cytoscape.js": path.join(__dirname, "node_modules/cytoscape/dist/cytoscape.min.js"),
     "/assets/node-map.js": path.join(__dirname, "node-map.js"),
@@ -121,7 +135,7 @@ const server = http.createServer((req, res) => {
     return capture?jsonReply(res,200,capture):sendText(res,404,"Saved capture not found.");
   }
   if(req.method==="GET"&&req.url==="/api/collection/export") {
-    try{collection.exportCsv();collection.exportError=null;
+    try{if(collection.exportError || !fs.existsSync(collection.csv)) collection.exportCsv();collection.exportError=null;
       res.writeHead(200,{"Content-Type":"text/csv; charset=utf-8","Content-Disposition":'attachment; filename="collection.csv"',"Cache-Control":"no-store"});
       return fs.createReadStream(collection.csv).pipe(res);
     }catch(error){return sendText(res,503,"CSV unavailable: "+error.message);}
@@ -138,14 +152,19 @@ const server = http.createServer((req, res) => {
         } else if(req.url==="/api/collection/discover") {
           ensureCommandReady();const id=randomUUID();collection.beginDiscovery(id);
           response=startCommand("discover",{mac:collection.state.session.mac.replace(/:/g,""),channel:0},id);
-        } else if(req.url==="/api/collection/run") {
+        } else if(["/api/collection/run","/api/collection/preflight","/api/collection/retry"].includes(req.url)) {
           ensureCommandReady();
           if (!networkStatus || networkStatus.stale)
             throw Error("Waiting for a fresh mesh status update from the root.");
           if(networkStatus.nodes?.length!==4||![1,2,3,4].every(board=>networkStatus.nodes.some(n=>n.board===board&&n.online)))
             throw Error("Collection requires root 01 and normal boards 02, 03, 04 online.");
-          const id=randomUUID();collection.prepare(id,value.physicalConfirmed);
-          response=startCommand("collect",{mac:collection.state.session.mac.replace(/:/g,""),channel:collection.state.session.channel},id);
+          const id=randomUUID();
+          let windows = req.url.endsWith("/preflight") ? 1 : 3;
+          if (req.url.endsWith("/retry")) {
+            windows=collection.retry(value.collectionId,id,value.physicalConfirmed);
+          } else collection.prepare(id,value.physicalConfirmed,windows);
+          const session=collection.state.pending.session;
+          response=startCommand("collect",{mac:session.mac.replace(/:/g,""),channel:session.channel,windows},id);
         } else if(req.url==="/api/collection/approve") {
           if(activeCommandId)throw Error("Wait for the root to finish before approving.");collection.approve(value.collectionId);
         } else if(req.url==="/api/collection/drop") {
@@ -201,28 +220,9 @@ const server = http.createServer((req, res) => {
         return sendText(res, 409, "A command is already running.");
       }
 
-      const commandId = randomUUID();
-      commandHistory = [];
-      activeCommandId = commandId;
-      activeCommandName = command;
-      pendingControl = null;
-      publishCommandLock();
-      activeCommandTimer = setTimeout(finishTimedOutCommand, COMMAND_TIMEOUT_MS);
-      deviceSocket.send(JSON.stringify({ type: "command", command, commandId, params }), error => {
-        if (error && activeCommandId === commandId) {
-          activeCommandId = null;
-          publishCommandLock();
-          clearTimeout(activeCommandTimer);
-          activeCommandTimer = null;
-          broadcast({ type: "command_event", commandId, command, phase: "error",
-            code: "SEND_FAILED", message: "Could not send command to the root." });
-          broadcast({ type: "command_event", commandId, command, phase: "end", status: "failed" });
-        }
-      });
-      logToUi(`Sent command "${command}" (${commandId}) to ESP32-S3.`);
-
-      res.writeHead(202, { "Content-Type": "application/json; charset=utf-8" });
-      return res.end(JSON.stringify({ command, commandId, status: "sent" }));
+      const result = startCommand(command,params);
+      logToUi(`Sent command "${command}" (${result.commandId}) to ESP32-S3.`);
+      return jsonReply(res,202,result);
     });
 
     return;
@@ -236,20 +236,15 @@ const webSockets = new WebSocketServer({
   path: "/ws",
   maxPayload: 64*1024
 });
+const operators = new Set();
 
 webSockets.on("connection", (socket, request) => {
   socket.on("error", () => logToUi("WebSocket transport error; waiting for reconnection."));
-  const url = new URL(request.url, `http://${request.headers.host}`);
+  const url = new URL(request.url, "http://localhost");
   const role = url.searchParams.get("role");
+  let retainedCommandId = null;
 
   if (role === "device") {
-    const token = url.searchParams.get("token");
-
-    if (token !== DEVICE_TOKEN) {
-      socket.close(1008, "Invalid device token");
-      return;
-    }
-
     if (deviceSocket && deviceSocket.readyState === WebSocket.OPEN) {
       deviceSocket.close();
     }
@@ -261,12 +256,14 @@ webSockets.on("connection", (socket, request) => {
     if (wasReady) broadcast({ type: "device_connection", connected: false });
     markNetworkStatusStale();
     logToUi("ESP32-S3 connected by WebSocket.");
-  } else if (role !== "ui") {
-    socket.close(1008, "Unknown connection role");
+  } else if (role !== "ui" || !localOperator(request)) {
+    socket.close(1008, "Operator access requires the local dashboard");
     return;
   }
 
   if (role === "ui") {
+    operators.add(socket);
+    if (networkStatus) socket.send(JSON.stringify(networkStatus));
     socket.send(JSON.stringify({type:"collection_state",...collection.snapshot()}));
     for (const event of commandHistory) socket.send(JSON.stringify(event));
     socket.send(JSON.stringify({ type: "command_lock", locked: Boolean(activeCommandId), commandId: activeCommandId, command: activeCommandName }));
@@ -277,7 +274,6 @@ webSockets.on("connection", (socket, request) => {
       )
     }));
     if (meshChannelStatus) socket.send(JSON.stringify(meshChannelStatus));
-    if (networkStatus) socket.send(JSON.stringify(networkStatus));
 
     for (const entry of recentLogs) {
       if (socket.readyState === WebSocket.OPEN) {
@@ -302,34 +298,35 @@ webSockets.on("connection", (socket, request) => {
         return;
       }
       if (message.type === "command_state") {
-        if(activeCommandId&&message.commandId&&message.commandId!==activeCommandId) {
-          const interrupted={type:"command_event",commandId:activeCommandId,command:activeCommandName,phase:"end",status:"interrupted",
-            message:"Root reports a different operation. The previous capture cannot be approved."};
-          collection.event(interrupted);broadcast(interrupted);publishCollection();
-          activeCommandId=null;clearTimeout(activeCommandTimer);
-        }
-        if (!activeCommandId && typeof message.commandId === "string" && message.commandId) {
-          activeCommandId = message.commandId;
-          activeCommandName = allowedCommands.has(message.command) ? message.command : "conf";
-          publishCommandLock();
-          activeCommandTimer = setTimeout(finishTimedOutCommand, COMMAND_TIMEOUT_MS);
-        }
-        if (activeCommandId && !message.commandId && !message.pendingEvents) {
+        if (typeof message.commandId !== "string" || typeof message.pendingEvents !== "boolean") return;
+        retainedCommandId = message.pendingEvents && typeof message.retainedCommandId==="string"
+          ? message.retainedCommandId : null;
+        if (activeCommandId && activeCommandId!==message.commandId && !message.pendingEvents) {
           const ended = { type: "command_event", commandId: activeCommandId,
             command: activeCommandName, phase: "end", status: "interrupted",
-            message: "The root has no active command or retained result; it may have restarted." };
-          commandHistory.push(ended);
+            message: "The root has no active work or retained result for this command." };
           collection.event(ended);publishCollection();
+          commandHistory.push(ended);
           broadcast(ended);
           pendingControl = null;
           activeCommandId = null;
-          publishCommandLock();
           clearTimeout(activeCommandTimer);
+          activeCommandTimer = null;
+          publishCommandLock();
         }
-        deviceReady = true;
-        socket.send(JSON.stringify({ type: "state_ack" }));
-        broadcast({ type: "device_connection", connected: true });
-        sendPendingControl();
+        if (!activeCommandId && (retainedCommandId || message.commandId)) {
+          activeCommandId = retainedCommandId || message.commandId;
+          const name = retainedCommandId ? message.retainedCommand : message.command;
+          activeCommandName = allowedCommands.has(name) ? name : "conf";
+          publishCommandLock();
+          activeCommandTimer = setTimeout(finishTimedOutCommand, COMMAND_TIMEOUT_MS);
+        }
+        if (!deviceReady) {
+          deviceReady = true;
+          socket.send(JSON.stringify({ type: "state_ack" }));
+          broadcast({ type: "device_connection", connected: true });
+          sendPendingControl();
+        }
         return;
       }
 
@@ -348,7 +345,13 @@ webSockets.on("connection", (socket, request) => {
           publishCommandLock();
           activeCommandTimer = setTimeout(finishTimedOutCommand, COMMAND_TIMEOUT_MS);
         }
-        if (message.commandId !== activeCommandId) return;
+        if (message.commandId !== activeCommandId) {
+          if (message.commandId!==retainedCommandId || !Number.isInteger(message.sequence)) return;
+          collection.event(message);
+          socket.send(JSON.stringify({type:"event_ack",commandId:message.commandId,sequence:message.sequence}));
+          if(message.phase==="end") {retainedCommandId=null;requestCommandState();}
+          return;
+        }
         // Persist collection events before acknowledging them to the root.
         collection.event(message);
         if(Number.isInteger(message.sequence))socket.send(JSON.stringify({type:"event_ack",commandId:message.commandId,sequence:message.sequence}));
@@ -358,7 +361,8 @@ webSockets.on("connection", (socket, request) => {
         }
         commandHistory.push(message);
         broadcast(message);
-        if(message.command==="collect"||message.command==="discover")publishCollection();
+        if(["collect","discover"].includes(message.command) && ["data","error","end"].includes(message.phase))
+          publishCollection();
         clearTimeout(activeCommandTimer);
         activeCommandTimer = setTimeout(finishTimedOutCommand, COMMAND_TIMEOUT_MS);
         if (message.phase === "end") {
@@ -396,7 +400,7 @@ webSockets.on("connection", (socket, request) => {
           message.routerChannel <= 13) {
         meshChannelStatus = message;
         broadcast(message);
-        logToUi(`Mesh channel ${message.meshChannel}; Pavan channel ${message.routerChannel || "unknown"}.`, "ESP32");
+        logToUi(`Mesh channel ${message.meshChannel}; hotspot channel ${message.routerChannel || "unknown"}.`, "ESP32");
       }
     } catch {
       logToUi("Ignored unrecognized message from ESP32-S3.", "ESP32");
@@ -404,6 +408,7 @@ webSockets.on("connection", (socket, request) => {
   });
 
   socket.on("close", () => {
+    operators.delete(socket);
     if (role === "device" && deviceSocket === socket) {
       deviceSocket = null;
       deviceReady = false;
@@ -437,11 +442,8 @@ function logToUi(message, source = "BACKEND") {
 function broadcast(message) {
   const data = JSON.stringify(message);
 
-  for (const client of webSockets.clients) {
-    if (
-      client !== deviceSocket &&
-      client.readyState === WebSocket.OPEN
-    ) {
+  for (const client of operators) {
+    if (client.readyState === WebSocket.OPEN) {
       client.send(data);
     }
   }
@@ -460,5 +462,4 @@ server.listen(PORT, HOST, () => {
   const actualPort = server.address().port;
   logToUi(`Backend running on port ${actualPort}.`);
   logToUi(`Open http://127.0.0.1:${actualPort} on this PC.`);
-  logToUi("Keep page.html beside server.js.");
 });

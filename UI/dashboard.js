@@ -87,6 +87,7 @@
   }
   function network(data) {
     networkStatus=data;
+    window.nodeMap?.applyLayout?.(data);
     renderNetwork();
     const boardSelects=[byId("boardSelect"),byId("diagnosticBoardSelect")];
     const selected=boardSelects.map(select=>select.value);
@@ -136,13 +137,24 @@
     if(data.kind==="target") {
       const item=card("target","Target position",data.targetMac,data.position?.status||"unavailable");
       item.append(element("div",`Position: ${positionText(data.position)} · Receivers: ${data.anchors} · Fit RMSE: ${number(data.position?.fitRmseMeters)} m`,"result-position"));
-      item.append(element("p",data.message,"result-progress"));return;
+      item.append(element("p",data.message,"result-progress"));
+      if(data.positionAlternatives?.length)item.append(table(["POSSIBLE POSITION"],data.positionAlternatives.map(p=>[positionText(p)])));
+      if (data.mlDemo) {
+        const demo = data.mlDemo;
+        item.append(element("div",`Synthetic ML demo · ${positionText(demo.position)}`,"result-position"));
+        if (demo.status === "estimated") {
+          item.append(element("p",`${demo.validWindows}/${demo.windows} windows · ${demo.inferenceUs} µs total inference · Free heap ${demo.heapBeforeBytes} → ${demo.heapAfterBytes} bytes`,"result-progress"));
+        }
+        item.append(element("p",demo.message,"result-progress"));
+      }
+      return;
     }
     if(data.reporterMac) {
       const title=data.reporterMac.endsWith(":01")?"Root 01":`Node ${data.reporterMac.slice(-2)}`;
       const item=card(data.reporterMac,title,data.reporterMac,data.status);
-      item.append(element("div",`Estimated position: ${positionText(data.position)}${data.kind==="sniff"?` · Valid capture cycles ${data.validCycles}/${data.cycles} · Channel ${data.channel}`:""}`,"result-position"));
-      item.append(table(["MEASURED TARGET","DISTANCE"],(data.distances||[]).map(row=>[row.targetMac,Number.isFinite(row.meters)?number(row.meters,2)+" m":row.status||"Unavailable"])));
+      const positionLabel = data.position?.status === "measured" ? "Measured position" : "Estimated position";
+      item.append(element("div",`${positionLabel}: ${positionText(data.position)}${data.kind==="sniff"?` · Valid windows ${data.windowNumbers?.join(", ")||"none"} (${data.validCycles}/${data.cycles}) · Channel ${data.channel}`:""}`,"result-position"));
+      if (data.distances?.length) item.append(table(["MEASURED TARGET","DISTANCE"],data.distances.map(row=>[row.targetMac,Number.isFinite(row.meters)?number(row.meters,2)+" m":row.status||"Unavailable"])));
     }
   }
   function receive(data) {
@@ -169,7 +181,6 @@
       else if(data.phase==="end") {
         badge(data.status);progress(data.message||`Command ${data.status}. Review the results below.`);
         byId("message").textContent=`${labels[data.command]||data.command}: ${data.status}`;
-        if(data.command==="calibrate"&&["success","partial"].includes(data.status))window.nodeMap?.invalidateLayout();
       }
       return;
     }
@@ -210,8 +221,35 @@
       log(`${action} requested. Waiting for root acknowledgement.`,"UI");
     }catch(error){controlPending=false;log(error.message,"BACKEND",true);controls();}
   }
-  byId("configureButton").onclick=()=>send("conf");byId("statusButton").onclick=()=>send("status");
-  byId("sniffForm").onsubmit=event=>{event.preventDefault();send("sniff",{mac:byId("targetMac").value,channel:Number(byId("targetChannel").value)});};
+  const layoutMode = byId("layoutMode");
+  function showLayoutFields() {
+    for (const [id, mode] of [["squareLayoutFields","square"],["manualLayoutFields","manual"]]) {
+      const fields = byId(id);
+      fields.hidden = fields.disabled = layoutMode.value !== mode;
+    }
+  }
+  layoutMode.onchange = showLayoutFields;
+  showLayoutFields();
+  byId("configureForm").onsubmit = event => {
+    event.preventDefault();
+    if (layoutMode.value === "square") {
+      send("conf", {layout: {mode: "square", side: Number(byId("squareSide").value)}});
+    } else if (layoutMode.value === "manual") {
+      const lengths = ["side0102","side0204","side0403","side0301","diagonal0104"].map(id => Number(byId(id).value));
+      send("conf", {layout: {mode: "manual", lengths}});
+    } else {
+      send("conf");
+    }
+  };
+  byId("statusButton").onclick=()=>send("status");
+  byId("sniffForm").onsubmit = event => {
+    event.preventDefault();
+    send("sniff", {
+      mac: byId("targetMac").value,
+      channel: Number(byId("targetChannel").value),
+      mlDemo: byId("sniffMlDemo").checked
+    });
+  };
   byId("calibrateButton").onclick=()=>send("calibrate",{board:Number(byId("boardSelect").value)});
   byId("diagnoseButton").onclick=()=>send("diagnose",{board:Number(byId("diagnosticBoardSelect").value),distance:Number(byId("diagnosticDistance").value)});
   for(const [id,name]of[["nextButton","next"],["saveButton","save"],["retryButton","retry"],["cancelButton","cancel"]])byId(id).onclick=()=>action(name);

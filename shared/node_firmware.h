@@ -69,7 +69,6 @@ const char *ROUTER_PASSWORD = "12345678";
 
 const char *BACKEND_HOST = "10.131.226.100"; // Used until a serverIP command saves another address.
 const uint16_t BACKEND_PORT = 3000;
-const char *DEVICE_TOKEN = "local-device-token-change-me";
 
 WebSocketsClient webSocket;
 String backendHost = BACKEND_HOST;
@@ -87,8 +86,7 @@ bool validBackendHost(const String &host)
 
 void beginBackendConnection()
 {
-  const String wsPath = String("/ws?role=device&token=") + DEVICE_TOKEN;
-  webSocket.begin(backendHost.c_str(), BACKEND_PORT, wsPath.c_str());
+  webSocket.begin(backendHost.c_str(), BACKEND_PORT, "/ws?role=device");
   deviceLogf("[WS] Connecting to backend %s:%u", backendHost.c_str(), BACKEND_PORT);
 }
 
@@ -150,8 +148,13 @@ JsonDocument pendingCommandParams;
 String pendingControlId, pendingControlAction, lastControlId;
 String webSnapshot;
 bool webCancelled = false;
+unsigned webCollectionWindows = TimeSliceProtocol::SNIFF_CYCLES;
 Coordinates::Result lastNodeCoordinates;
+bool lastLayoutMeasured = false;
 uint32_t lastCoordinateRound = 0;
+uint32_t layoutRevision = 0;
+uint32_t layoutBootId = 0;
+bool uiLayoutPending = true;
 std::array<uint8_t,6> webSniffTarget{};
 String pendingCommandId;
 #include "command_events.h"
@@ -300,24 +303,28 @@ void flushDeviceLogQueue()
 
 bool wsCommandPending = false;
 
+void sendCommandState()
+{
+  JsonDocument state;
+  state["type"] = "command_state";
+  state["commandId"] = wsCommandPending ? pendingCommandId : activeCommandId;
+  state["command"] = wsCommandPending ? pendingCommandName : activeCommandName;
+  state["pendingEvents"] = commandEvents.available();
+  commandEvents.describePending(state);
+  String payload;
+  serializeJson(state, payload);
+  webSocket.sendTXT(payload);
+}
+
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 {
   switch (type)
   {
   case WStype_CONNECTED:
-    {
-      JsonDocument state;
-      state["type"] = "command_state";
-      state["commandId"] = activeCommandId;
-      state["command"] = activeCommandName;
-      state["pendingEvents"] = commandEvents.available();
-      commandEvents.describePending(state);
-      String payload;
-      serializeJson(state, payload);
-      webSocket.sendTXT(payload);
-    }
+    sendCommandState();
     uiSnapshotPending = true;
     uiChannelPending = true;
+    uiLayoutPending = true;
     deviceLog("[WS] Connected to backend");
     break;
 
@@ -329,6 +336,10 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     {
       JsonDocument request;
       if (deserializeJson(request, payload, length)) break;
+      if (strcmp(request["type"] | "", "command_state_request") == 0) {
+        sendCommandState();
+        break;
+      }
       if (strcmp(request["type"] | "", "event_ack") == 0) {
         commandEvents.acknowledge(request);
         break;
@@ -404,8 +415,6 @@ JsonDocument &roundDistanceReports = timeSlicing.distanceReports;
 uint32_t &distanceReportRoundId = timeSlicing.distanceRoundId;
 JsonDocument &sniffReports = timeSlicing.sniffReports;
 JsonDocument &sniffCycleReports = timeSlicing.sniffCycleReports;
-JsonDocument &sniffAverageDistances = timeSlicing.sniffAverageDistances;
-JsonDocument &sniffAverageCounts = timeSlicing.sniffAverageCounts;
 JsonDocument &channelDiscoveryReports = timeSlicing.channelDiscoveryReports;
 uint8_t &true_channel = timeSlicing.discoveredChannel;
 
@@ -507,8 +516,8 @@ void serviceBackend()
   webSocket.loop();
   if (webSocket.isConnected())
   {
-    commandEvents.send(webSocket);
     publishNetworkStatus();
+    commandEvents.send(webSocket);
     static uint8_t lastReportedMeshChannel = 0;
     static uint8_t lastReportedRouterChannel = 0;
     if (uiChannelPending || lastReportedMeshChannel != meshChannel ||
@@ -637,7 +646,6 @@ void finishWebConf(TimeSlicingController::Phase phase)
     if(count) ranges[i][j]=ranges[j][i]=sum/count;
   }
   const auto coordinates=Coordinates::solve(ranges,present,TEST_BOARD_COUNT);
-  if (coordinates.valid && !webCancelled) { lastNodeCoordinates=coordinates; lastCoordinateRound=timeSlicing.roundId(); }
   bool complete = phase != TimeSlicingController::Phase::FAILED &&
                   !timeSlicing.roundCancelled();
   for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
@@ -649,6 +657,8 @@ void finishWebConf(TimeSlicingController::Phase phase)
     JsonDocument data;
     commandEnvelope(data, activeCommandId, "data");
     data["reporterMac"] = reporter;
+    data["layoutBootId"] = layoutBootId;
+    data["layoutRevision"] = layoutRevision + 1;
     data["status"] = !present ? "offline" : reportOk ? "ok" : "failed";
     JsonObject position=data["position"].to<JsonObject>();
     position["unit"]="m";
@@ -684,6 +694,12 @@ void finishWebConf(TimeSlicingController::Phase phase)
       }
     }
     queueCommandEvent(data);
+  }
+  complete = complete && coordinates.valid;
+  if (complete && !webCancelled) {
+    lastNodeCoordinates=coordinates; lastCoordinateRound=timeSlicing.roundId(); lastLayoutMeasured=false;
+    ++layoutRevision;
+    uiLayoutPending = true;
   }
   if (!complete && !webCancelled)
   {
@@ -1216,6 +1232,7 @@ void setup()
 #endif
   calibrationMode.begin();
 #if ROOT_FIRMWARE
+  layoutBootId = esp_random();
   for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
   {
     macList.push_back(MacAddress{0x44, 0x33, 0x22, 0x11, 0x00, board});
@@ -1258,6 +1275,13 @@ void loop()
   runTimeSlicing();
 
 #if ROOT_FIRMWARE
+  static uint32_t lastModelRevision = calibrationMode.modelRevision();
+  if(lastModelRevision != calibrationMode.modelRevision()) {
+    lastModelRevision = calibrationMode.modelRevision();
+    if(!lastLayoutMeasured) { lastNodeCoordinates={};lastCoordinateRound=0; }
+    ++layoutRevision;
+    uiLayoutPending = true;
+  }
   if (wsCommandPending && !timeSlicing.timingCritical())
   {
     wsCommandPending = false;

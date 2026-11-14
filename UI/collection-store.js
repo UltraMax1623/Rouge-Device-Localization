@@ -3,7 +3,7 @@ const fs=require("node:fs"), path=require("node:path"), {randomUUID}=require("no
 const positions=require("./collection-positions");
 const environments=["Clear area","One classroom desk","Large metal object","Several desks","Square near a wall",
   "One stationary person","Two stationary people","One walking person","Desk with books and bag","Furniture and people"];
-const MIN_PACKETS=20;
+const MIN_PACKETS=5;
 const COLUMNS=["collection_id","mesh_id","target_id","environment_id","side_length_m","target_x_m","target_y_m",
   "target_mac","wifi_channel","window_index","recorded_at_utc",
   ...["rssi_mean","rssi_std","packet_count"].flatMap(name=>[1,2,3,4].map(n=>`${name}_${String(n).padStart(2,"0")}`)),"dataset_split"];
@@ -45,13 +45,35 @@ class CollectionStore {
   constructor(directory) {
     this.directory=path.resolve(directory);fs.mkdirSync(this.directory,{recursive:true});
     this.file=path.join(this.directory,"collection-state.json");this.csv=path.join(this.directory,"collection.csv");
+    this.captures=path.join(this.directory,"captures");
+    fs.mkdirSync(this.captures,{recursive:true});
     this.state=fs.existsSync(this.file)?JSON.parse(fs.readFileSync(this.file,"utf8")):
       {session:null,cursor:{mesh:1,env:1,split:"train",position:0,complete:false},pending:null,approved:[],lastApproval:null};
+    const legacy=this.state.storageVersion!==2;
+    if(!legacy) this.state.approved=this.state.approved.map((id,index)=>{
+      const capture=JSON.parse(fs.readFileSync(path.join(this.captures,index+".json"),"utf8"));
+      if(capture.id!==id)throw Error("Capture storage identity mismatch.");
+      return capture;
+    });
+    this.persist(this.state,legacy);
     // The durable journal is authoritative; regenerate CSV after an interrupted export.
     this.exportError=null;try{this.exportCsv();}catch(error){this.exportError=error.message;}
   }
-  persist(next) {atomicWrite(this.file,JSON.stringify(next));this.state=next;}
-  mutate(fn) {const next=structuredClone(this.state);const result=fn(next);this.persist(next);return result;}
+  persist(next,forceCaptures=false) {
+    const first=forceCaptures?0:this.state.approved.length;
+    next.approved.slice(first).forEach((capture,offset)=>{
+      const index=first+offset;
+      const file=path.join(this.captures,index+".json");
+      atomicWrite(file,JSON.stringify(capture));
+    });
+    atomicWrite(this.file,JSON.stringify({...next,storageVersion:2,approved:next.approved.map(c=>c.id)}));
+    this.state=next;
+  }
+  mutate(fn) {
+    const {approved,...current}=this.state;
+    const next={...structuredClone(current),approved:approved.slice()};
+    const result=fn(next);this.persist(next);return result;
+  }
   setup() {
     const c=this.state.cursor;if(c.complete)return null;
     const id=(c.split==="train"?positions.trainingOrder:positions.unseenOrder)[c.position];
@@ -59,15 +81,22 @@ class CollectionStore {
       target_x_m:positions.coordinatesFor(id,c.mesh).x_m,target_y_m:positions.coordinatesFor(id,c.mesh).y_m,
       ordinal:c.position+1,total:c.split==="train"?25:12,environment:environments[c.env-1]};
   }
-  snapshot() {
+  snapshot(includeHistory=true) {
     const pending=this.state.pending?structuredClone(this.state.pending):null;
     if(pending){pending.review=[1,2,3].map(i=>({index:i,data:pending.windows[i]||null,errors:validateWindow(pending.windows[i],pending.session)}));
-      pending.canApprove=pending.stage==="review"&&pending.outcome==="success"&&pending.review.every(w=>!w.errors.length);
-      const ids=pending.review.map(w=>w.data?.receivers?.[0]?.roundId).filter(Number.isInteger);
-      if(new Set(ids).size!==3)pending.canApprove=false;}
-    return {session:this.state.session,setup:this.setup(),pending,approved:this.state.approved.map(a=>({id:a.id,setup:a.setup,mac:a.session.mac})),
+      const seen = new Set();
+      for (const window of pending.review) {
+        const round = window.data?.receivers?.[0]?.roundId;
+        if (Number.isInteger(round) && seen.has(round)) window.errors.push("Repeated capture round");
+        if (!window.errors.length) seen.add(round);
+      }
+      pending.canApprove=pending.stage==="review"&&["success","partial"].includes(pending.outcome)&&pending.review.every(w=>!w.errors.length);
+    }
+    return {session:this.state.session,setup:this.setup(),pending,
+      ...(includeHistory?{approved:this.state.approved.map(a=>({id:a.id,setup:a.setup,mac:a.session.mac}))}:{}),
       savedRows:this.state.approved.length*3,lastApproval:this.state.lastApproval,lastCapture:this.state.approved.at(-1)||null,exportError:this.exportError,
-      minimumPackets:MIN_PACKETS,csvFile:this.csv,positions:{training:positions.training,unseen:positions.unseen},environments};
+      minimumPackets:MIN_PACKETS,csvFile:this.csv,
+      ...(includeHistory?{positions:{training:positions.training,unseen:positions.unseen},environments}:{})};
   }
   configure({mac,channel,coordinatesConfirmed}) {
     if(this.state.pending||this.state.discovery)throw Error("Finish the current operation before changing the session.");
@@ -80,13 +109,27 @@ class CollectionStore {
       throw Error("Start a session with channel zero before fetching its channel.");
     this.mutate(s=>{s.discovery={id};});
   }
-  prepare(commandId,physicalConfirmed) {
+  prepare(commandId,physicalConfirmed,expectedWindows=3) {
     if(this.exportError)throw Error("Resolve the CSV export error before capturing another setup.");
     if(this.state.pending)throw Error("Approve or drop the previous capture first.");
     if(!this.state.session?.channel)throw Error("Start a session and lock the channel first.");
     if(physicalConfirmed!==true)throw Error("Confirm the displayed target position and environment.");
     const setup=this.setup();if(!setup)throw Error("All planned setups are complete.");
-    this.mutate(s=>{s.pending={id:commandId,setup,session:structuredClone(s.session),stage:"collecting",windows:{},outcome:null};});
+    this.mutate(s=>{s.pending={id:commandId,setup,session:structuredClone(s.session),stage:"collecting",windows:{},outcome:null,expectedWindows,startedAt:new Date().toISOString()};});
+  }
+  retry(id, commandId, physicalConfirmed) {
+    const pending = this.snapshot().pending;
+    if (pending?.id !== id || pending.stage !== "review" || pending.canApprove)
+      throw Error("Select an incomplete capture to retry.");
+    if (physicalConfirmed !== true) throw Error("Confirm the target and setup stayed in place.");
+    const unconfirmedAttempt = ["success","partial"].includes(pending.outcome) ? null : pending.attemptId||pending.id;
+    const slots = pending.review.filter(w => w.errors.length || w.data?.commandId===unconfirmedAttempt).map(w => w.index);
+    if (!slots.length) throw Error("No failed windows to retry.");
+    this.mutate(s=>{
+      Object.assign(s.pending,{attemptId:commandId,retrySlots:slots,expectedWindows:slots.length,stage:"collecting",outcome:null,error:null,attemptStartedAt:new Date().toISOString()});
+      slots.forEach(slot => delete s.pending.windows[slot]);
+    });
+    return slots.length;
   }
   event(message) {
     if(message.command==="discover"&&message.commandId===this.state.discovery?.id) {
@@ -98,26 +141,48 @@ class CollectionStore {
       });
       return;
     }
-    if(message.command!=="collect"||message.commandId!==this.state.pending?.id)return;
+    const pending = this.state.pending;
+    if(message.command!=="collect"||!pending||message.commandId!==(pending.attemptId||pending.id))return;
+    if (message.phase !== "error" && message.phase !== "end" &&
+        !(message.phase === "data" && message.kind === "collection_window")) return;
+    let slot;
+    if (message.phase === "data") {
+      if (!Number.isInteger(message.window) || message.window<1 || message.window>(pending.expectedWindows??3))
+        throw Error("Invalid window index.");
+      slot = pending.retrySlots ? pending.retrySlots[message.window-1] : message.window;
+      const old = pending.windows[slot];
+      if (old) {
+        const {receivedAt, capturedAt, ...original} = old;
+        if (JSON.stringify(original) !== JSON.stringify(message)) throw Error("Conflicting report for a retained window.");
+        return;
+      }
+    }
     this.mutate(s=>{
       const p=s.pending;
-      if(message.phase==="data"&&message.kind==="collection_window") {
-        if(!Number.isInteger(message.window)||message.window<1||message.window>3)throw Error("Invalid window index.");
-        const old=p.windows[message.window];
-        if(old&&JSON.stringify(old)!==JSON.stringify(message))throw Error("Conflicting report for a retained window.");
-        p.windows[message.window]=message;
+      if(message.phase==="data") {
+        const received=Date.now();
+        const start=Date.parse(p.attemptStartedAt||p.startedAt);
+        const elapsed=message.captureEndElapsedMs;
+        const captured=Number.isInteger(elapsed)&&elapsed>=10000 ? start+elapsed : NaN;
+        p.windows[slot]={...message,receivedAt:new Date(received).toISOString()};
+        if (captured<=received) p.windows[slot].capturedAt=new Date(captured).toISOString();
       }
       if(message.phase==="error")p.error=String(message.message||message.code||"Capture error");
-      if(message.phase==="end"){p.stage="review";p.outcome=message.status;}
+      if(message.phase==="end"){
+        p.stage="review";p.outcome=message.status;
+        if(!["success","partial"].includes(message.status))
+          for(const [index,window] of Object.entries(p.windows))
+            if(window.commandId===message.commandId)delete p.windows[index];
+      }
     });
   }
   approve(id) {
     const old=this.state.approved.find(a=>a.id===id);
-    if(old){this.exportCsv();this.exportError=null;return;}
+    if(old){if(this.exportError){this.exportCsv();this.exportError=null;}return;}
     const view=this.snapshot();if(view.pending?.id!==id||!view.pending.canApprove)throw Error("Three complete valid windows are required before approval.");
     this.mutate(s=>{
       const p=s.pending;
-      s.approved.push({...p,recordedAt:new Date().toISOString()});s.pending=null;s.lastApproval=id;
+      s.approved.push({...p,approvedAt:new Date().toISOString()});s.pending=null;s.lastApproval=id;
       const c=s.cursor;c.position++;
       if(c.position===(c.split==="train"?25:12)){c.position=0;c.env++;}
       if(c.env>10){c.env=1;c.mesh++;}
@@ -131,15 +196,28 @@ class CollectionStore {
     this.mutate(s=>{s.pending=null;});
   }
   exportCsv() {
-    const lines=[COLUMNS.join(",")];
-    for(const capture of this.state.approved)for(let index=1;index<=3;index++) {
+    const append=this.exportedCaptures!=null && fs.existsSync(this.csv) &&
+      fs.statSync(this.csv).size===this.exportedBytes;
+    const start=append?this.exportedCaptures:0;
+    const lines=append?[]:[COLUMNS.join(",")];
+    for(const capture of this.state.approved.slice(start))for(let index=1;index<=3;index++) {
       const row={collection_id:capture.id,...capture.setup,target_mac:capture.session.mac,wifi_channel:capture.session.channel,
-        window_index:index,recorded_at_utc:capture.recordedAt};
+        window_index:index,recorded_at_utc:capture.windows[index].capturedAt || capture.windows[index].receivedAt || capture.recordedAt || capture.startedAt};
       for(const r of capture.windows[index].receivers){const suffix=String(r.board).padStart(2,"0");
         row[`rssi_mean_${suffix}`]=r.mean;row[`rssi_std_${suffix}`]=r.std;row[`packet_count_${suffix}`]=r.count;}
       lines.push(COLUMNS.map(k=>JSON.stringify(row[k]??"")).join(","));
     }
-    atomicWrite(this.csv,lines.join("\r\n")+"\r\n");
+    if(lines.length) {
+      const content=lines.join("\r\n")+"\r\n";
+      if(append) {
+        const fd=fs.openSync(this.csv,"a");
+        try{fs.writeFileSync(fd,content);fs.fsyncSync(fd);}
+        catch(error){this.exportedCaptures=null;throw error;}
+        finally{fs.closeSync(fd);}
+      } else atomicWrite(this.csv,content);
+    }
+    this.exportedCaptures=this.state.approved.length;
+    this.exportedBytes=fs.statSync(this.csv).size;
   }
 }
 module.exports={CollectionStore,COLUMNS,MIN_PACKETS,validateWindow,normalizeMac};

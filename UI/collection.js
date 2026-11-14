@@ -6,6 +6,8 @@
   function hint(text,type=""){ $("collectionProgress").textContent=text;$("collectionProgress").className="collect-info "+type;}
   function render() {
     if(!state)return;const {session,setup,pending}=state;
+    $("collectionRequirements").textContent =
+      `Each receiver needs at least ${state.minimumPackets} packets in a full 10-second window. Green means complete. Orange means needs attention.`;
     const key=setup?`${setup.dataset_split}:${setup.mesh_id}:${setup.environment_id}:${setup.target_id}`:"complete";
     if(key!==lastSetup){$("confirmCollectionPlacement").checked=false;lastSetup=key;}
     if(session&&!editing){$("collectMac").value=session.mac;$("collectChannel").value=session.channel;$("confirmCollectionLayout").checked=true;}
@@ -25,6 +27,9 @@
     }
     $("collectSplit").textContent=setup?.dataset_split==="test"?"Unseen test data · excluded from training":"Training data";
     $("runCollection").disabled=!locked||!session.channel||!online||!nodesReady||busy||sending||Boolean(pending)||!setup||Boolean(state.exportError)||!$("confirmCollectionPlacement").checked;
+    $("preflightCollection").disabled=$("runCollection").disabled;
+    $("retryCollection").disabled=!locked||!online||!nodesReady||busy||sending||
+      pending?.stage!=="review"||pending.canApprove||!$("confirmCollectionPlacement").checked;
     $("cancelCollection").disabled=!busy||!["collect","discover"].includes(activeName)||sending;
     $("approveCollection").disabled=busy||sending||!(pending?.canApprove||state.exportError&&state.lastApproval);
     $("approveCollection").textContent=state.exportError?"Retry CSV export":"Approve and save 3 rows";
@@ -33,8 +38,11 @@
     $("collectionFile").textContent=state.csvFile;$("collectionTotalProgress").value=state.savedRows;
     renderReview();window.nodeMap?.collection?.($("collectionNodeMap"),state);
     if(state.exportError)hint("Approval retained in the recovery journal. CSV export needs attention: "+state.exportError,"warn");
-    else if(pending?.stage==="collecting")hint(online?"Capture is running. Reports will appear after the root collects the three windows.":"Measuring / reconnecting. Keep the target fixed; results are retained until delivery.","warn");
-    else if(pending)hint(pending.canApprove?"Three complete windows received. Review and approve to save, or drop to retry.":`${pending.error||"Capture needs attention"}. ${pending.outcome||""} — approval is blocked until all three windows are valid.`,pending.canApprove?"good":"warn");
+    else if(pending?.stage==="collecting") {
+      const count=pending.expectedWindows??3;
+      hint(online?`Capturing ${count} ${count===1?"window":"windows"}. Keep the target fixed.`:"Measuring / reconnecting. Keep the target fixed while the root retains results for delivery.","warn");
+    }
+    else if(pending)hint(pending.canApprove?"Three complete windows received. Review and approve to save.":`${pending.error||"Some windows still need a capture"}. Keep the setup fixed to capture only missing or failed windows.`,pending.canApprove?"good":"warn");
     else if(!setup)hint("All 25 training and 12 unseen positions are complete across five sizes and ten environments.","good");
     else if(!locked)hint("Enter the target MAC and channel, verify the layout, then lock this session.");
     else if(!session.channel)hint("Fetch the target channel once before running setups.");
@@ -52,7 +60,7 @@
       row.append(el("td",String(i)),el("td",receivers.map(r=>fmt(r?.mean)).join(" / ")),
         el("td",data?String(receivers.reduce((s,r)=>s+(Number.isInteger(r?.count)?r.count:0),0)):"—"),
         el("td",spreads.length?fmt(Math.max(...spreads))+" dB":"—"));
-      const cell=el("td"),details=el("details");details.append(el("summary",!data?"Waiting":good?"Complete":"Needs attention"));
+      const cell=el("td"),details=el("details");details.append(el("summary",!data?(state.pending?.stage==="review"?"Missing":"Waiting"):good?"Complete":"Needs attention"));
       const list=el("ul");receivers.forEach((r,j)=>list.append(el("li",`Sniffer ${j+1}: ${fmt(r?.mean)} dBm · SD ${fmt(r?.std)} dB · ${r?.count??0} packets · observed ${fmt(r?.observedMs/1000,3)} s`)));
       if(data)for(const error of w.errors)list.append(el("li",error));details.append(list);cell.append(details);row.append(cell);body.append(row);
     }
@@ -72,6 +80,8 @@
   $("changeCollectionSession").onclick=()=>{editing=true;render();};
   $("fetchCollectionChannel").onclick=()=>request("discover");
   $("runCollection").onclick=()=>request("run",{physicalConfirmed:$("confirmCollectionPlacement").checked});
+  $("preflightCollection").onclick=()=>request("preflight",{physicalConfirmed:$("confirmCollectionPlacement").checked});
+  $("retryCollection").onclick=()=>request("retry",{collectionId:state.pending?.id,physicalConfirmed:$("confirmCollectionPlacement").checked});
   $("approveCollection").onclick=()=>request("approve",{collectionId:state.pending?.id||state.lastApproval});
   $("dropCollection").onclick=()=>request("drop",{collectionId:state.pending?.id});
   $("confirmCollectionPlacement").onchange=render;
@@ -86,6 +96,11 @@
   window.addEventListener("console-message",event=>{
     const data=event.detail;
     if(data.type==="collection_state")state=data;
+    if(data.type==="collection_update" && state) {
+      const approved=new Map(state.approved.map(capture=>[capture.id,capture]));
+      for(const capture of data.approvedAdded)approved.set(capture.id,capture);
+      state={...state,...data,approved:[...approved.values()]};
+    }
     if(data.type==="device_connection"){online=data.connected;if(!online)network=null;}
     if(data.type==="network_status")network=data;
     if(data.type==="command_lock"){busy=data.locked;activeId=data.commandId;activeName=data.command;}

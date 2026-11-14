@@ -170,7 +170,7 @@ class MeshChannelMigration {
         if (WiFi.scanNetworks(true) == WIFI_SCAN_RUNNING) {
           scanning_ = true;
           scanStartedMs_ = now;
-          deviceLog("[CHANNEL] Scanning for Pavan router channel");
+          deviceLogf("[CHANNEL] Scanning for %s router channel", ROUTER_SSID);
         } else {
           const int result = WiFi.scanComplete();
           if (result >= 0) acceptScan(result);
@@ -407,9 +407,9 @@ class MeshChannelMigration {
     if (found) {
       if (found != routerChannel_) { failedChannel_ = 0; failureCount_ = 0; }
       routerChannel_ = found;
-      deviceLogf("[CHANNEL] Pavan detected on channel %u; mesh channel %u",
-                 routerChannel_, meshChannel);
-    } else deviceLog("[CHANNEL] Pavan not found; staying on current mesh channel");
+      deviceLogf("[CHANNEL] %s detected on channel %u; mesh channel %u",
+                 ROUTER_SSID, routerChannel_, meshChannel);
+    } else deviceLogf("[CHANNEL] %s not found; staying on current mesh channel", ROUTER_SSID);
   }
 #endif
 };

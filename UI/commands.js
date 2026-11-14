@@ -11,6 +11,18 @@ function parseCommand(body, json = false) {
   }
   if (!value || !names.has(value.command)) throw new Error("Unknown command.");
   const params = value.params || {};
+  if (value.command === "conf" && params.layout !== undefined) {
+    const layout = params.layout;
+    const positive = number => Number.isFinite(number) && number > 0;
+    if (layout?.mode === "square" && positive(layout.side)) {
+      return {command: "conf", params: {layout: {mode: "square", side: layout.side}}};
+    }
+    if (layout?.mode === "manual" && Array.isArray(layout.lengths) &&
+        layout.lengths.length === 5 && layout.lengths.every(positive)) {
+      return {command: "conf", params: {layout: {mode: "manual", lengths: layout.lengths}}};
+    }
+    throw new Error("Enter a positive square side, or four positive sides and diagonal 01–04.");
+  }
   if (["sniff","collect","discover"].includes(value.command)) {
     const mac = String(params.mac || "").replace(/[:-]/g, "").toUpperCase();
     const channel = params.channel === undefined ? 0 : params.channel;
@@ -18,7 +30,9 @@ function parseCommand(body, json = false) {
       throw new Error("Enter a 12-digit Wi-Fi MAC and channel 0..13 (0 is automatic).");
     if (value.command==="collect" && channel===0) throw new Error("Lock a channel before collection.");
     if (value.command==="discover" && channel!==0) throw new Error("Discovery uses channel zero.");
-    return { command: value.command, params: { mac, channel } };
+    if (params.mlDemo !== undefined && (value.command !== "sniff" || typeof params.mlDemo !== "boolean"))
+      throw new Error("The synthetic ML option is a boolean for Sniff only.");
+    return { command: value.command, params: { mac, channel, ...(params.mlDemo ? { mlDemo: true } : {}) } };
   }
   if (["calibrate", "diagnose"].includes(value.command)) {
     const distance = params.distance === undefined ? 1 : params.distance;

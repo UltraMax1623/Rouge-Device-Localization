@@ -17,6 +17,7 @@ constexpr size_t PAYLOAD_SIZE = 18;
 constexpr int64_t DISCOVERY_US = 10000000;
 constexpr int64_t SNIFF_US = 20000000;
 constexpr int64_t COLLECTION_US = 10000000;
+constexpr uint32_t COLLECTION_MIN_PACKETS_PER_RECEIVER = 5;
 constexpr uint8_t SNIFF_CYCLES = 3;
 constexpr int64_t CHANNEL_DWELL_US = 200000;
 
@@ -45,6 +46,12 @@ inline int64_t sniffDurationUs(bool discovery, bool collection = false) {
 }
 inline uint8_t nextSniffCycle(uint8_t cycle) {
   return cycle < SNIFF_CYCLES ? uint8_t(cycle + 1) : 0;
+}
+
+inline bool acknowledgesPreviousCapture(uint32_t currentRound, uint32_t previousRound,
+                                        uint8_t currentCycle, uint8_t incomingCycle) {
+  return currentRound != 0 && previousRound == currentRound &&
+         incomingCycle != 0 && nextSniffCycle(currentCycle) == incomingCycle;
 }
 
 inline uint8_t sniffChannel(int64_t elapsedUs, uint8_t first, uint8_t count) {

@@ -3,7 +3,9 @@
   const status = document.getElementById("mapStatus");
   const details = document.getElementById("mapDetails");
   const reports = new Map();
-  let commandId = null;
+  let layoutKey = null;
+  let configureResult = null;
+  let pendingSniffEnd = false;
   let targetResult=null;
   const sniffReports=new Map();
   if (typeof cytoscape !== "function") {
@@ -21,6 +23,8 @@
         width: 38, height: 38, "border-width": 3, "border-color": "#fff" } },
       { selector: "node.root", style: { "background-color": "#17b7a4", width: 48, height: 48 } },
       { selector: "node.target", style: { "background-color": "#ffb020", shape:"diamond", width:42,height:42 } },
+      { selector: "node.ml-demo", style: { "background-color": "#7350b2", shape: "star", width: 28, height: 28,
+        "text-valign": "top", "text-margin-y": -8, "z-index": 10 } },
       { selector: "edge.sniff", style: { "line-color":"#d8a244", "line-style":"dashed" } },
       { selector: "edge", style: { label: "data(label)", width: 2, "line-color": "#9eafc2",
         "font-size": 11, "text-background-color": "#fff", "text-background-opacity": 0.9 } },
@@ -32,8 +36,14 @@
   document.getElementById("mapZoomIn").onclick = () => graph.zoom(graph.zoom()*1.3);
   document.getElementById("mapZoomOut").onclick = () => graph.zoom(graph.zoom()/1.3);
   graph.on("tap", "node", event => {
+    if (event.target.hasClass("ml-demo") && targetResult?.mlDemo) {
+      const demo = targetResult.mlDemo;
+      details.textContent = `Synthetic ML demo · ${targetResult.targetMac}\nPosition (${demo.position.x.toFixed(3)}, ${demo.position.y.toFixed(3)}) m\n${demo.message}`;
+      return;
+    }
     if(event.target.hasClass("target") && targetResult) {
-      details.textContent=`Target ${targetResult.targetMac}\nPosition: (${targetResult.position.x.toFixed(3)}, ${targetResult.position.y.toFixed(3)}) m\n${targetResult.message}`;
+      const p=event.target.data("coordinates");
+      details.textContent=`Target ${targetResult.targetMac}\nPosition: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\n${targetResult.message}`;
       return;
     }
     const report = reports.get(event.target.id());
@@ -81,46 +91,92 @@
     }
     graph.elements().remove(); graph.add(elements); fitMap();
     const error = [...reports.values()].find(r=>Number.isFinite(r.position?.fitRmseMeters))?.position.fitRmseMeters;
-    status.textContent = `${placed.size}/${reports.size} nodes positioned. ${placed.size===2 ? "Direction is arbitrary with two nodes. " : "Relative orientation; distances are RSSI estimates. "}` +
+    const measured = [...reports.values()].some(r=>r.position?.status === "measured");
+    const description = measured ? "Measured anchor layout. " :
+      placed.size===2 ? "Direction is arbitrary with two nodes. " : "Relative orientation; distances are RSSI estimates. ";
+    status.textContent = `${placed.size}/${reports.size} nodes positioned. ${description}` +
       (Number.isFinite(error) ? `Fit RMSE: ${error.toFixed(3)} m. ` : "") +
       (unavailable.length ? `No position: ${unavailable.join(", ")}` : "");
     details.textContent = "Select a node or connection for details. Scroll to zoom; drag the background to pan.";
   }
+  function applyConfigureDistances() {
+    if(configureResult?.status!=="success")return;
+    for(const report of configureResult.reports.values()) {
+      if(layoutKey===`${report.layoutBootId}:${report.layoutRevision}` && reports.has(report.reporterMac))
+        reports.get(report.reporterMac).distances=report.distances||[];
+    }
+  }
   window.nodeMap = {
     resize() {graph.resize();fitMap();},
-    invalidateLayout() {
-      reports.clear();sniffReports.clear();targetResult=null;graph.elements().remove();
-      status.textContent="Calibration changed. Run Configure again to establish anchor positions.";
+    applyLayout(snapshot) {
+      if(snapshot.stale || !Number.isInteger(snapshot.layoutRevision))return;
+      const key=`${snapshot.layoutBootId}:${snapshot.layoutRevision}`;
+      if(key===layoutKey)return;
+      layoutKey=key;
+      reports.clear();
+      if(targetResult && key!==`${targetResult.layoutBootId}:${targetResult.layoutRevision}`) {
+        targetResult=null;sniffReports.clear();pendingSniffEnd=false;
+      }
+      for(const node of snapshot.nodes||[]) {
+        if(Number.isFinite(node.x)&&Number.isFinite(node.y))reports.set(node.mac,{
+          reporterMac:node.mac,status:snapshot.layoutSource,distances:[],
+          position:{x:node.x,y:node.y,status:snapshot.layoutSource,fitRmseMeters:snapshot.layoutFitRmseMeters}
+        });
+      }
+      applyConfigureDistances();
+      render();
+      if(!reports.size)status.textContent="Run Configure to establish anchor positions.";
+      if(pendingSniffEnd && targetResult) this.event({command:"sniff",phase:"end"});
     },
     event(event) {
     if(event.command === "sniff") {
-      if(event.phase === "start") { sniffReports.clear();targetResult=null;graph.elements(".target, .sniff").remove();status.textContent="Capturing target traffic; node positions use the last Configure result."; }
+      if(event.phase === "start") { sniffReports.clear();targetResult=null;pendingSniffEnd=false;graph.elements(".target, .sniff").remove();status.textContent="Capturing target traffic; the map shows the active anchor layout."; }
       if(event.phase === "data" && event.kind === "sniff") {
         sniffReports.set(event.reporterMac,event);
-        if(Number.isFinite(event.position?.x)&&!reports.has(event.reporterMac))reports.set(event.reporterMac,{...event,distances:[]});
       }
       if(event.phase === "data" && event.kind === "target")targetResult=event;
       if(event.phase === "end") {
-        if(reports.size)render();
+        pendingSniffEnd=Boolean(targetResult && layoutKey!==`${targetResult.layoutBootId}:${targetResult.layoutRevision}`);
+        if(pendingSniffEnd)return;
+        render();
+        const scale = graph.scratch("metreScale") || 80;
         if(Number.isFinite(targetResult?.position?.x)&&Number.isFinite(targetResult?.position?.y)) {
-          const target=targetResult.targetMac,scale=graph.scratch("metreScale")||80;
-          if(graph.getElementById(target).empty())graph.add({data:{id:target,label:`TARGET\n(${targetResult.position.x.toFixed(2)}, ${targetResult.position.y.toFixed(2)}) m`},classes:"target",position:{x:targetResult.position.x*scale,y:-targetResult.position.y*scale}});
+          const target=targetResult.targetMac;
+          if(graph.getElementById(target).empty())graph.add({data:{id:target,label:`TARGET\n(${targetResult.position.x.toFixed(2)}, ${targetResult.position.y.toFixed(2)}) m`,coordinates:targetResult.position},classes:"target",position:{x:targetResult.position.x*scale,y:-targetResult.position.y*scale}});
           for(const report of sniffReports.values()) {
             const value=report.distances?.[0]?.meters;
             if(Number.isFinite(value)&&!graph.getElementById(report.reporterMac).empty())graph.add({data:{id:`target-${report.reporterMac}`,source:report.reporterMac,target,label:`${value.toFixed(2)} m`},classes:"sniff"});
           }
-          fitMap();status.textContent=targetResult.message;
+          status.textContent=targetResult.message;
         } else status.textContent=targetResult?.message||"No target position available. Check traffic and Configure anchor positions.";
+        for(const [index,p] of (targetResult?.positionAlternatives||[]).entries()) {
+          graph.add({data:{id:`alternative-${index}`,label:`Possible target ${index+1}`,coordinates:p},
+            classes:"target",position:{x:p.x*scale,y:-p.y*scale}});
+        }
+        const demo = targetResult?.mlDemo;
+        if (demo?.status === "estimated" && Number.isFinite(demo.position?.x) && Number.isFinite(demo.position?.y)) {
+          graph.add({data: {id: `ml:${targetResult.targetMac}`,
+            label: `Synthetic ML demo\n(${demo.position.x.toFixed(2)}, ${demo.position.y.toFixed(2)}) m`},
+            classes: "target ml-demo", position: {x: demo.position.x * scale, y: -demo.position.y * scale}});
+          status.textContent += " Synthetic ML demo shown in purple.";
+        } else if (demo?.message) {
+          status.textContent += ` ${demo.message}`;
+        }
+        fitMap();
       }
       return;
     }
-    if(event.command && event.command!=="conf")return;
-    if(event.phase === "start") { commandId=event.commandId; reports.clear(); status.textContent="Measuring; previous layout shown until results arrive."; }
-    if(event.phase === "data") {
-      if(commandId!==event.commandId) { commandId=event.commandId; reports.clear(); }
-      reports.set(event.reporterMac,event);
+    if(event.command!=="conf")return;
+    if(event.phase==="start" || configureResult?.id!==event.commandId)
+      configureResult={id:event.commandId,status:null,reports:new Map()};
+    if(event.phase==="start")status.textContent="Configuring. The map shows the active anchor layout.";
+    if(event.phase==="data" && event.layoutRevision!=null)configureResult.reports.set(event.reporterMac,event);
+    if(event.phase==="end") {
+      configureResult.status=event.status;
+      applyConfigureDistances();
+      render();
+      if(event.status!=="success")status.textContent="Configure ended without applying a new layout.";
     }
-    if(event.phase === "end" && reports.size) render();
   } };
 })();
 
@@ -132,11 +188,14 @@
   const scale=450;
   function fit(all=false){if(!graph)return;graph.resize();graph.fit(all?graph.elements():graph.elements().not(".estimate"),55);graph.center();}
   function estimate(window,L) {
-    const a=window?.A,n=window?.n;
-    if(!Number.isFinite(a)||!Number.isFinite(n)||n<=0)return null;
-    const r=[1,2,3,4].map(board=>window.receivers?.find(r=>r.board===board)?.mean);
-    if(!r.every(Number.isFinite))return null;
-    const d=r.map(rssi=>10**((a-rssi)/(10*n)));
+    const d=[1,2,3,4].map(board=>{
+      const receiver=window?.receivers?.find(r=>r.board===board);
+      const perReceiver=receiver?.A!=null&&receiver?.n!=null;
+      const a=perReceiver?receiver.A:window?.A,n=perReceiver?receiver.n:window?.n;
+      if(!Number.isFinite(a)||!Number.isFinite(n)||n<=0||!Number.isFinite(receiver?.mean))return NaN;
+      return 10**((a-receiver.mean)/(10*n));
+    });
+    if(!d.every(Number.isFinite))return null;
     const x=(d[0]**2-d[1]**2+d[2]**2-d[3]**2+2*L*L)/(4*L);
     const y=(d[0]**2-d[2]**2+d[1]**2-d[3]**2+2*L*L)/(4*L);
     return Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null;
@@ -168,7 +227,7 @@
     }
     const setup=state.setup||state.lastCapture?.setup;if(!setup)return;
     const L=setup.side_length_m;
-    const key=`${setup.mesh_id}:${setup.environment_id}:${setup.dataset_split}:${state.session?.mac}:${state.pending?.id}:${state.pending?.stage}:${Object.keys(state.pending?.windows||{}).length}:${state.savedRows}`;
+    const key=`${setup.mesh_id}:${setup.environment_id}:${setup.dataset_split}:${state.session?.mac}:${state.pending?.id}:${state.pending?.attemptId}:${state.pending?.stage}:${Object.keys(state.pending?.windows||{}).length}:${state.savedRows}`;
     if(key===context){graph.resize();return;}context=key;
     const elements=[];
     [[0,0],[1,0],[0,1],[1,1]].forEach(([u,v],i)=>elements.push({data:{id:`anchor-${i+1}`,label:`Sniffer 0${i+1}`,description:`Sniffer 0${i+1}: (${(u*L).toFixed(3)}, ${(v*L).toFixed(3)}) m · measured corner`},position:{x:u*scale,y:v*scale},classes:"anchor"}));
