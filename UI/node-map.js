@@ -122,7 +122,7 @@
       if(pendingSniffEnd && targetResult) this.event({command:"sniff",phase:"end"});
     },
     event(event) {
-    if(event.command === "sniff") {
+    if(["sniff","autoscan","focus"].includes(event.command)) {
       if(event.phase === "start") { sniffReports.clear();targetResult=null;pendingSniffEnd=false;graph.elements(".target, .sniff").remove();status.textContent="Capturing target traffic; the map shows the active anchor layout."; }
       if(event.phase === "data" && event.kind === "sniff") {
         sniffReports.set(event.reporterMac,event);

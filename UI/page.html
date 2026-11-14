@@ -350,6 +350,12 @@
     <div id="operationsPanel">
       <section class="card command-controls">
         <h2>Commands</h2>
+        <div class="collect-actions">
+          <button id="autoScanButton" data-command type="button">Auto Scan</button>
+          <button id="stopAutoScanButton" type="button" disabled>Stop Auto Scan</button>
+        </div>
+        <p id="autoScanStatus" role="status">Manual mode</p>
+        <div id="autoScanShortlist"></div>
         <p id="commandAvailability" class="muted">Waiting for the root</p>
         <div class="command-grid">
           <form id="configureForm" class="command-tile tile-configure">

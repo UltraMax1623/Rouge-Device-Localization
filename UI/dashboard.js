@@ -1,11 +1,38 @@
 (() => {
   const byId=id=>document.getElementById(id);
-  const labels={conf:"Node configuration",sniff:"Wi-Fi target capture",status:"Network status",calibrate:"A/n calibration",diagnose:"Measurement diagnostics"};
+  const labels={autoscan:"Auto Scan",focus:"Focus",conf:"Node configuration",sniff:"Wi-Fi target capture",status:"Network status",calibrate:"A/n calibration",diagnose:"Measurement diagnostics"};
   const terminal=byId("terminalOutput"), result=byId("commandResult");
   let online=false, locked=false, activeId=null, activeName="conf", sending=false, controlPending=false;
   let backendConnected=false, networkStatus=null;
   let resultId=null, session=null;
   const seen=new Set();
+  let queuedFocus=null;
+  function showShortlist(data) {
+    const expires=data.expiresAt || Date.now()+120000;
+    const panel=byId("autoScanShortlist");
+    panel.replaceChildren(element("h3","Discovered devices"));
+    if(data.truncated) panel.append(element("p","Showing a limited set of sightings."));
+    for(const candidate of data.candidates) {
+      const row=element("p",candidate.mac+" · Channel "+candidate.channel+" · "+candidate.count+" packets ");
+      const focus=element("button","Focus","secondary");
+      focus.type="button";
+      focus.onclick=()=>{
+        queuedFocus={params:{mac:candidate.mac,channel:candidate.channel,scanId:data.commandId},expires};
+        if(locked||!online) byId("autoScanStatus").textContent="Focus queued for "+candidate.mac;
+        dispatchFocus();
+      };
+      row.append(focus);
+      panel.append(row);
+    }
+    if(!data.candidates.length) panel.append(element("p","No eligible devices found."));
+  }
+  function dispatchFocus() {
+    if(!queuedFocus||locked||!online||sending)return;
+    const selection=queuedFocus;
+    queuedFocus=null;
+    if(Date.now()<selection.expires) send("focus",selection.params);
+    else byId("autoScanStatus").textContent="Queued Focus expired. Run Auto Scan again.";
+  }
   function element(tag,text,cls) {
     const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(cls)node.className=cls;return node;
   }
@@ -16,6 +43,7 @@
   function controls() {
     document.querySelectorAll("[data-command]").forEach(button=>button.disabled=!online||locked||sending);
     byId("commandAvailability").textContent=!online ? "Root unavailable. Commands will be available after reconnection." : locked ? `${labels[activeName] || activeName} is active. New commands are locked.` : "Ready for one command at a time.";
+    byId("stopAutoScanButton").disabled=!locked||!["autoscan","focus"].includes(activeName)||controlPending;
     const usable=locked&&online&&!controlPending;
     byId("nextButton").disabled=!usable||!session?.canNext;
     byId("saveButton").disabled=!usable||!session?.canSave;
@@ -156,7 +184,7 @@
       const changed=locked!==data.locked;locked=data.locked;activeId=data.commandId;activeName=data.command||activeName;
       if(locked){block(activeId,activeName);if(changed)log(`${labels[activeName]||activeName} started. New commands locked.`);}
       else {controlPending=false;session=null;if(changed)log("Command finished. Controls unlocked.");}
-      controls();renderNetwork();return;
+      controls();renderNetwork();dispatchFocus();return;
     }
     if(data.type==="control_ack") {
       controlPending=false;log(data.message||"Action acknowledged.","ROOT",!data.accepted);controls();return;
@@ -164,8 +192,11 @@
     if(data.type==="command_event") {
       const key=`${data.commandId}:${data.sequence??JSON.stringify(data)}`;
       if(seen.has(key))return;seen.add(key);if(seen.size>2048)seen.delete(seen.values().next().value);
+      if(data.kind==="shortlist") {showShortlist(data);return;}
       block(data.commandId,data.command);
-      if(["conf","sniff"].includes(data.command))window.nodeMap?.event(data);
+      if(["autoscan","focus"].includes(data.command) && (data.phase==="end" || !queuedFocus && !controlPending))
+        byId("autoScanStatus").textContent=data.message || (data.phase==="end" ? "Manual mode · "+data.status : labels[data.command]);
+      if(["conf","sniff","autoscan","focus"].includes(data.command))window.nodeMap?.event(data);
       if(data.phase==="start"){badge("Running");progress(`Root acknowledged ${labels[data.command]||data.command}.`);}
       else if(data.phase==="data")render(data);
       else if(data.phase==="log")progress(data.message||"Processing...");
@@ -178,6 +209,7 @@
     }
     if(data.type==="device_connection") {
       online=data.connected;
+      dispatchFocus();
       if(!online&&networkStatus)networkStatus={...networkStatus,stale:true};
       renderNetwork();
       log(`Root ${online?"connected":"disconnected"}.`);controls();return;
@@ -213,6 +245,12 @@
       log(`${action} requested. Waiting for root acknowledgement.`,"UI");
     }catch(error){controlPending=false;log(error.message,"BACKEND",true);controls();}
   }
+  byId("autoScanButton").onclick=()=>{queuedFocus=null;send("autoscan");};
+  byId("stopAutoScanButton").onclick=()=>{
+    queuedFocus=null;
+    byId("autoScanStatus").textContent="Stop pending";
+    action("cancel");
+  };
   const layoutMode = byId("layoutMode");
   function showLayoutFields() {
     for (const [id, mode] of [["squareLayoutFields","square"],["manualLayoutFields","manual"]]) {

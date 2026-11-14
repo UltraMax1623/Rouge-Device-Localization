@@ -53,6 +53,7 @@ function publishCommandLock() {
 
 const receivedEvents = new Set();
 let commandHistory = [];
+let autoShortlist = null;
 
 function finishTimedOutCommand() {
   if (!activeCommandId) return;
@@ -203,6 +204,7 @@ webSockets.on("connection", (socket, request) => {
   if (role === "ui") {
     operators.add(socket);
     if (networkStatus) socket.send(JSON.stringify(networkStatus));
+    if (autoShortlist && !commandHistory.includes(autoShortlist)) socket.send(JSON.stringify(autoShortlist));
     for (const event of commandHistory) socket.send(JSON.stringify(event));
     socket.send(JSON.stringify({ type: "command_lock", locked: Boolean(activeCommandId), commandId: activeCommandId, command: activeCommandName }));
     socket.send(JSON.stringify({
@@ -292,6 +294,10 @@ webSockets.on("connection", (socket, request) => {
         if (Number.isInteger(message.sequence)) {
           receivedEvents.add(key);
           if (receivedEvents.size > 2048) receivedEvents.delete(receivedEvents.values().next().value);
+        }
+        if (message.command === "autoscan" && message.kind === "shortlist") {
+          message.expiresAt = Date.now() + 120000;
+          autoShortlist = message;
         }
         commandHistory.push(message);
         broadcast(message);

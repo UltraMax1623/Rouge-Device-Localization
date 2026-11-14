@@ -122,7 +122,7 @@ class TimeSlicingController {
   uint8_t captureCycle() const { return captureCycle_; }
   uint8_t targetChannel() const { return targetChannel_; }
   int64_t captureDurationUs() const {
-    return TimeSliceProtocol::sniffDurationUs(discoveryRound_);
+    return autoRound_ ? autoDuration(discoveryRound_,autoCount_) : TimeSliceProtocol::sniffDurationUs(discoveryRound_);
   }
   bool requestCancellation() {
     if (!isRoot() || timingCritical()) return false;
@@ -235,6 +235,17 @@ class TimeSlicingController {
     return true;
   }
 
+  bool beginAutoRound(const std::vector<Mac> &table, const Mac &target, uint8_t channel, unsigned rotation) {
+    const uint32_t previous = autoRound_ ? round_ : 0;
+    wifi_country_t country{};
+    if (table.size() != 4 || phase_ == Phase::FAILED || esp_wifi_get_country(&country) != ESP_OK || !country.schan ||
+        country.nchan < 4 || country.schan + country.nchan > 14 ||
+        (channel && (channel < country.schan || channel >= country.schan + country.nchan)) ||
+        !beginSniff(table,target,channel)) return false;
+    previousCaptureRound_ = previous;
+    setAutoPlan(country.schan,country.nchan,rotation % 3);
+    return true;
+  }
   // Called by handleConfigMode() after validating a temporary ordered table.
   // No radio changes happen in a mesh callback.
   bool acceptConfiguration(JsonDocument &doc, const std::vector<Mac> &table,
@@ -244,6 +255,7 @@ class TimeSlicingController {
     uint8_t channel = 0, cycle = 0;
     if (!readJob(doc, sniff, discovery, target, channel, cycle)) return false;
     const bool calibration = doc["Calibration"] | false;
+    if ((doc["AutoScan"] | false) && (!sniff || table.size()!=4)) return false;
     if (calibration && (sniff || table.size() != 2 ||
         !doc["CalibrationSession"].is<uint32_t>() ||
         doc["CalibrationSession"].as<uint32_t>() == 0)) return false;
@@ -268,7 +280,10 @@ class TimeSlicingController {
           doc["PreviousCaptureRoundId"].is<uint32_t>() &&
           TimeSliceProtocol::acknowledgesPreviousCapture(
               round_, doc["PreviousCaptureRoundId"].as<uint32_t>(), captureCycle_, cycle);
-      if (!acknowledged) return false;
+      const bool supersededAuto = phase_ == Phase::REPORTING && autoRound_ &&
+          (doc["AutoScan"] | false) && table == table_ &&
+          doc["PreviousCaptureRoundId"].as<uint32_t>() == round_;
+      if (!acknowledged && !supersededAuto) return false;
       FW_LOG("[ROUND %u] Root confirmed results in prepare for next capture %u", round_, unsigned(cycle));
     }
     resetRound(table, round);
@@ -276,6 +291,7 @@ class TimeSlicingController {
     calibrationSession_ = calibration ? doc["CalibrationSession"].as<uint32_t>() : 0;
     sniffRound_ = sniff;
     discoveryRound_ = discovery;
+    if (doc["AutoScan"] | false) setAutoPlan(doc["AutoFirst"],doc["AutoCount"],doc["AutoRotation"]);
     target_ = target;
     targetChannel_ = channel;
     captureCycle_ = cycle;
@@ -454,7 +470,7 @@ class TimeSlicingController {
     if (phase_ == Phase::WAIT_READY) {
       if (!allSet(ready_) && waitLogDue(nowMs))
         logWait(nowMs, String("Waiting for ready replies from ") + missingBoards(ready_));
-      if (nowMs - phaseSinceMs_ > READY_TIMEOUT_MS) {
+      if (nowMs - phaseSinceMs_ > (autoRound_ ? 5000 : READY_TIMEOUT_MS)) {
         const String missing = missingBoards(ready_);
         for (size_t i = 0; i < table_.size(); ++i) {
           if (!ready_[i]) FW_LOG("[ROUND %u] Missing ready: %s\n",
@@ -463,7 +479,7 @@ class TimeSlicingController {
         beginCancellation(missing.length() ? "missing ready replies" : "mesh clock did not settle");
         if(sniffRound_ && missing.length()) captureFailure_ = String("Prepare not acknowledged by board(s) ") + missing;
       } else if (allSet(ready_) && settled()) {
-        meshStartUs_ = mesh_.getNodeTime() + START_LEAD_US;
+        meshStartUs_ = mesh_.getNodeTime() + (autoRound_ ? 6500000 : START_LEAD_US);
         phase_ = Phase::ARMED;
         startAcknowledged_[selfIndex_] = true;
         lastMessageMs_ = nowMs - RETRY_MS;
@@ -476,7 +492,7 @@ class TimeSlicingController {
       return;
     }
     if (phase_ == Phase::PREPARED) {
-      if (nowMs - phaseSinceMs_ > READY_TIMEOUT_MS + 20000) {
+      if (nowMs - phaseSinceMs_ > (autoRound_ ? 9000 : READY_TIMEOUT_MS + 20000)) {
         phase_ = Phase::IDLE;
         mode_ = "mesh";
         FW_LOG("[ROUND] No start received; remaining in mesh");
@@ -543,8 +559,9 @@ class TimeSlicingController {
       if (sniffRound_) {
         const int64_t elapsed = nowUs - localStartUs_;
         if (elapsed >= captureDurationUs()) finishRound(true, "complete", true);
-        else if (discoveryRound_) {
-          const uint8_t channel = sniffChannel(elapsed, scanFirst_, scanCount_);
+        else if (discoveryRound_ && elapsed >= 0) {
+          const uint8_t channel = autoRound_ ? scanFirst_ + std::min<int64_t>(elapsed / 300000, scanCount_ - 1) :
+              sniffChannel(elapsed, scanFirst_, scanCount_);
           if (channel != captureChannel_) {
             if (esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
               finishRound(false, "channel hopping failed", true);
@@ -590,7 +607,7 @@ class TimeSlicingController {
           retryReportMesh();
       }
       if (phase_ == Phase::FAILED) return;
-      if (nowMs - phaseSinceMs_ > REPORT_TIMEOUT_MS) {
+      if (nowMs - phaseSinceMs_ > (autoRound_ ? 9000 : REPORT_TIMEOUT_MS)) {
         phase_ = Phase::IDLE;
         FW_LOG("[ROUND] Report timeout; results remain available locally");
       } else if (meshStarted_ && mesh_.isConnected(rootNodeId()) &&
@@ -610,12 +627,12 @@ class TimeSlicingController {
         if (waitLogDue(nowMs)) logWait(nowMs, reportWaitMessage());
         if (reportMeshRetryDue(nowMs, 25000) && mesh_.getNodeList().empty()) retryReportMesh();
         if (phase_ == Phase::FAILED) return;
-        if (nowMs - phaseSinceMs_ < REPORT_REJOIN_TIMEOUT_MS) return;
+        if (nowMs - phaseSinceMs_ < (autoRound_ ? 7000 : REPORT_REJOIN_TIMEOUT_MS)) return;
         bool missingPeer = false;
         for (size_t i = 0; i < reportReceived_.size(); ++i)
           if (!reportReceived_[i] && (!peerIds_[i] || !mesh_.isConnected(peerIds_[i])))
             missingPeer = true;
-        const uint32_t timeout = missingPeer ? REPORT_REJOIN_TIMEOUT_MS : REPORT_TIMEOUT_MS;
+        const uint32_t timeout = autoRound_ ? 7000 : (missingPeer ? REPORT_REJOIN_TIMEOUT_MS : REPORT_TIMEOUT_MS);
         if (nowMs - phaseSinceMs_ >= timeout) {
           const String missing = missingBoards(reportReceived_);
           FW_LOG("[ROUND %u] Timed out after %u s waiting for reports from %s", round_,
@@ -661,6 +678,23 @@ class TimeSlicingController {
   uint32_t phaseSinceMs_ = 0, lastMessageMs_ = 0, lastUnstableMs_ = 0;
   uint32_t sequence_ = 0, sendErrors_ = 0;
   double roundA_ = -60.0, roundN_ = 2.0;
+  struct Candidate {
+    Mac mac{};
+    uint16_t count = 0, sequence = 0;
+    uint8_t channel = 0;
+  };
+  std::array<Candidate,24> candidates_{};
+  bool autoRound_ = false, truncated_ = false;
+  uint8_t autoFirst_ = 0, autoCount_ = 0, autoRotation_ = 0;
+  void setAutoPlan(uint8_t first, uint8_t count, uint8_t rotation) {
+    autoRound_ = true;
+    autoFirst_ = first;
+    autoCount_ = count;
+    autoRotation_ = rotation;
+  }
+  static unsigned autoDuration(bool discovery, unsigned count) {
+    return discovery ? ((count + 3) / 4) * 300000 : 3000000;
+  }
   bool sniffRound_ = false, discoveryRound_ = false;
   bool calibrationRound_ = false;
   uint32_t calibrationSession_ = 0;
@@ -756,8 +790,12 @@ class TimeSlicingController {
     discovery = doc["DiscoverChannel"].as<bool>();
     channel = doc["SniffChannel"].as<unsigned>();
     cycle = doc["SniffCycle"].as<unsigned>();
-    return doc["SniffMs"].as<unsigned>() ==
-               unsigned(TimeSliceProtocol::sniffDurationUs(discovery) / 1000) &&
+    const bool automatic = doc["AutoScan"] | false;
+    const unsigned first = doc["AutoFirst"] | 0u, count = doc["AutoCount"] | 0u;
+    if (automatic && (!first || first > 13 || count < 4 || count > 13 || first + count > 14 ||
+        (doc["AutoRotation"] | 3u) >= 3)) return false;
+    return doc["SniffMs"].as<unsigned>() == (automatic ? autoDuration(discovery,count) :
+               TimeSliceProtocol::sniffDurationUs(discovery)) / 1000 &&
            (discovery ? channel == 0 && cycle == 0 : channel >= 1 && cycle >= 1);
   }
   bool jobMatches(JsonDocument &doc) const {
@@ -767,6 +805,9 @@ class TimeSlicingController {
     return readJob(doc, sniff, discovery, target, channel, cycle) &&
            (doc["Calibration"] | false) == calibrationRound_ &&
            (!calibrationRound_ || doc["CalibrationSession"].as<uint32_t>() == calibrationSession_) &&
+           (doc["AutoScan"] | false) == autoRound_ &&
+           (!autoRound_ || (doc["AutoFirst"] == autoFirst_ && doc["AutoCount"] == autoCount_ &&
+                            doc["AutoRotation"] == autoRotation_)) &&
            sniff == sniffRound_ && (!sniff || (discovery == discoveryRound_ &&
            channel == targetChannel_ && target == target_ && cycle == captureCycle_));
   }
@@ -850,7 +891,8 @@ class TimeSlicingController {
     resultOK_ = false;
     resultReason_ = "not finished";
     nextSendUs_ = 0;
-    sniffRound_ = discoveryRound_ = false;
+    sniffRound_ = discoveryRound_ = autoRound_ = truncated_ = false;
+    candidates_.fill(Candidate{});
     calibrationRound_ = false;
     calibrationSession_ = 0;
     calibrationWindows_.fill(TimeSliceProtocol::WindowTiming{});
@@ -876,6 +918,12 @@ class TimeSlicingController {
     if (sniffRound_) {
       doc["DiscoverChannel"] = discoveryRound_;
       doc["SniffChannel"] = targetChannel_;
+      if (autoRound_) {
+        doc["AutoScan"] = true;
+        doc["AutoFirst"] = autoFirst_;
+        doc["AutoCount"] = autoCount_;
+        doc["AutoRotation"] = autoRotation_;
+      }
       doc["SniffMs"] = unsigned(captureDurationUs() / 1000);
       doc["SniffCycle"] = captureCycle_;
       doc["SniffCycles"] = TimeSliceProtocol::SNIFF_CYCLES;
@@ -961,7 +1009,8 @@ class TimeSlicingController {
         : uint32_t(table_.size() * int64_t(TimeSliceProtocol::slotDurationUs(calibrationRound_)) / 1000);
     // A peer may have already stopped its mesh and cannot hear cancel until
     // capture ends. Keep the old round identity until that return/report window.
-    cancelTimeoutMs_ = armed ? durationMs + TimeSliceProtocol::START_LEAD_US / 1000 + READY_TIMEOUT_MS : 10000;
+    cancelTimeoutMs_ = autoRound_ ? (armed ? durationMs + 14500 : 3500) :
+        (armed ? durationMs + TimeSliceProtocol::START_LEAD_US / 1000 + READY_TIMEOUT_MS : 10000);
     cancelled_ = true;
     resultOK_ = false;
     resultReason_ = reason;
@@ -988,11 +1037,43 @@ class TimeSlicingController {
     if (status != ESP_NOW_SEND_SUCCESS) ++active_->sendErrors_;
     portEXIT_CRITICAL(&active_->mux_);
   }
+  void observeCandidate(const wifi_promiscuous_pkt_t *packet) {
+    const auto *frame = packet->payload;
+    if (packet->rx_ctrl.sig_len < 28 || (frame[0] & 0x03) || (frame[1] & 2)) return;
+    Mac mac{};
+    memcpy(mac.data(),frame+10,mac.size());
+    if (mac[0] & 1) return;
+    for (const auto &node : table_) if (mac == node) return;
+    const int64_t elapsed = esp_timer_get_time() - localStartUs_;
+    const uint8_t channel = packet->rx_ctrl.channel;
+    const uint16_t sequence = uint16_t(frame[22]) | (uint16_t(frame[23]) << 8);
+    portENTER_CRITICAL(&mux_);
+    if (capturing_ && elapsed >= 0 && elapsed / 300000 < scanCount_ &&
+        channel == scanFirst_ + elapsed / 300000) {
+      Candidate *entry = nullptr;
+      for (auto &c : candidates_) {
+        if (c.count && c.mac == mac && c.channel == channel) { entry = &c; break; }
+        if (!entry && !c.count) entry = &c;
+      }
+      if (!entry) truncated_ = true;
+      else if (!entry->count || !(frame[1] & 8) || entry->sequence != sequence) {
+        entry->mac = mac;
+        entry->channel = channel;
+        entry->sequence = sequence;
+        if (entry->count < 65535) ++entry->count;
+      }
+    }
+    portEXIT_CRITICAL(&mux_);
+  }
   static void sniffCallback(void *buffer, wifi_promiscuous_pkt_type_t type) {
     if (!active_ || (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA)) return;
     auto *packet = static_cast<wifi_promiscuous_pkt_t *>(buffer);
     auto &self = *active_;
     if (self.sniffRound_) {
+      if (self.autoRound_ && self.discoveryRound_) {
+        if (type == WIFI_PKT_DATA) self.observeCandidate(packet);
+        return;
+      }
       if (!TimeSliceProtocol::targetFrame(packet->payload, packet->rx_ctrl.sig_len,
                                          self.target_.data())) return;
       const int64_t now = esp_timer_get_time();
@@ -1051,6 +1132,14 @@ class TimeSlicingController {
           country.nchan < 1 || country.schan + country.nchan - 1 > 13) return false;
       scanFirst_ = country.schan;
       scanCount_ = country.nchan;
+      if (autoRound_ && discoveryRound_) {
+        const unsigned rank = selfIndex_ ? 1 + (selfIndex_ - 1 + autoRotation_) % 3 : 0;
+        unsigned offset = 0;
+        for (unsigned i = 0; i < rank; ++i) offset += autoCount_ / 4 + (i > 0 && i <= autoCount_ % 4);
+        scanFirst_ = autoFirst_ + offset;
+        scanCount_ = autoCount_ / 4 + (rank > 0 && rank <= autoCount_ % 4);
+        if (scanFirst_ < country.schan || scanFirst_ + scanCount_ > country.schan + country.nchan) return false;
+      }
       captureChannel_ = discoveryRound_ ? scanFirst_ : targetChannel_;
       if (captureChannel_ < scanFirst_ || captureChannel_ >= scanFirst_ + scanCount_ ||
           esp_wifi_set_channel(captureChannel_, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
@@ -1132,6 +1221,7 @@ class TimeSlicingController {
     doc["ReporterMAC"] = macString(table_[selfIndex_]);
     doc["A"] = roundA_;
     doc["n"] = roundN_;
+    if (autoRound_) doc["RadioElapsedMs"] = radioElapsedMs_;
     if (calibrationRound_) {
       doc["SampleWindowMs"] = TimeSliceProtocol::CALIBRATION_SAMPLE_US / 1000;
       doc["RadioElapsedMs"] = radioElapsedMs_;
@@ -1142,6 +1232,14 @@ class TimeSlicingController {
     JsonObject counts = doc["Samples"].to<JsonObject>();
     if (sniffRound_) {
       counts[macString(target_)] = targetSample_.count;
+      if (autoRound_ && discoveryRound_) {
+        JsonArray rows = doc["Candidates"].to<JsonArray>();
+        doc["Truncated"] = truncated_;
+        for (const auto &c : candidates_) if (c.count >= 3) {
+          JsonArray row = rows.add<JsonArray>();
+          row.add(macString(c.mac)); row.add(c.channel); row.add(c.count);
+        }
+      }
       if (discoveryRound_) {
         JsonObject channels = doc["ChannelSamples"].to<JsonObject>();
         for (unsigned channel = 1; channel <= 13; ++channel)
@@ -1167,7 +1265,7 @@ class TimeSlicingController {
       beginCancellation(reason);
       return;
     }
-    if (calibrationRound_ && phase_ == Phase::MEASURING) {
+    if ((calibrationRound_ || autoRound_) && phase_ == Phase::MEASURING) {
       radioElapsedMs_ = uint32_t((esp_timer_get_time() - localStartUs_) / 1000);
       FW_LOG("[AN] Pair radio elapsed %.3f s; restoring mesh for reports\n", double(radioElapsedMs_) / 1000);
     }
@@ -1258,6 +1356,10 @@ class TimeSlicingController {
       if (rssi.size() != 1 || counts.size() != 1 || receivedDistances.size() != 1 ||
           !validTargetReading(rssi[target], counts[target], receivedDistances[target],
                               doc["A"].as<double>(), doc["n"].as<double>())) return false;
+      if (autoRound_ && !doc["RadioElapsedMs"].is<uint32_t>()) return false;
+      if (autoRound_ && discoveryRound_ &&
+          (!doc["Candidates"].is<JsonArray>() || doc["Candidates"].size()>candidates_.size() ||
+           !doc["Truncated"].is<bool>())) return false;
       if (discoveryRound_) {
         if (!doc["ChannelSamples"].is<JsonObject>() || doc["ChannelSamples"].size() != 13)
           return false;
@@ -1351,6 +1453,10 @@ class TimeSlicingController {
 
   void completeCollection() {
     phase_ = Phase::IDLE;
+    if (autoRound_) {
+      if (!discoveryRound_) sniffCycleReports["1"].set(sniffReports.as<JsonObjectConst>());
+      return;
+    }
     if (!discoveryRound_) {
       if (sniffRound_) {
         sniffCycleReports[String(captureCycle_)].set(sniffReports.as<JsonObjectConst>());
