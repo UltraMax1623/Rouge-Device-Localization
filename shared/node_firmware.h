@@ -16,6 +16,7 @@
 #include <array>
 #include <vector>
 #include <utility>
+#include "connection_debug.h"
 #include "../root_node/time_slicing.h"
 #include "mode_indicator.h"
 #include "serial_commands.h"
@@ -50,7 +51,6 @@ uint8_t meshChannel = TimeSliceProtocol::CHANNEL;
 #if ROOT_FIRMWARE
 bool backendServiceAllowed();
 bool backendCommandBusy();
-#include "connection_debug.h"
 #include "coordinate_engine.h"
 #if CONNECTION_DEBUG
 volatile uint8_t lastWifiDisconnectReason = 0;
@@ -69,7 +69,6 @@ const char *ROUTER_PASSWORD = "12345678";
 
 const char *BACKEND_HOST = "10.131.226.100"; // Used until a serverIP command saves another address.
 const uint16_t BACKEND_PORT = 3000;
-const char *DEVICE_TOKEN = "local-device-token-change-me";
 
 WebSocketsClient webSocket;
 String backendHost = BACKEND_HOST;
@@ -87,8 +86,7 @@ bool validBackendHost(const String &host)
 
 void beginBackendConnection()
 {
-  const String wsPath = String("/ws?role=device&token=") + DEVICE_TOKEN;
-  webSocket.begin(backendHost.c_str(), BACKEND_PORT, wsPath.c_str());
+  webSocket.begin(backendHost.c_str(), BACKEND_PORT, "/ws?role=device");
   deviceLogf("[WS] Connecting to backend %s:%u", backendHost.c_str(), BACKEND_PORT);
 }
 
@@ -151,7 +149,11 @@ String pendingControlId, pendingControlAction, lastControlId;
 String webSnapshot;
 bool webCancelled = false;
 Coordinates::Result lastNodeCoordinates;
+bool lastLayoutMeasured = false;
 uint32_t lastCoordinateRound = 0;
+uint32_t layoutRevision = 0;
+uint32_t layoutBootId = 0;
+bool uiLayoutPending = true;
 std::array<uint8_t,6> webSniffTarget{};
 String pendingCommandId;
 #include "command_events.h"
@@ -168,6 +170,14 @@ void commandEnvelope(JsonDocument &event, const String &id, const char *phase)
 
 void queueCommandEvent(JsonDocument &event)
 {
+#if FIRMWARE_DEBUG
+  const char *phase = event["phase"] | "";
+  if (strcmp(phase, "start") == 0 || strcmp(phase, "end") == 0 || strcmp(phase, "error") == 0) {
+    const char *code = event["code"] | "";
+    FW_LOG("[COMMAND] %s %s %s %s", event["command"] | "", phase,
+           event["status"] | code, event["message"] | "");
+  }
+#endif
   // A new command reserves enough room for every configured result and end.
   if (!commandEvents.push(event)) queueDeviceLog("[ERROR] Command event storage full");
 }
@@ -233,9 +243,11 @@ void queueDeviceLog(const char *text)
 void deviceLog(const char *text)
 {
   FW_LOG(text);
+#if !FIRMWARE_DEBUG
   if (strncmp(text, "[CHANNEL]", 9) == 0 || strncmp(text, "[WS]", 4) == 0 ||
       strncmp(text, "[WIFI]", 6) == 0 || strncmp(text, "[MESH]", 6) == 0 ||
       strncmp(text, "[TIMING]", 8) == 0) connectionTrace(text);
+#endif
   queueDeviceLog(text);
 }
 
@@ -256,9 +268,11 @@ void deviceLogf(const char *format, ...)
   }
 
   FW_LOG(line);
+#if !FIRMWARE_DEBUG
   if (strncmp(line, "[CHANNEL]", 9) == 0 || strncmp(line, "[WS]", 4) == 0 ||
       strncmp(line, "[WIFI]", 6) == 0 || strncmp(line, "[MESH]", 6) == 0 ||
       strncmp(line, "[TIMING]", 8) == 0) connectionTrace(line);
+#endif
   queueDeviceLog(line);
 }
 
@@ -288,24 +302,28 @@ void flushDeviceLogQueue()
 
 bool wsCommandPending = false;
 
+void sendCommandState()
+{
+  JsonDocument state;
+  state["type"] = "command_state";
+  state["commandId"] = wsCommandPending ? pendingCommandId : activeCommandId;
+  state["command"] = wsCommandPending ? pendingCommandName : activeCommandName;
+  state["pendingEvents"] = commandEvents.available();
+  commandEvents.describePending(state);
+  String payload;
+  serializeJson(state, payload);
+  webSocket.sendTXT(payload);
+}
+
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 {
   switch (type)
   {
   case WStype_CONNECTED:
-    {
-      JsonDocument state;
-      state["type"] = "command_state";
-      state["commandId"] = activeCommandId;
-      state["command"] = activeCommandName;
-      state["pendingEvents"] = commandEvents.available();
-      commandEvents.describePending(state);
-      String payload;
-      serializeJson(state, payload);
-      webSocket.sendTXT(payload);
-    }
+    sendCommandState();
     uiSnapshotPending = true;
     uiChannelPending = true;
+    uiLayoutPending = true;
     deviceLog("[WS] Connected to backend");
     break;
 
@@ -317,6 +335,10 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     {
       JsonDocument request;
       if (deserializeJson(request, payload, length)) break;
+      if (strcmp(request["type"] | "", "command_state_request") == 0) {
+        sendCommandState();
+        break;
+      }
       if (strcmp(request["type"] | "", "event_ack") == 0) {
         commandEvents.acknowledge(request);
         break;
@@ -350,9 +372,23 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
   }
 }
 #else
-// Normal nodes keep printing locally; only the root has a backend WebSocket.
+#if NORMAL_CHANNEL_DEBUG && !FIRMWARE_DEBUG
+inline void deviceLog(const char *text) {
+  if (strncmp(text, "[CHANNEL]", 9) == 0) connectionTrace(text);
+}
+inline void deviceLogf(const char *format, ...) {
+  if (strncmp(format, "[CHANNEL]", 9) != 0) return;
+  char line[160];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  connectionTrace(line);
+}
+#else
 #define deviceLog(text) FW_LOG(text)
 #define deviceLogf(...) FW_LOG(__VA_ARGS__)
+#endif
 #endif
 
 // funtions
@@ -378,8 +414,6 @@ JsonDocument &roundDistanceReports = timeSlicing.distanceReports;
 uint32_t &distanceReportRoundId = timeSlicing.distanceRoundId;
 JsonDocument &sniffReports = timeSlicing.sniffReports;
 JsonDocument &sniffCycleReports = timeSlicing.sniffCycleReports;
-JsonDocument &sniffAverageDistances = timeSlicing.sniffAverageDistances;
-JsonDocument &sniffAverageCounts = timeSlicing.sniffAverageCounts;
 JsonDocument &channelDiscoveryReports = timeSlicing.channelDiscoveryReports;
 uint8_t &true_channel = timeSlicing.discoveredChannel;
 
@@ -388,11 +422,11 @@ CalibrationMode calibrationMode;
 #include "mesh_channel_migration.h"
 MeshChannelMigration channelMigration;
 
-#if ROOT_FIRMWARE
-bool backendCommandBusy() { return timeSlicing.busy() || calibrationMode.active() || channelMigration.busy(); }
-#if CONNECTION_DEBUG
+#if (ROOT_FIRMWARE || NORMAL_CHANNEL_DEBUG) && CONNECTION_DEBUG
 bool connectionDebugAllowed() { return !timeSlicing.timingCritical(); }
 #endif
+#if ROOT_FIRMWARE
+bool backendCommandBusy() { return timeSlicing.busy() || calibrationMode.active() || channelMigration.busy(); }
 
 void printConnectionStatus()
 {
@@ -481,8 +515,8 @@ void serviceBackend()
   webSocket.loop();
   if (webSocket.isConnected())
   {
-    commandEvents.send(webSocket);
     publishNetworkStatus();
+    commandEvents.send(webSocket);
     static uint8_t lastReportedMeshChannel = 0;
     static uint8_t lastReportedRouterChannel = 0;
     if (uiChannelPending || lastReportedMeshChannel != meshChannel ||
@@ -611,7 +645,6 @@ void finishWebConf(TimeSlicingController::Phase phase)
     if(count) ranges[i][j]=ranges[j][i]=sum/count;
   }
   const auto coordinates=Coordinates::solve(ranges,present,TEST_BOARD_COUNT);
-  if (coordinates.valid && !webCancelled) { lastNodeCoordinates=coordinates; lastCoordinateRound=timeSlicing.roundId(); }
   bool complete = phase != TimeSlicingController::Phase::FAILED &&
                   !timeSlicing.roundCancelled();
   for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
@@ -623,6 +656,8 @@ void finishWebConf(TimeSlicingController::Phase phase)
     JsonDocument data;
     commandEnvelope(data, activeCommandId, "data");
     data["reporterMac"] = reporter;
+    data["layoutBootId"] = layoutBootId;
+    data["layoutRevision"] = layoutRevision + 1;
     data["status"] = !present ? "offline" : reportOk ? "ok" : "failed";
     JsonObject position=data["position"].to<JsonObject>();
     position["unit"]="m";
@@ -658,6 +693,12 @@ void finishWebConf(TimeSlicingController::Phase phase)
       }
     }
     queueCommandEvent(data);
+  }
+  complete = complete && coordinates.valid;
+  if (complete && !webCancelled) {
+    lastNodeCoordinates=coordinates; lastCoordinateRound=timeSlicing.roundId(); lastLayoutMeasured=false;
+    ++layoutRevision;
+    uiLayoutPending = true;
   }
   if (!complete && !webCancelled)
   {
@@ -932,6 +973,18 @@ bool configureSelfMacs()
   return true;
 }
 
+bool meshAccessPointReady()
+{
+  wifi_config_t config{};
+  const IPAddress expectedIP = mesh.getAPIP();
+  return WiFi.AP.started() && WiFi.AP.linkUp() &&
+         esp_wifi_get_config(WIFI_IF_AP, &config) == ESP_OK &&
+         config.ap.ssid_len == sizeof(MESH_PREFIX) - 1 &&
+         memcmp(config.ap.ssid, MESH_PREFIX, sizeof(MESH_PREFIX) - 1) == 0 &&
+         !config.ap.ssid_hidden && expectedIP != IPAddress(0, 0, 0, 0) &&
+         WiFi.softAPIP() == expectedIP;
+}
+
 bool restartMesh()
 {
   meshStarted = false;
@@ -941,10 +994,35 @@ bool restartMesh()
     return false;
   }
 
-  // painlessMesh defaults to silent logging. Its setter prints even for level 0.
   channelMigration.bridgeConfigured(false);
   mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT,
             WIFI_AP_STA, meshChannel);
+  // Wi-Fi can report AP start before its network interface is up.
+  constexpr unsigned long apReadyTimeoutMs = 250;
+  const unsigned long apWaitStarted = millis();
+  bool apReady = meshAccessPointReady();
+  while (!apReady && millis() - apWaitStarted < apReadyTimeoutMs)
+  {
+    delay(1);
+    apReady = meshAccessPointReady();
+  }
+  const unsigned long apReadyWaitMs = millis() - apWaitStarted;
+  if (!apReady)
+  {
+    deviceLogf("[CHANNEL] Mesh AP startup failed on channel %u after %lu ms (started=%u, link=%u, IP=%s)",
+               unsigned(meshChannel), apReadyWaitMs,
+               unsigned(WiFi.AP.started()), unsigned(WiFi.AP.linkUp()),
+               WiFi.softAPIP().toString().c_str());
+    stopMeshForMeasurement();
+    return false;
+  }
+  if (!mesh.ensureTcpListener())
+  {
+    deviceLogf("[MESH] TCP listener failed on channel %u port %u",
+               unsigned(meshChannel), unsigned(MESH_PORT));
+    stopMeshForMeasurement();
+    return false;
+  }
 #if ROOT_FIRMWARE
   if (channelMigration.routerChannel() == meshChannel)
   {
@@ -973,8 +1051,15 @@ bool restartMesh()
     return false;
   }
 
+#if MESH_REJOIN_DEBUG
+  using namespace painlessmesh::logger;
+  mesh.setDebugMsgTypes(ERROR | CONNECTION);
+  FW_LOG("[REJOIN] AP ready channel=%u radio=%d wait=%lu ms TCP port=%u listening",
+         unsigned(meshChannel), WiFi.channel(), apReadyWaitMs, unsigned(MESH_PORT));
+#endif
   meshStarted = true;
   deviceLogf("[CHANNEL] Mesh active on channel %u", meshChannel);
+  deviceLogf("[CHANNEL] Mesh AP verified locally at %s", WiFi.softAPIP().toString().c_str());
   deviceLogf("AP MAC: %s\n", WiFi.softAPmacAddress().c_str());
   deviceLogf("Station MAC: %s\n", WiFi.macAddress().c_str());
   deviceLogf("Mesh node ID: %u\n", mesh.getNodeId());
@@ -984,6 +1069,9 @@ bool restartMesh()
 
 void stopMeshForMeasurement()
 {
+#if MESH_REJOIN_DEBUG
+  if (meshStarted) mesh.setDebugMsgTypes(0);
+#endif
   meshStarted = false;
   mesh.stopForMeasurement();
   // AP off, station driver retained for ESP-NOW/sniffing. Avoid repeated
@@ -1097,14 +1185,21 @@ uint32_t lastMeshRecoveryMs = 0;
 void recoverUnavailableMesh()
 {
   const auto phase = timeSlicing.phase();
-  if (meshStarted || (phase != TimeSlicingController::Phase::IDLE &&
-                      phase != TimeSlicingController::Phase::FAILED) ||
+  if ((phase != TimeSlicingController::Phase::IDLE &&
+       phase != TimeSlicingController::Phase::FAILED) ||
       channelMigration.busy())
     return;
   const uint32_t now = millis();
   if (now - lastMeshRecoveryMs < 5000)
     return;
   lastMeshRecoveryMs = now;
+  if (meshStarted)
+  {
+    if (meshAccessPointReady())
+      return;
+    deviceLog("[MESH] Mesh AP went down; restoring it on the current channel");
+    stopMeshForMeasurement();
+  }
   deviceLog("[MESH] Retrying unavailable mesh");
   if (restartMesh())
     timeSlicing.meshRecovered();
@@ -1113,9 +1208,14 @@ void recoverUnavailableMesh()
 void setup()
 {
   Serial.begin(115200);
+  FW_LOG("[BOOT] %s board %02u, mesh boot channel %u", ROOT_FIRMWARE ? "Root" : "Normal",
+         unsigned(BOARD_NUMBER), unsigned(meshChannel));
 #if ROOT_FIRMWARE && CONNECTION_DEBUG
   WiFi.onEvent(connectionWifiEvent);
   connectionTrace("[NET] Connection diagnostics enabled; snapshots every 5 seconds; no credentials printed");
+#endif
+#if MESH_REJOIN_DEBUG
+  MeshRejoinTrace::begin();
 #endif
   beginModeIndicator();
 #if ROOT_FIRMWARE
@@ -1131,6 +1231,7 @@ void setup()
 #endif
   calibrationMode.begin();
 #if ROOT_FIRMWARE
+  layoutBootId = esp_random();
   for (uint8_t board = 1; board <= TEST_BOARD_COUNT; ++board)
   {
     macList.push_back(MacAddress{0x44, 0x33, 0x22, 0x11, 0x00, board});
@@ -1148,6 +1249,9 @@ void loop()
   // The controller runs before any optional operation, and immediately after
   // mesh callbacks (which can arm a round or deliver its final report).
   runTimeSlicing();
+#if MESH_REJOIN_DEBUG
+  if (!timeSlicing.timingCritical()) MeshRejoinTrace::drain(root_AP_mac, meshStarted);
+#endif
   if (meshStarted)
   {
     const uint32_t meshStartedMs = millis();
@@ -1170,6 +1274,13 @@ void loop()
   runTimeSlicing();
 
 #if ROOT_FIRMWARE
+  static uint32_t lastModelRevision = calibrationMode.modelRevision();
+  if(lastModelRevision != calibrationMode.modelRevision()) {
+    lastModelRevision = calibrationMode.modelRevision();
+    if(!lastLayoutMeasured) { lastNodeCoordinates={};lastCoordinateRound=0; }
+    ++layoutRevision;
+    uiLayoutPending = true;
+  }
   if (wsCommandPending && !timeSlicing.timingCritical())
   {
     wsCommandPending = false;
@@ -1206,5 +1317,8 @@ void loop()
       (!meshStarted && timeSlicing.phase() != TimeSlicingController::Phase::MEASURING) ||
           timeSlicing.phase() == TimeSlicingController::Phase::FAILED,
       mesh.broadcastIndicatorActive(), radioActivity);
+#if FIRMWARE_DEBUG
+  if (!timeSlicing.timingCritical()) FirmwareTrace::flush();
+#endif
   delay(1);
 }

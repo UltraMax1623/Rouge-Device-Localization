@@ -75,8 +75,7 @@ Unheard stations remain `null`. Reports retain the existing retries and ACKs.
 The root stores all distance maps, including its own, in the global
 `roundDistanceReports[reporterMAC][targetMAC]`; `distanceReportRoundId`
 identifies the current table. These are reset at each new configuration.
-The root prints one formatted table per configured reporter at collection completion
-or timeout, with full space-separated reporter MACs and target suffixes. `macDistances` holds each board's own map.
+The dashboard shows the returned readings and report status. `macDistances` holds each board's own map.
 Re-upload all boards together because distance fields are now required in
 the validated result messages.
 

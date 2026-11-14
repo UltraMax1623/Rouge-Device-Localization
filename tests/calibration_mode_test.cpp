@@ -60,15 +60,17 @@ struct TestMesh {
   void sendSingle(uint32_t, const String &) { ++singles; }
 } mesh;
 struct TimeSlicingController {
-  enum class Phase { IDLE, FAILED };
+  enum class Phase { IDLE, MEASURING, COLLECTING, FAILED };
   bool root = true, running = false;
+  Phase activePhase = Phase::MEASURING;
   uint32_t round = 0;
   bool isRoot() const { return root; }
   uint32_t rootNodeId() const { return 1; }
   bool busy() const { return running; }
   bool timingCritical() const { return false; }
   bool requestCancellation() { running=false; return true; }
-  Phase phase() const { return Phase::IDLE; }
+  Phase phase() const { return running ? activePhase : Phase::IDLE; }
+  String reportWaitMessage() const { return ""; }
   bool networkReadyForConfiguration(size_t) const { return !running && meshStarted; }
   bool beginCalibrationRound(const std::vector<MacAddress> &pair, uint32_t session) {
     assert(pair.size() == 2 && session); ++round; running = true; return true;
@@ -79,13 +81,14 @@ double A = -60, n = 2;
 JsonDocument roundReports;
 #include "../shared/calibration_mode.h"
 
-void acknowledge(CalibrationMode &mode, bool identified = true) {
+void acknowledge(CalibrationMode &mode, bool identified = true, uint32_t reportedSession = UINT32_MAX) {
   JsonDocument broadcast;
   assert(!deserializeJson(broadcast, mesh.lastBroadcast.c_str()));
   JsonDocument doc;
   doc["Action"] = "hello"; doc["Board"] = 2;
   doc["Revision"] = broadcast["Revision"].as<uint32_t>();
-  doc["Session"] = mode.session(); doc["Identified"] = identified;
+  doc["Session"] = reportedSession == UINT32_MAX ? mode.session() : reportedSession;
+  doc["Identified"] = identified;
   doc["SyncEpoch"] = broadcast["SyncEpoch"].as<uint32_t>();
   auto ap = doc["AP"].to<JsonArray>();
   for (uint8_t byte : AP_self_mac) ap.add(byte);
@@ -132,8 +135,13 @@ int main() {
   mode.update(); assert(mesh.broadcasts == idleBroadcasts + 1);
   ticks += 1001; mode.update(); assert(mesh.broadcasts == idleBroadcasts + 2); // Retry lost ACK.
   for (unsigned i = 0; i < 10; ++i) { ticks += 1001; mode.update(); }
-  assert(mesh.broadcasts == idleBroadcasts + 5); // Idle retries stop after five attempts.
+  assert(mesh.broadcasts == idleBroadcasts + 5); // Five quick attempts.
+  ticks += 15001; mode.update();
+  assert(mesh.broadcasts == idleBroadcasts + 6); // Idle recovery continues with backoff.
   acknowledge(mode); mode.update();
+  macList.push_back({0x44,0x33,0x22,0x11,0,3}); // Offline bystander.
+  assert(!mode.networkSynced());
+  assert(!mode.start(3)); // The selected board still must acknowledge the model.
   assert(mode.start(2)); assert(mode.identifying());
   assert(!mode.webControl("next")); assert(!timeSlicing.running); // No capture during identification.
   ticks += 7001; mode.update(); acknowledge(mode); mode.update();
@@ -143,6 +151,10 @@ int main() {
   assert(!timeSlicing.running && mesh.broadcasts == waitingBroadcasts); // Silent ten-minute placement wait.
   for (unsigned point = 1; point <= 5; ++point) {
     startCapture(mode);
+    assert(!mode.backendSafe());
+    timeSlicing.activePhase = TimeSlicingController::Phase::COLLECTING;
+    assert(mode.backendSafe()); // The radio window is over and reports can be shown.
+    timeSlicing.activePhase = TimeSlicingController::Phase::MEASURING;
     completeCapture(point); mode.update();
     assert(A == -60 && n == 2); // Fits remain provisional.
   }
@@ -154,9 +166,14 @@ int main() {
   assert(mode.webControl("save")); assert(std::fabs(A + 50) < 1e-9 && !testNvs.empty());
   mode.update(); assert(mode.active()); // Old peer revision cannot finish save.
   mesh.connected = false; ticks += 31000; mode.update();
-  assert(mode.active() && std::fabs(A + 50) < 1e-9); // Save survives a disconnected node.
+  assert(!mode.active() && strcmp(mode.outcome(), "partial") == 0);
+  assert(std::fabs(A + 50) < 1e-9); // Saved model survives pending distribution.
   mesh.connected = true;
-  acknowledge(mode); mode.update(); assert(!mode.active());
+  acknowledge(mode,true,42); // A current revision can still carry a stale calibration lock.
+  assert(!mode.modelAcknowledged(2));
+  acknowledge(mode); mode.update(); assert(!mode.networkSynced()); // Board 03 still pending.
+  macList.pop_back();
+  assert(mode.networkSynced());
   A = -60; n = 2;
   CalibrationMode reboot; reboot.begin(); assert(std::fabs(A + 50) < 1e-9);
   reboot.topologyChanged(); ticks += 1001; reboot.update(); acknowledge(reboot);
@@ -250,6 +267,8 @@ int main() {
   startCapture(diagnostic);
   for (unsigned window = 0; window < 5; ++window) {
     completeCapture(2, -70 + double(window), 2, window == 1 ? 7 : 1);
+    if (window == 2) roundReports["1"]["ObservedWindowMs"]["2"] = 5000;
+    if (window == 3) roundReports["1"]["PacketSpanMs"]["2"] = 5000;
     diagnostic.update();
     assert(A == oldA && n == oldN && testNvs == savedBeforeDiagnostic);
     if (window < 4) {
@@ -261,7 +280,7 @@ int main() {
   JsonDocument diagnosticResult; diagnostic.snapshot(diagnosticResult, true);
   unsigned validWindows=0;
   for (JsonVariant row : diagnosticResult["readings"].as<JsonArray>()) if (row["rootValid"].as<bool>()) ++validWindows;
-  assert(validWindows == 4 && diagnosticResult["distanceMeters"].as<double>() == 2);
+  assert(validWindows == 2 && diagnosticResult["distanceMeters"].as<double>() == 2);
   assert(diagnosticResult["radioChecks"]["2"]["rootSpreadDb"].as<double>() == 7);
   assert(strcmp(diagnostic.outcome(), "failed") == 0);
   timeSlicing.root = false;

@@ -23,3 +23,10 @@ __pycache__/
 
 # Installed UI dependencies
 node_modules/
+
+# Local measurement dataset and recovery journal
+/data/
+
+/ml/artifacts/
+/ml/esp32_dummy/generated/
+/outputs/

@@ -3,6 +3,7 @@
   const labels={conf:"Node configuration",sniff:"Wi-Fi target capture",status:"Network status",calibrate:"A/n calibration",diagnose:"Measurement diagnostics"};
   const terminal=byId("terminalOutput"), result=byId("commandResult");
   let online=false, locked=false, activeId=null, activeName="conf", sending=false, controlPending=false;
+  let backendConnected=false, networkStatus=null;
   let resultId=null, session=null;
   const seen=new Set();
   function element(tag,text,cls) {
@@ -54,31 +55,58 @@
     head.append(name,element("span",status,"result-badge "+(status==="ok"?"success":"")));
     card.append(head);panel.append(card);return card;
   }
-  function network(data) {
-    byId("networkFacts").replaceChildren();
+  function renderNetwork() {
+    const data=networkStatus;
+    const current=backendConnected&&online&&data&&!data.stale;
+    const connection=byId("connectionStatus");
+    connection.textContent=!backendConnected ? "Dashboard disconnected from backend"
+      : current ? "Root connected to backend"
+      : online ? "Root connected to backend · waiting for fresh mesh status"
+      : locked ? "Root unavailable · operation in progress" : "Root unavailable";
+    const factsPanel=byId("networkFacts"), nodesPanel=byId("overviewNodes");
+    factsPanel.replaceChildren();
+    nodesPanel.replaceChildren();
+    if(!data) {
+      factsPanel.append(element("span","Waiting for root telemetry"));
+      return;
+    }
+    const lastUpdate=new Date(data.receivedAt).toLocaleTimeString();
+    factsPanel.append(element("span",current ? `Updated ${lastUpdate}` : `Last known at ${lastUpdate} · awaiting fresh telemetry`,current?"":"network-stale"));
     const facts=[`Hotspot: ${data.ssid||"not associated"}`,`Root IP: ${data.ip||"unknown"}`,`Server: ${data.serverIP}:${data.serverPort}`,
       `Channels: mesh ${data.meshChannel} / hotspot ${data.routerChannel||"unknown"}`,`A: ${number(data.A,2)} / n: ${number(data.n,2)}`,
       `Model: ${data.modelSynced?"synchronized":"sync pending"}`,`Mode: ${data.activeCommand||data.mode||"idle"}`,`Wi-Fi: ${data.rssi} dBm`,
-      `Uptime: ${data.uptimeSeconds}s`, `Updated ${new Date().toLocaleTimeString()}`];
-    facts.forEach(text=>byId("networkFacts").append(element("span",text)));
-    byId("overviewNodes").replaceChildren();
-    const selected=byId("boardSelect").value;
-    byId("boardSelect").replaceChildren();
+      `Uptime: ${data.uptimeSeconds}s`];
+    facts.forEach(text=>factsPanel.append(element("span",text)));
     for(const node of data.nodes||[]) {
-      const tile=element("div",undefined,"overview-node");tile.dataset.board=String(node.board);
-      tile.append(element("strong",`${node.board===1?"Root":"Node"} ${String(node.board).padStart(2,"0")} · ${node.online?"Online":"Offline"}`),element("span",node.mac));
-      byId("overviewNodes").append(tile);
-      if(node.board!==1){const option=element("option",`Node ${String(node.board).padStart(2,"0")}`);option.value=node.board;byId("boardSelect").append(option);}
+      const root=node.board===1;
+      const state=current ? (node.online?"Online":"Offline") : root&&!online ? "Unavailable" : "Unknown";
+      const tile=element("div",undefined,"overview-node");tile.dataset.state=state.toLowerCase();
+      tile.append(element("strong",`${root?"Root":"Node"} ${String(node.board).padStart(2,"0")} · ${state}`),element("span",node.mac));
+      nodesPanel.append(tile);
     }
-    if([...byId("boardSelect").options].some(option=>option.value===selected))byId("boardSelect").value=selected;
+  }
+  function network(data) {
+    networkStatus=data;
+    window.nodeMap?.applyLayout?.(data);
+    renderNetwork();
+    const boardSelects=[byId("boardSelect"),byId("diagnosticBoardSelect")];
+    const selected=boardSelects.map(select=>select.value);
+    boardSelects.forEach(select=>select.replaceChildren());
+    for(const node of data.nodes||[]) {
+      if(node.board!==1)for(const select of boardSelects){const option=element("option",`Node ${String(node.board).padStart(2,"0")}`);option.value=node.board;select.append(option);}
+    }
+    boardSelects.forEach((select,index)=>{if([...select.options].some(option=>option.value===selected[index]))select.value=selected[index];});
   }
   function render(data) {
     if(data.kind==="network") {
-      network(data);
-      card("network","Connection and model",data.rootMac,"ok").append(table(["PROPERTY","VALUE"],[
+      const report=card("network","Connection and model",data.rootMac,"ok");
+      report.append(table(["PROPERTY","VALUE"],[
         ["Root IP",data.ip],["Backend",`${data.serverIP}:${data.serverPort}`],["Mesh / hotspot channel",`${data.meshChannel} / ${data.routerChannel}`],
-        ["A / n",`${number(data.A)} / ${number(data.n)}`],["Free memory",`${data.freeHeap} bytes`]
-      ]));return;
+        ["A / n",`${number(data.A)} / ${number(data.n)}`],["Model",data.modelSynced?"Synchronized":"Sync pending"],
+        ["Free memory",`${data.freeHeap} bytes`]
+      ]),table(["BOARD","MAC","STATUS AT REQUEST"],(data.nodes||[]).map(node=>[
+        String(node.board).padStart(2,"0"),node.mac,node.online?"Online":"Offline"
+      ])));return;
     }
     if(data.kind==="calibration"||data.kind==="diagnostic") {
       session=data;progress(data.message||"Processing");badge(data.state);
@@ -109,22 +137,26 @@
     if(data.kind==="target") {
       const item=card("target","Target position",data.targetMac,data.position?.status||"unavailable");
       item.append(element("div",`Position: ${positionText(data.position)} · Receivers: ${data.anchors} · Fit RMSE: ${number(data.position?.fitRmseMeters)} m`,"result-position"));
-      item.append(element("p",data.message,"result-progress"));return;
+      item.append(element("p",data.message,"result-progress"));
+      if(data.positionAlternatives?.length)item.append(table(["POSSIBLE POSITION"],data.positionAlternatives.map(p=>[positionText(p)])));
+      return;
     }
     if(data.reporterMac) {
       const title=data.reporterMac.endsWith(":01")?"Root 01":`Node ${data.reporterMac.slice(-2)}`;
       const item=card(data.reporterMac,title,data.reporterMac,data.status);
-      item.append(element("div",`Estimated position: ${positionText(data.position)}${data.kind==="sniff"?` · Valid capture cycles ${data.validCycles}/${data.cycles} · Channel ${data.channel}`:""}`,"result-position"));
-      item.append(table(["MEASURED TARGET","DISTANCE"],(data.distances||[]).map(row=>[row.targetMac,Number.isFinite(row.meters)?number(row.meters,2)+" m":row.status||"Unavailable"])));
+      const positionLabel = data.position?.status === "measured" ? "Measured position" : "Estimated position";
+      item.append(element("div",`${positionLabel}: ${positionText(data.position)}${data.kind==="sniff"?` · Valid windows ${data.windowNumbers?.join(", ")||"none"} (${data.validCycles}/${data.cycles}) · Channel ${data.channel}`:""}`,"result-position"));
+      if (data.distances?.length) item.append(table(["MEASURED TARGET","DISTANCE"],data.distances.map(row=>[row.targetMac,Number.isFinite(row.meters)?number(row.meters,2)+" m":row.status||"Unavailable"])));
     }
   }
   function receive(data) {
+    window.dispatchEvent(new CustomEvent("console-message",{detail:data}));
     if(data.type==="network_status"){network(data);return;}
     if(data.type==="command_lock") {
       const changed=locked!==data.locked;locked=data.locked;activeId=data.commandId;activeName=data.command||activeName;
       if(locked){block(activeId,activeName);if(changed)log(`${labels[activeName]||activeName} started. New commands locked.`);}
       else {controlPending=false;session=null;if(changed)log("Command finished. Controls unlocked.");}
-      controls();return;
+      controls();renderNetwork();return;
     }
     if(data.type==="control_ack") {
       controlPending=false;log(data.message||"Action acknowledged.","ROOT",!data.accepted);controls();return;
@@ -139,14 +171,15 @@
       else if(data.phase==="log")progress(data.message||"Processing...");
       else if(data.phase==="error")result.append(element("div",data.message||data.code,"result-alert"));
       else if(data.phase==="end") {
-        badge(data.status);progress(`Command ${data.status}. Review the results below.`);
+        badge(data.status);progress(data.message||`Command ${data.status}. Review the results below.`);
         byId("message").textContent=`${labels[data.command]||data.command}: ${data.status}`;
-        if(data.command==="calibrate"&&data.status==="success")window.nodeMap?.invalidateLayout();
       }
       return;
     }
     if(data.type==="device_connection") {
-      online=data.connected;byId("connectionStatus").textContent=online?"Root: online":"Root: offline / radio unavailable";
+      online=data.connected;
+      if(!online&&networkStatus)networkStatus={...networkStatus,stale:true};
+      renderNetwork();
       log(`Root ${online?"connected":"disconnected"}.`);controls();return;
     }
     if(data.type==="log")log(data.message||"",data.source||"ROOT");
@@ -154,8 +187,13 @@
   function connect() {
     const socket=new WebSocket(`${location.protocol==="https:"?"wss:":"ws:"}//${location.host}/ws?role=ui`);
     socket.onmessage=event=>{try{receive(JSON.parse(event.data));}catch(error){log(`Dashboard could not display an update: ${error.message}`,"UI",true);}};
-    socket.onopen=()=>log("Dashboard connected.");
-    socket.onclose=()=>{online=false;controls();byId("connectionStatus").textContent="Backend disconnected";setTimeout(connect,2000);};
+    socket.onopen=()=>{backendConnected=true;renderNetwork();log("Dashboard connected.");};
+    socket.onclose=()=>{
+      backendConnected=false;online=false;
+      if(networkStatus)networkStatus={...networkStatus,stale:true};
+      window.dispatchEvent(new CustomEvent("console-message",{detail:{type:"device_connection",connected:false}}));
+      controls();renderNetwork();setTimeout(connect,2000);
+    };
     socket.onerror=()=>log("Backend WebSocket error.","UI",true);
   }
   async function send(command,params={}) {
@@ -175,10 +213,36 @@
       log(`${action} requested. Waiting for root acknowledgement.`,"UI");
     }catch(error){controlPending=false;log(error.message,"BACKEND",true);controls();}
   }
-  byId("configureButton").onclick=()=>send("conf");byId("statusButton").onclick=()=>send("status");
-  byId("sniffForm").onsubmit=event=>{event.preventDefault();send("sniff",{mac:byId("targetMac").value,channel:Number(byId("targetChannel").value)});};
+  const layoutMode = byId("layoutMode");
+  function showLayoutFields() {
+    for (const [id, mode] of [["squareLayoutFields","square"],["manualLayoutFields","manual"]]) {
+      const fields = byId(id);
+      fields.hidden = fields.disabled = layoutMode.value !== mode;
+    }
+  }
+  layoutMode.onchange = showLayoutFields;
+  showLayoutFields();
+  byId("configureForm").onsubmit = event => {
+    event.preventDefault();
+    if (layoutMode.value === "square") {
+      send("conf", {layout: {mode: "square", side: Number(byId("squareSide").value)}});
+    } else if (layoutMode.value === "manual") {
+      const lengths = ["side0102","side0204","side0403","side0301","diagonal0104"].map(id => Number(byId(id).value));
+      send("conf", {layout: {mode: "manual", lengths}});
+    } else {
+      send("conf");
+    }
+  };
+  byId("statusButton").onclick=()=>send("status");
+  byId("sniffForm").onsubmit = event => {
+    event.preventDefault();
+    send("sniff", {
+      mac: byId("targetMac").value,
+      channel: Number(byId("targetChannel").value)
+    });
+  };
   byId("calibrateButton").onclick=()=>send("calibrate",{board:Number(byId("boardSelect").value)});
-  byId("diagnoseButton").onclick=()=>send("diagnose",{board:Number(byId("boardSelect").value),distance:Number(byId("diagnosticDistance").value)});
+  byId("diagnoseButton").onclick=()=>send("diagnose",{board:Number(byId("diagnosticBoardSelect").value),distance:Number(byId("diagnosticDistance").value)});
   for(const [id,name]of[["nextButton","next"],["saveButton","save"],["retryButton","retry"],["cancelButton","cancel"]])byId(id).onclick=()=>action(name);
   byId("remeasureButton").onclick=()=>action(`remeasure ${byId("remeasureDistance").value}`);
   byId("clearTerminalButton").onclick=()=>terminal.replaceChildren();

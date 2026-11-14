@@ -11,8 +11,11 @@ extern double n;
 struct DistanceAverage {
   double sum = 0;
   unsigned count = 0;
-  void add(double metres) {
-    if (std::isfinite(metres) && metres > 0) { sum += metres; ++count; }
+  bool add(double metres) {
+    if (!std::isfinite(metres) || metres <= 0) return false;
+    sum += metres;
+    ++count;
+    return true;
   }
   double mean() const {
     return count ? sum / count : std::numeric_limits<double>::quiet_NaN();

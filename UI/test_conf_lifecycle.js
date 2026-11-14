@@ -1,12 +1,14 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const path = require("node:path");
+const fs = require("node:fs"), os = require("node:os");
 const { WebSocket } = require("ws");
 
 async function run() {
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),"rouge-conf-test-"));
   const server = spawn(process.execPath, [path.join(__dirname, "server.js")], {
     cwd: __dirname,
-    env: { ...process.env, PORT: "0", COMMAND_TIMEOUT_MS: "500" },
+    env: { ...process.env, PORT: "0", COMMAND_TIMEOUT_MS: "500", COLLECTION_DATA_DIR:directory },
     stdio: ["ignore", "pipe", "pipe"]
   });
   const sockets = [];
@@ -29,7 +31,9 @@ async function run() {
       socket.once("error", reject);
     });
     const ui = await connect(`ws://127.0.0.1:${port}/ws?role=ui`);
-    const device = await connect(`ws://127.0.0.1:${port}/ws?role=device&token=local-device-token-change-me`);
+    const device = await connect(`ws://127.0.0.1:${port}/ws?role=device`);
+    const forbidden = await fetch(`http://127.0.0.1:${port}/`, {headers:{Origin:"http://elsewhere.invalid"}});
+    assert.equal(forbidden.status,403);
     const stateAcknowledged = new Promise(resolve => device.once("message", resolve));
     device.send(JSON.stringify({ type: "command_state", commandId: "", pendingEvents: false }));
     await stateAcknowledged;
@@ -102,16 +106,17 @@ async function run() {
     const thirdCommand = new Promise(resolve => device.once("message", raw => resolve(JSON.parse(raw.toString()))));
     await fetch(`http://127.0.0.1:${port}/api/command`, { method: "POST", body: "conf" });
     const third = await thirdCommand;
+    const stateRequested=new Promise(resolve=>device.once("message",raw=>resolve(JSON.parse(raw))));
     const timedOut = await unknown;
     assert.equal(timedOut.commandId, third.commandId);
+    assert.equal((await stateRequested).type,"command_state_request");
     const recovered = new Promise(resolve => ui.on("message", raw => {
       const event = JSON.parse(raw.toString());
       if (event.commandId === third.commandId && event.phase === "end") resolve(event);
     }));
-    device.send(JSON.stringify({ type: "command_event", commandId: third.commandId,
-      command: "conf", phase: "end", status: "success", sequence: 100 }));
-    assert.equal((await recovered).status, "success");
-    console.log("PASS conf lifecycle, ACK replay, and late completion after timeout");
+    device.send(JSON.stringify({type:"command_state",commandId:"",pendingEvents:false}));
+    assert.equal((await recovered).status, "interrupted");
+    console.log("PASS conf lifecycle, ACK replay, and reconciliation on a connected socket after timeout");
   } finally {
     clearTimeout(timer);
     for (const socket of sockets) socket.terminate();

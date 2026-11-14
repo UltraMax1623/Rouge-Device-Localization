@@ -16,7 +16,7 @@ from `shared/`, which uses the protocol headers in `root_node/`.
 | Root | `root_node/root_node.ino` | `0x01` | `44:33:22:11:00:01` | `54:44:33:22:11:01` |
 | Normal 2 | `normal_node/normal_node.ino` | `0x02` | `44:33:22:11:00:02` | Factory AP MAC |
 | Normal 3 | `normal_node/normal_node.ino` | `0x03` | `44:33:22:11:00:03` | Factory AP MAC |
-| Optional normal 4 (set count to 4) | `normal_node/normal_node.ino` | `0x04` | `44:33:22:11:00:04` | Factory AP MAC |
+| Normal 4 | `normal_node/normal_node.ino` | `0x04` | `44:33:22:11:00:04` | Factory AP MAC |
 
 Upload the root sketch once. For each normal board, change `BOARD_NUMBER` in
 its sketch before uploading. Never give two powered boards the same station
@@ -25,9 +25,20 @@ AP and station interfaces. Only the root receives a custom AP address.
 The approved `54` prefix is unicast; the originally requested `55` prefix is
 multicast and unsuitable for an interface MAC.
 
+## Dashboard
+
+Run `npm ci --prefix UI`, then `npm start --prefix UI`. Open
+`http://127.0.0.1:3000` on the backend PC. On Windows, you can also run
+`tools/Start Dashboard.cmd` after installing dependencies. If the PC IP
+changes, set the new address on the root with `serverIP <IPv4>`.
+
+The Data Collection tab shows three sample windows and RSSI estimates.
+Switch to `codex/data-collection` for live capture, CSV export, and training.
+Keep the complete `data/` directory in a separate backup.
+
 ## Commands on the root
 
-The current setup is three total boards: root 01 and normal nodes 02, 03.
+The current setup is four boards: root 01 and normal nodes 02, 03, and 04.
 `TEST_BOARD_COUNT` controls the root's station table. No round starts
 on a timer anymore. Open the root Serial Monitor at **115200 baud** with
 **Newline** or **Both NL & CR**, wait for all peers and three seconds of mesh
@@ -178,21 +189,7 @@ These tables are cleared for a new round and filled as results become
 available. Missing node reports remain absent; unheard targets have `null`
 distance and print `unavailable`, never zero metres. The root validates
 the sender identity, target keys, and distance consistency before accepting
-a report. When collection completes or times out, it prints one formatted
-table per configured board in station order, including itself. Headers use the full reporter MAC
-with spaces; targets use the final byte (01, 02, 03, 04). Missing reports are
-labelled `NO REPORT`. For example (illustrative distances):
-
-```text
-44 33 22 11 00 02 measures
-+--------+----------------+
-| Target | Distance (m)   |
-+--------+----------------+
-| 01     |         1.1885 |
-| 03     |         2.5000 |
-| 04     |    unavailable |
-+--------+----------------+
-```
+a report. The dashboard displays the returned readings and report status.
 
 The current three-board setup prints three tables with two target rows each.
 The four-board example above illustrates the optional larger setup. The root

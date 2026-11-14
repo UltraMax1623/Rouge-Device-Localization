@@ -11,6 +11,18 @@ function parseCommand(body, json = false) {
   }
   if (!value || !names.has(value.command)) throw new Error("Unknown command.");
   const params = value.params || {};
+  if (value.command === "conf" && params.layout !== undefined) {
+    const layout = params.layout;
+    const positive = number => Number.isFinite(number) && number > 0;
+    if (layout?.mode === "square" && positive(layout.side)) {
+      return {command: "conf", params: {layout: {mode: "square", side: layout.side}}};
+    }
+    if (layout?.mode === "manual" && Array.isArray(layout.lengths) &&
+        layout.lengths.length === 5 && layout.lengths.every(positive)) {
+      return {command: "conf", params: {layout: {mode: "manual", lengths: layout.lengths}}};
+    }
+    throw new Error("Enter a positive square side, or four positive sides and diagonal 01–04.");
+  }
   if (value.command === "sniff") {
     const mac = String(params.mac || "").replace(/[:-]/g, "").toUpperCase();
     const channel = params.channel === undefined ? 0 : params.channel;

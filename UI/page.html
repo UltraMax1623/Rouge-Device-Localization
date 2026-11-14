@@ -285,6 +285,10 @@
     .overview-nodes { display:flex;gap:10px;flex-wrap:wrap;flex:1 1 100%; }
     .overview-node { border:1px solid #dce6ee;border-radius:10px;padding:10px 14px;font-size:13px; }
     .overview-node span { display:block;color:#738498;font-size:11px;margin-top:4px; }
+    .overview-node[data-state="online"] { background:#e9f8f1;border-color:#b9e4d2;color:#125d4c; }
+    .overview-node[data-state="offline"] { background:#fff1ed;border-color:#efcbc0;color:#943e2e; }
+    .overview-node[data-state="unknown"], .overview-node[data-state="unavailable"],
+    .network-facts .network-stale { background:#fff5df;border-color:#ebd7a5;color:#775515; }
     .control-group { border-top:1px solid #e5edf4;margin-top:20px;padding-top:18px; }
     .control-group h3 { font-size:15px;margin:0 0 12px; }
     .control-group label { display:block;font-size:12px;color:#60758a;margin:12px 0 6px; }
@@ -294,6 +298,7 @@
     .result-badge.partial,.result-badge.cancelled { background:#fff1d5;color:#94620b; }
     .result-table td { overflow-wrap:anywhere; }
   </style>
+  <link rel="stylesheet" href="/assets/collection.css">
 </head>
 
 <body>
@@ -307,7 +312,7 @@
       <div>
         <strong>Network overview</strong>
         <div class="muted">ESP32-S3 root and configured mesh nodes</div>
-        <div id="connectionStatus" class="muted">S3: offline</div>
+        <div id="connectionStatus" class="muted" role="status">Connecting to backend…</div>
       </div>
 
       <div id="networkFacts" class="network-facts"><span>Waiting for root telemetry</span></div>
@@ -315,7 +320,113 @@
       <p id="message" class="muted" role="status">Connecting to backend...</p>
     </section>
 
-    <div class="columns">
+    <nav class="console-tabs" aria-label="Console section">
+      <button id="collectionTab" type="button">Data Collection</button>
+      <button id="operationsTab" class="selected" type="button">Configuration and calibration</button>
+    </nav>
+    <section id="collectionPanel" hidden>
+      <div class="collect-hero">
+        <div><h1>Data Collection Demo</h1><p>Place a target at a known point, capture three windows, and review the receiver readings.</p></div>
+        <span class="collect-tag">Sample data</span>
+      </div>
+      <button id="showSampleCapture" type="button">Show sample capture</button>
+      <div id="sampleCapture" class="collect-grid" hidden style="margin-top:16px">
+        <section class="card">
+          <h2>Review sample windows</h2>
+          <p>Target at (0.35, 0.65) m in a 1 m square. Each window represents 10 seconds.</p>
+          <div class="collect-scroll"><table class="collect-table">
+            <thead><tr><th scope="col">Window</th><th scope="col">Receiver</th><th scope="col">RSSI (dBm)</th><th scope="col">Packets</th></tr></thead>
+            <tbody id="sampleReadings"></tbody>
+          </table></div>
+          <p>Live collection is available on <code>codex/data-collection</code>.</p>
+        </section>
+        <section class="card"><h2>Collection node map</h2><div class="collect-legend"><span class="orange">◆ Actual target</span><span class="blue">◆ W1 / W2 / W3 estimates</span></div><div class="collect-actions" style="margin-top:12px"><button id="collectionMapFit" class="secondary" type="button">Fit sample positions</button><button id="collectionMapEstimates" class="secondary" type="button">Fit all estimates</button></div><div id="collectionNodeMap" class="map" style="margin-top:12px;height:490px"></div><p id="collectionMapStatus" class="muted">Illustrative 1 m square.</p><div id="collectionWindowEstimates" class="collect-estimates"></div><pre id="collectionMapDetails" style="white-space:pre-wrap">Select a position or estimate to inspect it.</pre><p class="muted">W1–W3 show RSSI baseline estimates calculated from sample readings.</p></section>
+      </div>
+    </section>
+
+    <div id="operationsPanel">
+      <section class="card command-controls">
+        <h2>Commands</h2>
+        <p id="commandAvailability" class="muted">Waiting for the root</p>
+        <div class="command-grid">
+          <form id="configureForm" class="command-tile tile-configure">
+            <span class="command-category">Mesh layout</span>
+            <h3>Configure nodes</h3>
+            <label for="layoutMode">Anchor positions</label>
+            <select id="layoutMode">
+              <option value="auto">Estimate from RSSI</option>
+              <option value="square">Measured square</option>
+              <option value="manual">Enter each side</option>
+            </select>
+            <fieldset id="squareLayoutFields" hidden disabled>
+              <legend>Measured square</legend>
+              <p>Place 02 and 03 next to 01, with 04 diagonally opposite 01.</p>
+              <label for="squareSide">Side length (m)</label>
+              <input id="squareSide" type="number" min="0" step="any" placeholder="1" required>
+            </fieldset>
+            <fieldset id="manualLayoutFields" hidden disabled>
+              <legend>Measured sides and diagonal (m)</legend>
+              <p>Place nodes in perimeter order 01 → 02 → 04 → 03. Measure the diagonal so the map can determine the shape.</p>
+              <label for="side0102">Side 01–02</label>
+              <input id="side0102" type="number" min="0" step="any" required>
+              <label for="side0204">Side 02–04</label>
+              <input id="side0204" type="number" min="0" step="any" required>
+              <label for="side0403">Side 04–03</label>
+              <input id="side0403" type="number" min="0" step="any" required>
+              <label for="side0301">Side 03–01</label>
+              <input id="side0301" type="number" min="0" step="any" required>
+              <label for="diagonal0104">Diagonal 01–04</label>
+              <input id="diagonal0104" type="number" min="0" step="any" required>
+            </fieldset>
+            <button id="configureButton" data-command type="submit">Configure nodes</button>
+          </form>
+          <section class="command-tile tile-status">
+            <span class="command-category">Connection</span>
+            <h3>Network status</h3>
+            <p>The overview updates automatically. Request a one-time report with the root's current connection and model details.</p>
+            <button id="statusButton" data-command class="secondary" type="button">Get network report</button>
+          </section>
+          <form id="sniffForm" class="command-tile tile-sniff">
+            <span class="command-category">Target capture</span>
+            <h3>Sniff a Wi-Fi device</h3>
+            <label for="targetMac">Target Wi-Fi MAC</label>
+            <input id="targetMac" placeholder="11:22:33:44:55:66" autocomplete="off" required>
+            <label for="targetChannel">Channel · 0 for automatic discovery</label>
+            <input id="targetChannel" type="number" min="0" max="13" value="0" required>
+            <p>Use an active 2.4 GHz device. Three capture cycles estimate its position.</p>
+            <button data-command type="submit">Sniff · 3 capture cycles</button>
+          </form>
+          <section class="command-tile tile-calibrate">
+            <span class="command-category">A/n model</span>
+            <h3>Calibrate A/n</h3>
+            <label for="boardSelect">Pair with normal board</label>
+            <select id="boardSelect"><option value="2">Node 02</option></select>
+            <p>Follow the 1–5 m placement prompts, then validate at 2.5 m. Review before saving.</p>
+            <button id="calibrateButton" data-command type="button">Start calibration</button>
+          </section>
+          <section class="command-tile tile-diagnose">
+            <span class="command-category">Repeatability</span>
+            <h3>Fixed-position diagnostics</h3>
+            <label for="diagnosticBoardSelect">Pair with normal board</label>
+            <select id="diagnosticBoardSelect"><option value="2">Node 02</option></select>
+            <label for="diagnosticDistance">Separation in metres</label>
+            <input id="diagnosticDistance" type="number" min="1" max="5" value="1">
+            <p>Keep the pair fixed for five captures and compare RSSI stability.</p>
+            <button id="diagnoseButton" data-command class="secondary" type="button">Run diagnostics</button>
+          </section>
+          <section class="command-tile tile-session">
+            <span class="command-category">Active operation</span>
+            <h3>Placement and review</h3>
+            <p id="sessionHint" class="muted">Placement and review actions appear during a session.</p>
+            <div class="buttons session-buttons"><button id="nextButton" type="button" disabled>Next placement</button><button id="saveButton" type="button" disabled>Save A/n</button><button id="retryButton" class="secondary" type="button" disabled>Retry calibration</button></div>
+            <label for="remeasureDistance">Remeasure distance in metres</label>
+            <div class="remeasure-row"><select id="remeasureDistance"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select><button id="remeasureButton" class="secondary" type="button" disabled>Remeasure</button></div>
+            <button id="cancelButton" class="cancel-button" type="button" disabled>Cancel active command</button>
+            <p>During capture, cancellation waits for the root to reconnect. A committed save cannot be undone.</p>
+          </section>
+        </div>
+      </section>
+      <div class="columns">
       <div class="left-column">
         <section class="card">
           <h2>Node layout</h2>
@@ -341,35 +452,7 @@
         </div>
         <div id="terminalOutput" aria-live="polite"></div>
       </aside>
-      <section class="card command-controls">
-        <h2>Commands</h2>
-        <p id="commandAvailability" class="muted">Waiting for the root</p>
-        <div class="buttons"><button id="configureButton" data-command type="button">Configure nodes</button><button id="statusButton" data-command class="secondary" type="button">Network status</button></div>
-        <form id="sniffForm" class="control-group">
-          <h3>Sniff a Wi-Fi device</h3>
-          <label for="targetMac">Target Wi-Fi MAC</label>
-          <input id="targetMac" placeholder="11:22:33:44:55:66" autocomplete="off" required>
-          <label for="targetChannel">Channel (0 = automatic discovery)</label>
-          <input id="targetChannel" type="number" min="0" max="13" value="0" required>
-          <button data-command type="submit">Sniff · 3 capture cycles</button>
-          <p class="muted">Use an active 2.4 GHz Wi-Fi device. A target position based on one or two receivers is an assumption.</p>
-        </form>
-        <div class="control-group">
-          <h3>Calibration &amp; diagnostics</h3>
-          <label for="boardSelect">Normal board</label><select id="boardSelect"><option value="2">Node 02</option></select>
-          <label for="diagnosticDistance">Diagnostic separation (metres)</label><input id="diagnosticDistance" type="number" min="1" max="5" value="1">
-          <div class="buttons"><button id="calibrateButton" data-command type="button">Calibrate A/n</button><button id="diagnoseButton" data-command class="secondary" type="button">Diagnose</button></div>
-          <p class="muted">Calibration prompts for 1–5 m placements, then validation at 2.5 m. Diagnostics keep the pair at one fixed distance for five captures.</p>
-        </div>
-        <div class="control-group">
-          <h3>Current session</h3><p id="sessionHint" class="muted">Placement and review actions appear during a session.</p>
-          <div class="buttons"><button id="nextButton" type="button" disabled>Next placement</button><button id="saveButton" type="button" disabled>Save A/n</button><button id="retryButton" class="secondary" type="button" disabled>Retry calibration</button></div>
-          <label for="remeasureDistance">Remeasure distance (metres)</label><select id="remeasureDistance"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
-          <button id="remeasureButton" class="secondary" type="button" disabled>Remeasure</button>
-          <button id="cancelButton" class="cancel-button" type="button" disabled>Cancel active command</button>
-          <p class="muted">During radio capture, a cancel request waits for the root to return to the network. A committed calibration save cannot be undone.</p>
-        </div>
-      </section>
+      </div>
       </div>
     </div>
   </main>
@@ -377,5 +460,6 @@
   <script src="/assets/cytoscape.js"></script>
   <script src="/assets/node-map.js"></script>
   <script src="/assets/dashboard.js"></script>
+  <script src="/assets/collection.js"></script>
 </body>
 </html>

@@ -55,14 +55,24 @@ int main() {
   assert(nextSniffCycle(1) == 2);
   assert(nextSniffCycle(2) == 3);
   assert(nextSniffCycle(3) == 0);  // No fourth cycle.
+  assert(acknowledgesPreviousCapture(42, 42, 1, 2));
+  assert(acknowledgesPreviousCapture(42, 42, 0, 1));
+  assert(!acknowledgesPreviousCapture(42, 0, 1, 2));
+  assert(!acknowledgesPreviousCapture(42, 41, 1, 2));
+  assert(!acknowledgesPreviousCapture(42, 42, 1, 3));
+  assert(!acknowledgesPreviousCapture(42, 42, 3, 0));
   DistanceAverage average;
   assert(std::isnan(average.mean()));
   average.add(1.0); average.add(3.0); average.add(5.0);
   assert(average.count == 3 && std::fabs(average.mean() - 3.0) < 1e-10);
   DistanceAverage partial;
-  partial.add(2.0); partial.add(std::numeric_limits<double>::quiet_NaN()); partial.add(4.0);
+  assert(partial.add(2.0));
+  assert(!partial.add(std::numeric_limits<double>::quiet_NaN()));
+  assert(partial.add(4.0));
   assert(partial.count == 2 && std::fabs(partial.mean() - 3.0) < 1e-10);
-  partial.add(0); partial.add(-1); partial.add(std::numeric_limits<double>::infinity());
+  assert(!partial.add(0));
+  assert(!partial.add(-1));
+  assert(!partial.add(std::numeric_limits<double>::infinity()));
   assert(partial.count == 2);
   assert(sniffChannel(-1, 1, 11) == 1);
   assert(sniffChannel(CHANNEL_DWELL_US - 1, 1, 11) == 1);

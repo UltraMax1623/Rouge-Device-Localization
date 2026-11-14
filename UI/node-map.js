@@ -3,7 +3,9 @@
   const status = document.getElementById("mapStatus");
   const details = document.getElementById("mapDetails");
   const reports = new Map();
-  let commandId = null;
+  let layoutKey = null;
+  let configureResult = null;
+  let pendingSniffEnd = false;
   let targetResult=null;
   const sniffReports=new Map();
   if (typeof cytoscape !== "function") {
@@ -33,7 +35,8 @@
   document.getElementById("mapZoomOut").onclick = () => graph.zoom(graph.zoom()/1.3);
   graph.on("tap", "node", event => {
     if(event.target.hasClass("target") && targetResult) {
-      details.textContent=`Target ${targetResult.targetMac}\nPosition: (${targetResult.position.x.toFixed(3)}, ${targetResult.position.y.toFixed(3)}) m\n${targetResult.message}`;
+      const p=event.target.data("coordinates");
+      details.textContent=`Target ${targetResult.targetMac}\nPosition: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\n${targetResult.message}`;
       return;
     }
     const report = reports.get(event.target.id());
@@ -81,44 +84,152 @@
     }
     graph.elements().remove(); graph.add(elements); fitMap();
     const error = [...reports.values()].find(r=>Number.isFinite(r.position?.fitRmseMeters))?.position.fitRmseMeters;
-    status.textContent = `${placed.size}/${reports.size} nodes positioned. ${placed.size===2 ? "Direction is arbitrary with two nodes. " : "Relative orientation; distances are RSSI estimates. "}` +
+    const measured = [...reports.values()].some(r=>r.position?.status === "measured");
+    const description = measured ? "Measured anchor layout. " :
+      placed.size===2 ? "Direction is arbitrary with two nodes. " : "Relative orientation; distances are RSSI estimates. ";
+    status.textContent = `${placed.size}/${reports.size} nodes positioned. ${description}` +
       (Number.isFinite(error) ? `Fit RMSE: ${error.toFixed(3)} m. ` : "") +
       (unavailable.length ? `No position: ${unavailable.join(", ")}` : "");
     details.textContent = "Select a node or connection for details. Scroll to zoom; drag the background to pan.";
   }
+  function applyConfigureDistances() {
+    if(configureResult?.status!=="success")return;
+    for(const report of configureResult.reports.values()) {
+      if(layoutKey===`${report.layoutBootId}:${report.layoutRevision}` && reports.has(report.reporterMac))
+        reports.get(report.reporterMac).distances=report.distances||[];
+    }
+  }
   window.nodeMap = {
-    invalidateLayout() {
-      reports.clear();sniffReports.clear();targetResult=null;graph.elements().remove();
-      status.textContent="Calibration changed. Run Configure again to establish anchor positions.";
+    resize() {graph.resize();fitMap();},
+    applyLayout(snapshot) {
+      if(snapshot.stale || !Number.isInteger(snapshot.layoutRevision))return;
+      const key=`${snapshot.layoutBootId}:${snapshot.layoutRevision}`;
+      if(key===layoutKey)return;
+      layoutKey=key;
+      reports.clear();
+      if(targetResult && key!==`${targetResult.layoutBootId}:${targetResult.layoutRevision}`) {
+        targetResult=null;sniffReports.clear();pendingSniffEnd=false;
+      }
+      for(const node of snapshot.nodes||[]) {
+        if(Number.isFinite(node.x)&&Number.isFinite(node.y))reports.set(node.mac,{
+          reporterMac:node.mac,status:snapshot.layoutSource,distances:[],
+          position:{x:node.x,y:node.y,status:snapshot.layoutSource,fitRmseMeters:snapshot.layoutFitRmseMeters}
+        });
+      }
+      applyConfigureDistances();
+      render();
+      if(!reports.size)status.textContent="Run Configure to establish anchor positions.";
+      if(pendingSniffEnd && targetResult) this.event({command:"sniff",phase:"end"});
     },
     event(event) {
     if(event.command === "sniff") {
-      if(event.phase === "start") { sniffReports.clear();targetResult=null;graph.elements(".target, .sniff").remove();status.textContent="Capturing target traffic; node positions use the last Configure result."; }
+      if(event.phase === "start") { sniffReports.clear();targetResult=null;pendingSniffEnd=false;graph.elements(".target, .sniff").remove();status.textContent="Capturing target traffic; the map shows the active anchor layout."; }
       if(event.phase === "data" && event.kind === "sniff") {
         sniffReports.set(event.reporterMac,event);
-        if(Number.isFinite(event.position?.x)&&!reports.has(event.reporterMac))reports.set(event.reporterMac,{...event,distances:[]});
       }
       if(event.phase === "data" && event.kind === "target")targetResult=event;
       if(event.phase === "end") {
-        if(reports.size)render();
+        pendingSniffEnd=Boolean(targetResult && layoutKey!==`${targetResult.layoutBootId}:${targetResult.layoutRevision}`);
+        if(pendingSniffEnd)return;
+        render();
+        const scale = graph.scratch("metreScale") || 80;
         if(Number.isFinite(targetResult?.position?.x)&&Number.isFinite(targetResult?.position?.y)) {
-          const target=targetResult.targetMac,scale=graph.scratch("metreScale")||80;
-          if(graph.getElementById(target).empty())graph.add({data:{id:target,label:`TARGET\n(${targetResult.position.x.toFixed(2)}, ${targetResult.position.y.toFixed(2)}) m`},classes:"target",position:{x:targetResult.position.x*scale,y:-targetResult.position.y*scale}});
+          const target=targetResult.targetMac;
+          if(graph.getElementById(target).empty())graph.add({data:{id:target,label:`TARGET\n(${targetResult.position.x.toFixed(2)}, ${targetResult.position.y.toFixed(2)}) m`,coordinates:targetResult.position},classes:"target",position:{x:targetResult.position.x*scale,y:-targetResult.position.y*scale}});
           for(const report of sniffReports.values()) {
             const value=report.distances?.[0]?.meters;
             if(Number.isFinite(value)&&!graph.getElementById(report.reporterMac).empty())graph.add({data:{id:`target-${report.reporterMac}`,source:report.reporterMac,target,label:`${value.toFixed(2)} m`},classes:"sniff"});
           }
-          fitMap();status.textContent=targetResult.message;
+          status.textContent=targetResult.message;
         } else status.textContent=targetResult?.message||"No target position available. Check traffic and Configure anchor positions.";
+        for(const [index,p] of (targetResult?.positionAlternatives||[]).entries()) {
+          graph.add({data:{id:`alternative-${index}`,label:`Possible target ${index+1}`,coordinates:p},
+            classes:"target",position:{x:p.x*scale,y:-p.y*scale}});
+        }
+        fitMap();
       }
       return;
     }
-    if(event.command && event.command!=="conf")return;
-    if(event.phase === "start") { commandId=event.commandId; reports.clear(); status.textContent="Measuring; previous layout shown until results arrive."; }
-    if(event.phase === "data") {
-      if(commandId!==event.commandId) { commandId=event.commandId; reports.clear(); }
-      reports.set(event.reporterMac,event);
+    if(event.command!=="conf")return;
+    if(event.phase==="start" || configureResult?.id!==event.commandId)
+      configureResult={id:event.commandId,status:null,reports:new Map()};
+    if(event.phase==="start")status.textContent="Configuring. The map shows the active anchor layout.";
+    if(event.phase==="data" && event.layoutRevision!=null)configureResult.reports.set(event.reporterMac,event);
+    if(event.phase==="end") {
+      configureResult.status=event.status;
+      applyConfigureDistances();
+      render();
+      if(event.status!=="success")status.textContent="Configure ended without applying a new layout.";
     }
-    if(event.phase === "end" && reports.size) render();
   } };
+})();
+
+// Collection uses the same Cytoscape map component with measured square anchors.
+(() => {
+  if(typeof cytoscape!=="function")return;
+  let graph=null;
+  const details=()=>document.getElementById("collectionMapDetails");
+  const scale=450;
+  function fit(all=false){if(!graph)return;graph.resize();graph.fit(all?graph.elements():graph.elements().not(".estimate"),55);graph.center();}
+  function estimate(window,L) {
+    const d=[1,2,3,4].map(board=>{
+      const receiver=window?.receivers?.find(r=>r.board===board);
+      const perReceiver=receiver?.A!=null&&receiver?.n!=null;
+      const a=perReceiver?receiver.A:window?.A,n=perReceiver?receiver.n:window?.n;
+      if(!Number.isFinite(a)||!Number.isFinite(n)||n<=0||!Number.isFinite(receiver?.mean))return NaN;
+      return 10**((a-receiver.mean)/(10*n));
+    });
+    if(!d.every(Number.isFinite))return null;
+    const x=(d[0]**2-d[1]**2+d[2]**2-d[3]**2+2*L*L)/(4*L);
+    const y=(d[0]**2-d[2]**2+d[1]**2-d[3]**2+2*L*L)/(4*L);
+    return Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null;
+  }
+  window.nodeMap=window.nodeMap||{};
+  window.nodeMap.collection=(container,setup,target,windows)=>{
+    if(container.offsetParent===null)return;
+    if(!graph) {
+      graph=cytoscape({container,layout:{name:"preset"},autoungrabify:true,minZoom:.005,maxZoom:8,style:[
+        {selector:"node",style:{label:"data(label)","background-color":"#c5d1dd",width:17,height:17,color:"#415972","font-size":11,"text-valign":"bottom","text-margin-y":7,"text-wrap":"wrap","text-max-width":125,"border-width":2,"border-color":"white"}},
+        {selector:"node.anchor",style:{shape:"round-rectangle","background-color":"#078a95",width:32,height:32,color:"#155666","font-weight":"bold"}},
+        {selector:"node.saved",style:{"background-color":"#179b66"}},
+        {selector:"node.test",style:{shape:"diamond","border-color":"#326dd5"}},
+        {selector:"node.actual",style:{shape:"diamond","background-color":"#ef9e1b",width:28,height:28,"border-color":"#bb740c","font-weight":"bold"}},
+        {selector:"node.estimate",style:{shape:"star","background-color":"#357ee6",width:27,height:27,"font-weight":"bold","z-index":10}},
+        {selector:"edge",style:{width:2,"line-color":"#9aafc0"}},
+        {selector:":selected",style:{"border-color":"#6737c1","border-width":4}}
+      ]});
+      graph.on("tap","node",event=>{
+        details().textContent=event.target.data("description")||event.target.data("label");
+      });
+      document.getElementById("collectionMapFit").onclick=()=>fit();
+      document.getElementById("collectionMapEstimates").onclick=()=>fit(true);
+    }
+    const L=setup.side_length_m;
+    const elements=[];
+    [[0,0],[1,0],[0,1],[1,1]].forEach(([u,v],i)=>elements.push({data:{id:`anchor-${i+1}`,label:`Sniffer 0${i+1}`,description:`Sniffer 0${i+1}: (${(u*L).toFixed(3)}, ${(v*L).toFixed(3)}) m · measured corner`},position:{x:u*scale,y:v*scale},classes:"anchor"}));
+    for(const [i,j] of [[1,2],[2,4],[4,3],[3,1]])elements.push({data:{id:`side-${i}-${j}`,source:`anchor-${i}`,target:`anchor-${j}`}});
+    elements.push({data:{id:target.id,label:target.id,
+      description:`Known target: (${target.u}, ${target.v}) m`},
+      position:{x:target.u*scale,y:target.v*scale},classes:"actual"});
+    const estimateList=document.getElementById("collectionWindowEstimates");
+    estimateList.replaceChildren();
+    let count=0;
+    for(const [index, window] of Object.entries(windows)) {
+        const p=estimate(window,L);
+        if(!p)continue;
+        count++;
+        const button=document.createElement("button");button.type="button";
+        button.textContent=`W${index} · ${target.id}: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m · baseline estimate`;
+        const description=`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${target.id}: (${target.u}, ${target.v}) m\nRSSI A/n baseline estimate; not a trained ML prediction.`;
+        button.onclick=()=>{details().textContent=description;};estimateList.append(button);
+        const overlapping=elements.find(e=>e.classes==="estimate"&&Math.hypot(e.position.x-p.x/L*scale,e.position.y-p.y/L*scale)<1e-7);
+        if(overlapping){overlapping.data.label+=` / W${index}`;overlapping.data.description+="\n"+description;continue;}
+        elements.push({data:{id:`estimate-${index}`,label:`W${index} · ${target.id}`,
+          description:`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${target.id}: (${target.u}, ${target.v}) m\nRSSI A/n baseline estimate; not a trained ML prediction. Overlapping markers retain their real coordinates.`},
+          position:{x:p.x/L*scale,y:p.y/L*scale},classes:"estimate"});
+    }
+    graph.elements().remove();graph.add(elements);fit();
+    document.getElementById("collectionMapStatus").textContent=`Sample ${L} m square · y increases downward · ${count}/3 per-window baseline estimates available. Fit all estimates to include estimates beyond this view. Overlapping estimates share coordinates.`;
+    if(count)details().textContent="Select W1, W2 or W3 for estimated coordinates.";
+  };
 })();
