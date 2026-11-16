@@ -422,6 +422,32 @@ CalibrationMode calibrationMode;
 #include "mesh_channel_migration.h"
 MeshChannelMigration channelMigration;
 
+constexpr uint32_t IDENTIFY_BLINK_MS = 2000;
+uint32_t identifyBlinkId = 0, identifyBlinkStarted = 0;
+
+bool boardIdentificationBlinking()
+{
+  return identifyBlinkId && millis() - identifyBlinkStarted < IDENTIFY_BLINK_MS;
+}
+
+void beginBoardIdentification(uint32_t id)
+{
+  identifyBlinkId = id;
+  identifyBlinkStarted = millis();
+}
+
+void sendBoardIdentification(uint32_t peer, const char *action, unsigned board, uint32_t id)
+{
+  JsonDocument doc;
+  doc["Mode"] = "identify";
+  doc["Action"] = action;
+  doc["Board"] = board;
+  doc["Id"] = id;
+  String payload;
+  serializeJson(doc, payload);
+  mesh.sendSingle(peer, payload);
+}
+
 #if (ROOT_FIRMWARE || NORMAL_CHANNEL_DEBUG) && CONNECTION_DEBUG
 bool connectionDebugAllowed() { return !timeSlicing.timingCritical(); }
 #endif
@@ -843,6 +869,27 @@ bool node_mssg_parser(const String &message, uint32_t from)
   if (strcmp(mode, "an") == 0)
     return calibrationMode.handle(doc, from);
 
+  if (strcmp(mode, "identify") == 0)
+  {
+    if (!doc["Id"].is<uint32_t>() || !doc["Board"].is<unsigned>()) return false;
+    const uint32_t id = doc["Id"].as<uint32_t>();
+    const unsigned board = doc["Board"].as<unsigned>();
+    if (!id) return false;
+#if ROOT_FIRMWARE
+    return strcmp(action, "done") == 0 && acknowledgeBoardIdentification(from, board, id);
+#else
+    if (strcmp(action, "blink") != 0 || from != timeSlicing.rootNodeId() ||
+        board != BOARD_NUMBER || timeSlicing.busy() || calibrationMode.active()) return false;
+    if (id != identifyBlinkId) {
+      if (boardIdentificationBlinking()) return false;
+      beginBoardIdentification(id);
+    } else if (!boardIdentificationBlinking()) {
+      sendBoardIdentification(from, "done", BOARD_NUMBER, id);
+    }
+    return true;
+#endif
+  }
+
   if (strcmp(mode, "conf") == 0)
   {
     if (strcmp(action, "prepare") == 0)
@@ -1094,6 +1141,9 @@ void runTimeSlicing(bool armOnly)
 
 bool userInputBusy()
 {
+#if ROOT_FIRMWARE
+  if (webCommandRunning) return true;
+#endif
   return timeSlicing.busy() || channelMigration.busy() ||
          timeSlicing.phase() == TimeSlicingController::Phase::FAILED;
 }
@@ -1316,7 +1366,7 @@ void loop()
       calibrationMode.identifying() ? String("scan") : currentMode,
       (!meshStarted && timeSlicing.phase() != TimeSlicingController::Phase::MEASURING) ||
           timeSlicing.phase() == TimeSlicingController::Phase::FAILED,
-      mesh.broadcastIndicatorActive(), radioActivity);
+      mesh.broadcastIndicatorActive(), radioActivity, boardIdentificationBlinking());
 #if FIRMWARE_DEBUG
   if (!timeSlicing.timingCritical()) FirmwareTrace::flush();
 #endif

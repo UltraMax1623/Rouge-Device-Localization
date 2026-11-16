@@ -1,11 +1,120 @@
 (() => {
   const byId=id=>document.getElementById(id);
-  const labels={conf:"Node configuration",sniff:"Wi-Fi target capture",status:"Network status",calibrate:"A/n calibration",diagnose:"Measurement diagnostics"};
+  const labels={autoscan:"Auto Scan",focus:"Focus",conf:"Node configuration",sniff:"Wi-Fi target capture",status:"Network status",calibrate:"A/n calibration",diagnose:"Measurement diagnostics",identify:"Identify board"};
   const terminal=byId("terminalOutput"), result=byId("commandResult");
+  const operationMode=byId("operationMode");
+  const boardSelect=byId("boardSelect");
+  const identifyBoard=byId("identifyBoard");
+  const defaultNodes=[1,2,3,4].map(board=>({board}));
   let online=false, locked=false, activeId=null, activeName="conf", sending=false, controlPending=false;
   let backendConnected=false, networkStatus=null;
   let resultId=null, session=null;
   const seen=new Set();
+  let queuedFocus=null;
+  let sendingFocus=null;
+  let autoLoop=false;
+  let focusedMac=null;
+  let resumingAutoScan=false;
+  let batchResults=[];
+  let shortlist=null;
+  let activeTarget=null;
+  let displayedTarget=null;
+  let expiryTimer;
+  const dismissedCandidates=new Set();
+  const sameMac=(left,right)=>Boolean(left && right &&
+    left.replace(/[:-]/g,"").toUpperCase()===right.replace(/[:-]/g,"").toUpperCase());
+  function showOperationMode() {
+    const auto = operationMode.value === "auto";
+    byId("sniffForm").hidden = auto;
+    byId("autoControls").hidden = !auto;
+    byId("autoScanShortlist").hidden = !auto;
+  }
+  function showShortlist(data) {
+    if (shortlist?.commandId!==data.commandId) dismissedCandidates.clear();
+    shortlist={...data,expiresAt:data.expiresAt || Date.now()+120000};
+    clearTimeout(expiryTimer);
+    expiryTimer=setTimeout(updateCandidateActions,Math.max(0,shortlist.expiresAt-Date.now()));
+    renderShortlist();
+  }
+  function renderShortlist() {
+    if (!shortlist) return;
+    const panel=byId("autoScanShortlist");
+    panel.replaceChildren(element("h2","Discovered devices"));
+    if(shortlist.truncated) panel.append(element("p","Showing a limited set of sightings.","muted"));
+    const candidates=shortlist.candidates.filter(candidate=>!dismissedCandidates.has(candidate.mac));
+    const list=element("ul",undefined,"candidate-list");
+    for(const candidate of candidates) {
+      const row=element("li",undefined,"candidate-row");
+      const info=element("div",undefined,"candidate-info");
+      info.append(element("strong",candidate.mac),element("span",`Channel ${candidate.channel} · ${candidate.count} packets`,"muted"));
+      const estimate=batchResults.find(item=>sameMac(item.mac,candidate.mac));
+      if (estimate) {
+        info.append(element("span",Number.isFinite(estimate.x) ? `Estimate (${estimate.x.toFixed(2)}, ${estimate.y.toFixed(2)}) m` : estimate.status,"muted"));
+        if (estimate.samples) {
+          info.append(element("span",`Packets at nodes 01–04: ${estimate.samples.map(count=>count ?? "—").join(" / ")}`,"muted"));
+        } else if (!Number.isFinite(estimate.x) && Number.isInteger(estimate.anchors)) {
+          info.append(element("span",`${estimate.anchors} receivers with usable samples`,"muted"));
+        }
+      }
+      const focus=element("button","Focus","secondary");
+      focus.type="button";
+      focus.dataset.candidateMac=candidate.mac;
+      focus.onclick=()=>requestFocus(candidate);
+      const remove=element("button","×","candidate-remove");
+      remove.type="button";
+      remove.setAttribute("aria-label",`Remove ${candidate.mac} from shortlist`);
+      remove.title="Remove from shortlist";
+      remove.onclick=()=>{
+        if (sameMac(queuedFocus?.mac,candidate.mac)) {
+          fetch("/api/focus-queue",{method:"DELETE"}).catch(error=>log(error.message,"UI",true));
+        }
+        dismissedCandidates.add(candidate.mac);
+        renderShortlist();
+        const next=[...panel.querySelectorAll(".candidate-remove")][Math.min(candidates.indexOf(candidate),candidates.length-2)];
+        (next || byId("autoScanButton")).focus();
+      };
+      row.append(info,focus,remove);
+      list.append(row);
+    }
+    if(candidates.length) panel.append(list);
+    else panel.append(element("p",shortlist.candidates.length ? "All devices removed from this list." : "No eligible devices found.","muted"));
+    const expiry=element("p","Shortlist expired. Run Auto Scan to refresh it.","muted");
+    expiry.id="shortlistExpiry";
+    panel.append(expiry);
+    updateCandidateActions();
+  }
+  function updateCandidateActions() {
+    if (!shortlist) return;
+    const expired=Date.now()>=shortlist.expiresAt;
+    byId("shortlistExpiry").hidden=!expired;
+    for (const button of byId("autoScanShortlist").querySelectorAll("[data-candidate-mac]")) {
+      const mac=button.dataset.candidateMac;
+      const inFocus=sameMac(focusedMac || activeTarget,mac) ||
+        (!autoLoop && !focusedMac && !activeTarget && sameMac(displayedTarget,mac));
+      const queued=sameMac(queuedFocus?.mac,mac);
+      const sendingRequest=sameMac(sendingFocus,mac);
+      button.textContent=queued ? "Focus queued" : sendingRequest ? "Sending Focus…" : inFocus ? "In focus" : "Focus";
+      button.classList.toggle("candidate-in-focus",inFocus && !queued && !sendingRequest);
+      button.disabled=expired || queued || sendingRequest || inFocus;
+      button.setAttribute("aria-label",`${button.textContent}: ${mac}`);
+    }
+  }
+  async function requestFocus(candidate) {
+    if (sendingFocus) return;
+    sendingFocus=candidate.mac;
+    updateCandidateActions();
+    try {
+      const response=await fetch("/api/command",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({command:"focus",params:{mac:candidate.mac,channel:candidate.channel,scanId:shortlist.commandId}})});
+      if (!response.ok) throw new Error(await response.text());
+    } catch (error) {
+      byId("autoScanStatus").textContent=error.message;
+      log(error.message,"BACKEND",true);
+    } finally {
+      sendingFocus=null;
+      updateCandidateActions();
+    }
+  }
   function element(tag,text,cls) {
     const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(cls)node.className=cls;return node;
   }
@@ -15,8 +124,17 @@
   }
   function controls() {
     document.querySelectorAll("[data-command]").forEach(button=>button.disabled=!online||locked||sending);
+    operationMode.disabled = locked || sending;
     byId("commandAvailability").textContent=!online ? "Root unavailable. Commands will be available after reconnection." : locked ? `${labels[activeName] || activeName} is active. New commands are locked.` : "Ready for one command at a time.";
+    byId("stopAutoScanButton").disabled=!(autoLoop || locked && ["autoscan","focus"].includes(activeName))||controlPending;
+    byId("autoScanButton").hidden=Boolean(focusedMac);
+    const resume=byId("resumeAutoScanButton");
+    resume.hidden=!focusedMac;
+    resume.disabled=!backendConnected || resumingAutoScan;
     const usable=locked&&online&&!controlPending;
+    const calibrating=locked&&activeName==="calibrate";
+    byId("calibrationReview").hidden=!calibrating;
+    byId("activeCommandActions").hidden=!locked||activeName==="identify";
     byId("nextButton").disabled=!usable||!session?.canNext;
     byId("saveButton").disabled=!usable||!session?.canSave;
     byId("retryButton").disabled=!usable||!session?.canReview;
@@ -66,6 +184,14 @@
     const factsPanel=byId("networkFacts"), nodesPanel=byId("overviewNodes");
     factsPanel.replaceChildren();
     nodesPanel.replaceChildren();
+    for(const node of data?.nodes?.length ? data.nodes : defaultNodes) {
+      const root=node.board===1;
+      const state=current ? (node.online?"Online":"Offline") : root&&!online&&backendConnected ? "Unavailable" : "Unknown";
+      const tile=element("div",undefined,"overview-node");tile.dataset.state=state.toLowerCase();
+      if(node.mac)tile.title=node.mac;
+      tile.append(element("strong",`${root?"Root":"Node"} ${String(node.board).padStart(2,"0")}`),element("span",state));
+      nodesPanel.append(tile);
+    }
     if(!data) {
       factsPanel.append(element("span","Waiting for root telemetry"));
       return;
@@ -77,25 +203,22 @@
       `Model: ${data.modelSynced?"synchronized":"sync pending"}`,`Mode: ${data.activeCommand||data.mode||"idle"}`,`Wi-Fi: ${data.rssi} dBm`,
       `Uptime: ${data.uptimeSeconds}s`];
     facts.forEach(text=>factsPanel.append(element("span",text)));
-    for(const node of data.nodes||[]) {
-      const root=node.board===1;
-      const state=current ? (node.online?"Online":"Offline") : root&&!online ? "Unavailable" : "Unknown";
-      const tile=element("div",undefined,"overview-node");tile.dataset.state=state.toLowerCase();
-      tile.append(element("strong",`${root?"Root":"Node"} ${String(node.board).padStart(2,"0")} · ${state}`),element("span",node.mac));
-      nodesPanel.append(tile);
-    }
   }
   function network(data) {
     networkStatus=data;
     window.nodeMap?.applyLayout?.(data);
     renderNetwork();
-    const boardSelects=[byId("boardSelect"),byId("diagnosticBoardSelect")];
-    const selected=boardSelects.map(select=>select.value);
-    boardSelects.forEach(select=>select.replaceChildren());
-    for(const node of data.nodes||[]) {
-      if(node.board!==1)for(const select of boardSelects){const option=element("option",`Node ${String(node.board).padStart(2,"0")}`);option.value=node.board;select.append(option);}
+    for (const select of [boardSelect,identifyBoard]) {
+      const selected=select.value;
+      select.replaceChildren();
+      for (const node of data.nodes||[]) {
+        if (node.board===1 && select===boardSelect) continue;
+        const option=element("option",`${node.board===1?"Root":"Node"} ${String(node.board).padStart(2,"0")}`);
+        option.value=node.board;
+        select.append(option);
+      }
+      if ([...select.options].some(option=>option.value===selected)) select.value=selected;
     }
-    boardSelects.forEach((select,index)=>{if([...select.options].some(option=>option.value===selected[index]))select.value=selected[index];});
   }
   function render(data) {
     if(data.kind==="network") {
@@ -152,10 +275,36 @@
   function receive(data) {
     window.dispatchEvent(new CustomEvent("console-message",{detail:data}));
     if(data.type==="network_status"){network(data);return;}
+    if(data.type==="focus_queue"){
+      const previous=queuedFocus;
+      const wasFocused=focusedMac;
+      queuedFocus=data.selection;
+      autoLoop=data.autoLoop;
+      focusedMac=data.focusedMac ?? null;
+      if (wasFocused && !focusedMac && autoLoop) {
+        activeTarget=null;
+        displayedTarget=null;
+        window.nodeMap?.clearFocus?.();
+        byId("autoScanStatus").textContent=locked && activeName==="focus"
+          ? "Auto Scan will resume after this capture."
+          : "Resuming Auto Scan when the mesh is ready.";
+      }
+      if (queuedFocus) byId("autoScanStatus").textContent="Focus queued for "+queuedFocus.mac;
+      else if (locked && activeName==="focus" && activeTarget) byId("autoScanStatus").textContent="Focus sent for "+activeTarget;
+      else if (previous) byId("autoScanStatus").textContent="Queued Focus cleared";
+      updateCandidateActions();controls();return;
+    }
     if(data.type==="command_lock") {
       const changed=locked!==data.locked;locked=data.locked;activeId=data.commandId;activeName=data.command||activeName;
+      if (locked && ["autoscan", "focus", "sniff"].includes(activeName)) {
+        operationMode.value = activeName === "sniff" ? "manual" : "auto";
+        if (activeName==="focus") activeTarget=data.targetMac ?? queuedFocus?.mac ?? sendingFocus;
+        showOperationMode();
+      }
+      if (locked && activeName === "calibrate") byId("calibrateCommand").open = true;
       if(locked){block(activeId,activeName);if(changed)log(`${labels[activeName]||activeName} started. New commands locked.`);}
-      else {controlPending=false;session=null;if(changed)log("Command finished. Controls unlocked.");}
+      else {controlPending=false;session=null;activeTarget=null;if(changed)log("Command finished. Controls unlocked.");}
+      updateCandidateActions();
       controls();renderNetwork();return;
     }
     if(data.type==="control_ack") {
@@ -164,10 +313,27 @@
     if(data.type==="command_event") {
       const key=`${data.commandId}:${data.sequence??JSON.stringify(data)}`;
       if(seen.has(key))return;seen.add(key);if(seen.size>2048)seen.delete(seen.values().next().value);
+      if(data.kind==="shortlist") {showShortlist(data);return;}
+      if(data.kind==="batch") {batchResults=data.results;renderShortlist();}
       block(data.commandId,data.command);
-      if(["conf","sniff"].includes(data.command))window.nodeMap?.event(data);
+      if(["autoscan","focus"].includes(data.command) && !queuedFocus && (data.phase==="end" || !controlPending))
+        byId("autoScanStatus").textContent=data.command==="focus" && autoLoop
+          ? "Resuming Auto Scan when the mesh is ready."
+          : data.message || (data.phase==="end" ? labels[data.command]+" · "+data.status : labels[data.command]);
+      if(["conf","sniff","autoscan","focus"].includes(data.command) && !(data.command==="focus" && autoLoop))
+        window.nodeMap?.event(data);
+      if (["sniff","autoscan","focus"].includes(data.command)) {
+        if (data.phase==="start") displayedTarget=null;
+        if (data.kind==="target" && data.command!=="sniff" && !(data.command==="focus" && autoLoop) &&
+            (Number.isFinite(data.position?.x) || data.positionAlternatives?.length))
+          displayedTarget=data.targetMac;
+        if (data.phase==="end") activeTarget=null;
+        updateCandidateActions();
+      }
       if(data.phase==="start"){badge("Running");progress(`Root acknowledged ${labels[data.command]||data.command}.`);}
-      else if(data.phase==="data")render(data);
+      else if(data.kind==="batch") {
+        progress(`Estimated ${data.results.filter(item=>Number.isFinite(item.x)).length} of ${data.results.length} device positions.`);
+      } else if(data.phase==="data")render(data);
       else if(data.phase==="log")progress(data.message||"Processing...");
       else if(data.phase==="error")result.append(element("div",data.message||data.code,"result-alert"));
       else if(data.phase==="end") {
@@ -202,7 +368,14 @@
       const response=await fetch("/api/command",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({command,params})});
       const text=await response.text();if(!response.ok)throw new Error(text);
       const accepted=JSON.parse(text);block(accepted.commandId,command);
-    }catch(error){log(error.message,"BACKEND",true);byId("message").textContent=error.message;}
+    }catch(error){
+      if (command==="focus") {
+        activeTarget=null;
+        byId("autoScanStatus").textContent=error.message;
+        updateCandidateActions();
+      }
+      log(error.message,"BACKEND",true);byId("message").textContent=error.message;
+    }
     finally{sending=false;controls();}
   }
   async function action(action) {
@@ -213,6 +386,28 @@
       log(`${action} requested. Waiting for root acknowledgement.`,"UI");
     }catch(error){controlPending=false;log(error.message,"BACKEND",true);controls();}
   }
+  byId("autoScanButton").onclick=()=>send("autoscan");
+  byId("resumeAutoScanButton").onclick=async()=>{
+    resumingAutoScan=true;controls();
+    try {
+      const response=await fetch("/api/auto-loop",{method:"PUT"});
+      if (!response.ok) throw new Error("Could not resume Auto Scan.");
+    } catch(error) {
+      byId("autoScanStatus").textContent=error.message;
+      log(error.message,"BACKEND",true);
+    } finally {
+      resumingAutoScan=false;controls();
+    }
+  };
+  byId("stopAutoScanButton").onclick=()=>{
+    byId("autoScanStatus").textContent="Stop pending";
+    if (locked && activeName==="focus") action("cancel");
+    else fetch("/api/auto-loop",{method:"DELETE"}).then(response=>{
+      if (!response.ok) throw new Error("Could not stop Auto Scan.");
+      byId("autoScanStatus").textContent=locked && activeName==="autoscan" ? "Stopping after this batch" : "Auto Scan stopped";
+    })
+      .catch(error=>log(error.message,"UI",true));
+  };
   const layoutMode = byId("layoutMode");
   function showLayoutFields() {
     for (const [id, mode] of [["squareLayoutFields","square"],["manualLayoutFields","manual"]]) {
@@ -234,6 +429,10 @@
     }
   };
   byId("statusButton").onclick=()=>send("status");
+  byId("identifyForm").onsubmit=event=>{
+    event.preventDefault();
+    send("identify",{board:Number(identifyBoard.value)});
+  };
   byId("sniffForm").onsubmit = event => {
     event.preventDefault();
     send("sniff", {
@@ -241,10 +440,12 @@
       channel: Number(byId("targetChannel").value)
     });
   };
-  byId("calibrateButton").onclick=()=>send("calibrate",{board:Number(byId("boardSelect").value)});
-  byId("diagnoseButton").onclick=()=>send("diagnose",{board:Number(byId("diagnosticBoardSelect").value),distance:Number(byId("diagnosticDistance").value)});
+  byId("calibrateButton").onclick=()=>send("calibrate",{board:Number(boardSelect.value)});
   for(const [id,name]of[["nextButton","next"],["saveButton","save"],["retryButton","retry"],["cancelButton","cancel"]])byId(id).onclick=()=>action(name);
   byId("remeasureButton").onclick=()=>action(`remeasure ${byId("remeasureDistance").value}`);
   byId("clearTerminalButton").onclick=()=>terminal.replaceChildren();
+  operationMode.onchange = showOperationMode;
+  showOperationMode();
+  renderNetwork();
   controls();connect();
 })();

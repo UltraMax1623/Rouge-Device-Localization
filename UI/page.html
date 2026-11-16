@@ -10,28 +10,40 @@
 
     body {
       margin: 0;
-      background: #f4f7fb;
-      color: #15263d;
-      font-family: Arial, sans-serif;
+      background: #eef2f3;
+      color: #142c32;
+      font-family: "Instrument Sans", system-ui, sans-serif;
     }
 
-    header {
-      padding: 20px 6%;
-      color: white;
-      background: #101a2b;
-      font-weight: bold;
-      letter-spacing: 1px;
+    .console-header {
+      background: #142c32;
+      color: #fff;
+    }
+
+    .console-header-inner {
+      max-width: 1600px;
+      margin: auto;
+      padding: 12px clamp(14px, 3vw, 40px);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px 24px;
     }
 
     main {
-      max-width: 1400px;
+      max-width: 1600px;
       margin: auto;
-      padding: 32px 24px;
+      padding: 22px clamp(14px, 3vw, 40px) 36px;
     }
 
     h1 { margin: 0 0 8px; }
     h2 { margin-top: 0; font-size: 18px; }
-    .muted { color: #7b899a; }
+    .muted { color: #536772; }
+    .console-brand { font-weight: 750; }
+    .console-header .console-tabs { margin: 0; }
+    .console-header .console-tabs button { background: transparent; color: #d5e3e7; }
+    .console-header .console-tabs .selected { background: #2d4850; color: #fff; }
 
     .card {
       margin: 20px 0;
@@ -61,7 +73,7 @@
       border: 0;
       border-radius: 9px;
       color: #082337;
-      background: linear-gradient(100deg, #35d0ba, #42a5ff);
+      background: #cdebe6;
       font-weight: bold;
       cursor: pointer;
     }
@@ -73,24 +85,111 @@
 
     button:disabled { opacity: .6; cursor: wait; }
 
-    .columns {
+    .workspace {
       display: grid;
-      grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr);
-      gap: 20px;
+      grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+      gap: 16px;
       align-items: start;
     }
 
-    .left-column {
+    .workspace-column {
       display: flex;
       flex-direction: column;
-      gap: 20px;
+      min-width: 0;
+      gap: 16px;
+    }
+
+    .workspace-column > .card, .workspace-top > .card {
+      margin: 0;
       min-width: 0;
     }
 
-    .left-column > .card,
-    .terminal-card {
-      margin: 0;
+    .map-card, .terminal-card {
+      height: clamp(360px, calc(100dvh - 345px), 660px);
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
     }
+
+    .workspace-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px 20px;
+      margin-bottom: 16px;
+    }
+
+    .workspace-bar h1 { margin: 0 0 4px; font-size: clamp(24px, 3vw, 32px); }
+    .workspace-bar p { margin: 0; font-size: 13px; }
+    .workspace-top {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .operation-bar {
+      display: flex;
+      align-items: start;
+      align-content: start;
+      flex-wrap: wrap;
+      gap: 12px 16px;
+      padding: 16px;
+      border: 1px solid #dbe5e7;
+      border-radius: 12px;
+      background: white;
+    }
+
+    .operation-bar form, #autoControls {
+      display: flex;
+      align-items: end;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .operation-bar label { display: grid; gap: 5px; font-size: 12px; font-weight: 650; }
+    .operation-bar input, .operation-bar select {
+      min-height: 39px;
+      border: 1px solid #b7c7cc;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #fff;
+      color: #142c32;
+      font-family: inherit;
+      font-size: 14px;
+    }
+
+    #targetChannel { width: 90px; }
+    #targetMac { width: 180px; }
+    #autoScanStatus { margin: 0; align-self: center; font-size: 13px; }
+    #autoScanShortlist:empty, #message:empty { display: none; }
+    #autoScanShortlist { max-height: 300px; overflow: auto; }
+    .candidate-list { list-style: none; padding: 0; margin: 0; }
+    .candidate-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 0; border-top: 1px solid #e5ebf2; }
+    .candidate-info { flex: 1 1 135px; overflow-wrap: anywhere; font-size: 13px; }
+    .candidate-info strong, .candidate-info span { display: block; }
+    .candidate-info span { margin-top: 3px; font-size: 12px; }
+    .candidate-row button { padding: 8px 10px; }
+    .candidate-row .candidate-in-focus { color: #125d4c; background: #d8f4e9; opacity: 1; }
+    .candidate-remove { background: #ffe7e5; color: #a12828; min-width: 34px; }
+    #shortlistExpiry { margin-bottom: 0; font-size: 13px; }
+    .network-overview { padding: 16px; }
+    .network-overview h2 { margin-bottom: 10px; }
+    .network-overview summary { cursor: pointer; font-size: 13px; }
+    .network-overview details[open] summary { margin-bottom: 10px; }
+    .network-overview details { margin-top: 12px; }
+    .map-card { padding: 0; overflow: hidden; }
+    .map-header { padding: 16px 18px 12px; }
+    .map-header-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .map-header h2 { margin: 0; }
+    .map-header p { margin: 10px 0 0; font-size: 13px; }
+    .map-header button { padding: 7px 10px; }
+    .map-scroll-control { display: inline-flex; align-items: center; gap: 5px; color: #536772; font-size: 12px; }
+    .map-view { position: relative; flex: 1; min-height: 0; background: #f3f7f7; }
+    .map-view .map { position: absolute; inset: 0; height: auto; border: 0; border-radius: 0; }
+    .map-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 20px; pointer-events: none; text-align: center; color: #536772; font-size: 14px; }
+    #mapDetails { margin: 0; padding: 12px 18px; max-height: 105px; overflow: auto; font: 12px/1.5 Consolas, "Courier New", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 
     .map {
       position: relative;
@@ -98,11 +197,7 @@
       overflow: hidden;
       border: 1px solid #e5ebf2;
       border-radius: 12px;
-      background-color: #f8fafc;
-      background-image:
-        linear-gradient(#eaf0f5 1px, transparent 1px),
-        linear-gradient(90deg, #eaf0f5 1px, transparent 1px);
-      background-size: 48px 48px;
+      background: #f3f7f7;
     }
 
     .connections {
@@ -187,8 +282,7 @@
     }
 
     #message {
-      min-height: 42px;
-      margin-top: 14px;
+      margin: 0;
       font-size: 13px;
       line-height: 1.5;
     }
@@ -198,7 +292,6 @@
     .terminal-card {
       display: flex;
       flex-direction: column;
-      min-height: 680px;
       padding: 0;
       overflow: hidden;
       background: #101820;
@@ -231,7 +324,6 @@
     #terminalOutput {
       flex: 1;
       min-height: 0;
-      max-height: 620px;
       overflow-y: auto;
       padding: 14px;
       color: #d8e2ea;
@@ -243,22 +335,23 @@
     }
 
     .terminal-line { margin: 0 0 5px; }
+    #terminalOutput:empty::before { content: "Waiting for log entries…"; color: #a8bac8; }
     .terminal-time { color: #7f94a5; }
     .terminal-source { color: #56c8b4; }
     .terminal-error { color: #ff8585; }
     .terminal-warn { color: #ffd37a; }
 
     @media (max-width: 850px) {
-      .columns { grid-template-columns: 1fr; }
-      .terminal-card { min-height: 400px; }
-      #terminalOutput { max-height: 400px; }
+      .workspace, .workspace-top { grid-template-columns: minmax(0, 1fr); }
+      .map-card { height: 420px; }
+      .terminal-card { height: 380px; }
     }
 
     @media (max-width: 500px) {
       main { padding: 24px 14px; }
       .card { padding: 16px; }
       .map { height: 350px; }
-      .terminal-card { padding: 0; }
+      .workspace .map-card, .workspace .terminal-card { padding: 0; }
     }
     #commandResult { min-height:120px; max-height:560px; overflow:auto; }
     .result-heading { display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px; }
@@ -278,13 +371,11 @@
     .result-table td:last-child { text-align:right;font-weight:700;white-space:nowrap; }
     .result-table tr:last-child td { border:0; }
     .result-alert { background:#fff2ec;color:#a14b27;padding:10px 14px;border-radius:8px;margin:10px 0;font-size:13px; }
-    .right-column { display:flex;flex-direction:column;gap:20px;min-width:0; }
-    .right-column > .card { margin:0; }
     .network-facts { display:flex;flex-wrap:wrap;gap:8px;flex:1 1 100%; }
     .network-facts span { background:#f0f5fa;border-radius:8px;padding:8px 12px;font-size:13px; }
-    .overview-nodes { display:flex;gap:10px;flex-wrap:wrap;flex:1 1 100%; }
-    .overview-node { border:1px solid #dce6ee;border-radius:10px;padding:10px 14px;font-size:13px; }
-    .overview-node span { display:block;color:#738498;font-size:11px;margin-top:4px; }
+    .overview-nodes { display:grid; grid-template-columns:repeat(auto-fit, minmax(94px, 1fr)); gap:8px; }
+    .overview-node { border:1px solid #dce6ee;border-radius:8px;padding:8px 10px;font-size:13px; }
+    .overview-node span { display:block;font-size:12px;margin-top:2px; }
     .overview-node[data-state="online"] { background:#e9f8f1;border-color:#b9e4d2;color:#125d4c; }
     .overview-node[data-state="offline"] { background:#fff1ed;border-color:#efcbc0;color:#943e2e; }
     .overview-node[data-state="unknown"], .overview-node[data-state="unavailable"],
@@ -302,56 +393,108 @@
 </head>
 
 <body>
-  <header>NODEWISE · DEVICE LOCALIZATION CONSOLE</header>
+  <header class="console-header">
+    <div class="console-header-inner">
+      <span class="console-brand">Nodewise</span>
+      <nav class="console-tabs" aria-label="Console section">
+        <button id="operationsTab" class="selected" type="button">Live workspace</button>
+        <button id="collectionTab" type="button">Data collection</button>
+      </nav>
+    </div>
+  </header>
 
   <main>
-    <h1>Project control</h1>
-    <p class="muted">Measure node distances, locate Wi-Fi targets, and calibrate the mesh.</p>
-
-    <section class="card summary">
-      <div>
-        <strong>Network overview</strong>
-        <div class="muted">ESP32-S3 root and configured mesh nodes</div>
-        <div id="connectionStatus" class="muted" role="status">Connecting to backend…</div>
-      </div>
-
-      <div id="networkFacts" class="network-facts"><span>Waiting for root telemetry</span></div>
-      <div id="overviewNodes" class="overview-nodes"></div>
-      <p id="message" class="muted" role="status">Connecting to backend...</p>
-    </section>
-
-    <nav class="console-tabs" aria-label="Console section">
-      <button id="collectionTab" type="button">Data Collection</button>
-      <button id="operationsTab" class="selected" type="button">Configuration and calibration</button>
-    </nav>
     <section id="collectionPanel" hidden>
-      <div class="collect-hero">
-        <div><h1>Data Collection Demo</h1><p>Place a target at a known point, capture three windows, and review the receiver readings.</p></div>
-        <span class="collect-tag">Sample data</span>
+      <div class="collect-hero"><div><h1>Build your RSSI dataset</h1><p class="muted">Read-only snapshot of a recorded three-window capture.</p></div><span id="collectConnection" class="collect-tag">Recorded snapshot</span></div>
+      <section class="card collect-session">
+        <h2>Wireless collection session</h2>
+        <div class="collect-fields"><label>Target Wi-Fi MAC<input disabled id="collectMac" placeholder="Hidden in snapshot" autocomplete="off"></label><label>Channel · 0 to fetch<input disabled id="collectChannel" type="number" min="0" max="13" value="6"></label><div><p class="muted">Target and channel stay fixed for this session.</p><button disabled id="fetchCollectionChannel" class="secondary" type="button">Fetch channel</button></div></div>
+        <label class="collect-check"><input disabled id="confirmCollectionLayout" type="checkbox"><span>I verified the proposed scaled coordinates with a tape, with sniffers 01 / 02 / 03 / 04 at upper-left / upper-right / lower-left / lower-right. All antennas are in the same plane.</span></label>
+        <div class="collect-actions"><button disabled id="startCollectionSession" type="button">Lock session</button><button disabled id="changeCollectionSession" class="secondary" type="button">Change target or channel</button></div>
+        <p class="muted">Keep target Wi-Fi traffic active. Channel discovery runs once per session and may take longer than a second.</p>
+      </section>
+      <section class="card">
+        <div class="collect-hero"><h2>Current setup</h2><span id="collectSplit" class="collect-tag">Training</span></div>
+        <div id="collectionSetup" class="setup-facts"></div>
+        <label class="collect-check"><input disabled id="confirmCollectionPlacement" type="checkbox"><span>I placed the target at the displayed coordinate and prepared this environment. The operator and laptop are away from the measurement area.</span></label>
+        <div class="collect-actions"><button disabled id="runCollection" type="button">Run Setup · 3 × 10 seconds</button><button disabled id="preflightCollection" type="button">Capture first window only</button><button disabled id="cancelCollection" class="collect-drop" type="button">Cancel capture</button></div>
+        <p class="muted">IDs advance only after approval is saved. After 25 training positions, change environment; after 10 environments, change square size. Unseen testing follows all training setups.</p>
+      </section>
+      <div class="collect-grid">
+        <section class="card"><h2>Review captured windows</h2><div id="collectionProgress" class="collect-info" role="status">Recorded windows from an approved setup.</div><div id="collectionReview" class="collect-scroll"></div><div class="collect-actions"><button disabled id="approveCollection" class="collect-ok" type="button">Approve and save 3 rows</button><button disabled id="retryCollection" type="button">Capture missing or failed windows</button><button disabled id="dropCollection" class="collect-drop" type="button">Drop and retry this setup</button></div><p id="collectionRequirements" class="muted"></p></section>
+        <section class="card"><h2>Collection node map</h2><div class="collect-legend"><span class="green">● Saved</span><span class="orange">◆ Actual target</span><span class="blue">◆ W1 / W2 / W3 estimates</span><span>○ Pending</span></div><div class="collect-actions" style="margin-top:12px"><button id="collectionMapFit" class="secondary" type="button">Fit planned positions</button><button id="collectionMapEstimates" class="secondary" type="button">Fit all estimates</button></div><div id="collectionNodeMap" class="map" style="margin-top:12px;height:490px"></div><p id="collectionMapStatus" class="muted">Measured square coordinates; outside points are 0.25 × side length from the boundary.</p><div id="collectionWindowEstimates" class="collect-estimates"></div><pre id="collectionMapDetails" style="white-space:pre-wrap">Select a position or estimate to inspect it.</pre><p class="muted">W1–W3 use the existing A/n distance baseline, not a trained ML model. Estimates may overlap or be unavailable. Known target coordinates are the CSV labels.</p></section>
       </div>
-      <button id="showSampleCapture" type="button">Show sample capture</button>
-      <div id="sampleCapture" class="collect-grid" hidden style="margin-top:16px">
-        <section class="card">
-          <h2>Review sample windows</h2>
-          <p>Target at (0.35, 0.65) m in a 1 m square. Each window represents 10 seconds.</p>
-          <div class="collect-scroll"><table class="collect-table">
-            <thead><tr><th scope="col">Window</th><th scope="col">Receiver</th><th scope="col">RSSI (dBm)</th><th scope="col">Packets</th></tr></thead>
-            <tbody id="sampleReadings"></tbody>
-          </table></div>
-          <p>Live collection is available on <code>codex/data-collection</code>.</p>
-        </section>
-        <section class="card"><h2>Collection node map</h2><div class="collect-legend"><span class="orange">◆ Actual target</span><span class="blue">◆ W1 / W2 / W3 estimates</span></div><div class="collect-actions" style="margin-top:12px"><button id="collectionMapFit" class="secondary" type="button">Fit sample positions</button><button id="collectionMapEstimates" class="secondary" type="button">Fit all estimates</button></div><div id="collectionNodeMap" class="map" style="margin-top:12px;height:490px"></div><p id="collectionMapStatus" class="muted">Illustrative 1 m square.</p><div id="collectionWindowEstimates" class="collect-estimates"></div><pre id="collectionMapDetails" style="white-space:pre-wrap">Select a position or estimate to inspect it.</pre><p class="muted">W1–W3 show RSSI baseline estimates calculated from sample readings.</p></section>
-      </div>
+      <section class="card"><div class="collect-foot"><div><h2>Your dataset</h2><p id="collectionSaved">0 approved rows</p><p id="collectionFile" class="muted">collection.csv</p></div><button disabled class="secondary" type="button">Download CSV for Excel</button></div><progress id="collectionTotalProgress" class="collect-progress" max="5550" value="0"></progress><p class="muted">3,750 training rows + 1,800 unseen test rows. This snapshot contains recorded readings from one setup.</p></section>
     </section>
 
     <div id="operationsPanel">
-      <section class="card command-controls">
+      <div class="workspace-bar">
+        <div>
+          <h1>Device localization</h1>
+          <p id="connectionStatus" class="muted" role="status">Connecting to backend…</p>
+        </div>
+      </div>
+      <div class="workspace-top">
+      <section class="card network-overview" aria-labelledby="networkOverviewTitle">
+        <h2 id="networkOverviewTitle">Network overview</h2>
+        <div id="overviewNodes" class="overview-nodes"></div>
+        <details>
+          <summary>Network details</summary>
+          <div id="networkFacts" class="network-facts"><span>Waiting for root telemetry</span></div>
+        </details>
+      </section>
+      <section class="card operation-bar" aria-label="Target capture controls">
+        <label for="operationMode">Operation mode
+          <select id="operationMode">
+            <option value="manual">Manual</option>
+            <option value="auto">Auto</option>
+          </select>
+        </label>
+        <form id="sniffForm">
+          <label for="targetMac">Target Wi-Fi MAC
+            <input id="targetMac" placeholder="11:22:33:44:55:66" autocomplete="off" required>
+          </label>
+          <label for="targetChannel"><span>Channel <span class="muted">(0 = auto)</span></span>
+            <input id="targetChannel" type="number" min="0" max="13" value="0" required>
+          </label>
+          <button data-command type="submit">Sniff</button>
+        </form>
+        <div id="autoControls" hidden>
+          <button id="autoScanButton" data-command type="button">Auto Scan</button>
+          <button id="resumeAutoScanButton" type="button" hidden>Clear focus &amp; resume Auto Scan</button>
+          <button id="stopAutoScanButton" type="button" class="secondary" disabled>Stop Auto Scan</button>
+          <p id="autoScanStatus" role="status">Ready to scan</p>
+        </div>
+      </section>
+      </div>
+      <div class="workspace">
+      <div class="workspace-column">
+        <section class="card map-card">
+          <div class="map-header">
+            <div class="map-header-row">
+              <h2>Node map</h2>
+              <div class="buttons">
+                <button id="mapZoomIn" class="secondary" type="button" aria-label="Zoom in">+</button>
+                <button id="mapZoomOut" class="secondary" type="button" aria-label="Zoom out">−</button>
+                <button id="mapFit" class="secondary" type="button">Fit map</button>
+                <label class="map-scroll-control"><input id="mapScrollZoom" type="checkbox"> Scroll to zoom</label>
+              </div>
+            </div>
+            <p id="mapStatus" class="muted" role="status">Waiting for anchor positions.</p>
+          </div>
+          <div class="map-view">
+            <div id="nodeMap" class="map"></div>
+            <div id="mapEmpty" class="map-empty">Run Configure nodes to place the anchors.</div>
+          </div>
+          <pre id="mapDetails">Relative coordinates in metres. Root is (0,0).</pre>
+        </section>
+      <section id="commands" class="card command-controls">
         <h2>Commands</h2>
+        <p id="message" class="muted" role="status"></p>
         <p id="commandAvailability" class="muted">Waiting for the root</p>
-        <div class="command-grid">
-          <form id="configureForm" class="command-tile tile-configure">
-            <span class="command-category">Mesh layout</span>
-            <h3>Configure nodes</h3>
+        <details name="commands" id="configureCommand" class="command-entry">
+          <summary>Configure nodes</summary>
+          <form id="configureForm" class="command-form">
             <label for="layoutMode">Anchor positions</label>
             <select id="layoutMode">
               <option value="auto">Estimate from RSSI</option>
@@ -380,78 +523,62 @@
             </fieldset>
             <button id="configureButton" data-command type="submit">Configure nodes</button>
           </form>
-          <section class="command-tile tile-status">
-            <span class="command-category">Connection</span>
-            <h3>Network status</h3>
+        </details>
+        <details name="commands" class="command-entry">
+          <summary>Network status</summary>
+          <div class="command-form">
             <p>The overview updates automatically. Request a one-time report with the root's current connection and model details.</p>
             <button id="statusButton" data-command class="secondary" type="button">Get network report</button>
-          </section>
-          <form id="sniffForm" class="command-tile tile-sniff">
-            <span class="command-category">Target capture</span>
-            <h3>Sniff a Wi-Fi device</h3>
-            <label for="targetMac">Target Wi-Fi MAC</label>
-            <input id="targetMac" placeholder="11:22:33:44:55:66" autocomplete="off" required>
-            <label for="targetChannel">Channel · 0 for automatic discovery</label>
-            <input id="targetChannel" type="number" min="0" max="13" value="0" required>
-            <p>Use an active 2.4 GHz device. Three capture cycles estimate its position.</p>
-            <button data-command type="submit">Sniff · 3 capture cycles</button>
+          </div>
+        </details>
+        <details name="commands" class="command-entry">
+          <summary>Identify board</summary>
+          <form id="identifyForm" class="command-form">
+            <label for="identifyBoard">Board number</label>
+            <select id="identifyBoard" required>
+              <option value="1">Root 01</option>
+              <option value="2">Node 02</option>
+              <option value="3">Node 03</option>
+              <option value="4">Node 04</option>
+            </select>
+            <button data-command type="submit">Blink for 2 seconds</button>
           </form>
-          <section class="command-tile tile-calibrate">
-            <span class="command-category">A/n model</span>
-            <h3>Calibrate A/n</h3>
+        </details>
+        <details name="commands" id="calibrateCommand" class="command-entry">
+          <summary>Calibrate A/n</summary>
+          <div class="command-form">
             <label for="boardSelect">Pair with normal board</label>
             <select id="boardSelect"><option value="2">Node 02</option></select>
             <p>Follow the 1–5 m placement prompts, then validate at 2.5 m. Review before saving.</p>
             <button id="calibrateButton" data-command type="button">Start calibration</button>
-          </section>
-          <section class="command-tile tile-diagnose">
-            <span class="command-category">Repeatability</span>
-            <h3>Fixed-position diagnostics</h3>
-            <label for="diagnosticBoardSelect">Pair with normal board</label>
-            <select id="diagnosticBoardSelect"><option value="2">Node 02</option></select>
-            <label for="diagnosticDistance">Separation in metres</label>
-            <input id="diagnosticDistance" type="number" min="1" max="5" value="1">
-            <p>Keep the pair fixed for five captures and compare RSSI stability.</p>
-            <button id="diagnoseButton" data-command class="secondary" type="button">Run diagnostics</button>
-          </section>
-          <section class="command-tile tile-session">
-            <span class="command-category">Active operation</span>
+          </div>
+          <div id="calibrationReview" class="command-form" hidden>
             <h3>Placement and review</h3>
             <p id="sessionHint" class="muted">Placement and review actions appear during a session.</p>
             <div class="buttons session-buttons"><button id="nextButton" type="button" disabled>Next placement</button><button id="saveButton" type="button" disabled>Save A/n</button><button id="retryButton" class="secondary" type="button" disabled>Retry calibration</button></div>
             <label for="remeasureDistance">Remeasure distance in metres</label>
             <div class="remeasure-row"><select id="remeasureDistance"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select><button id="remeasureButton" class="secondary" type="button" disabled>Remeasure</button></div>
-            <button id="cancelButton" class="cancel-button" type="button" disabled>Cancel active command</button>
-            <p>During capture, cancellation waits for the root to reconnect. A committed save cannot be undone.</p>
-          </section>
+          </div>
+        </details>
+        <div id="activeCommandActions" hidden>
+          <button id="cancelButton" class="cancel-button" type="button" disabled>Cancel active command</button>
+          <p class="muted">During capture, cancellation waits for the root to reconnect.</p>
         </div>
       </section>
-      <div class="columns">
-      <div class="left-column">
-        <section class="card">
-          <h2>Node layout</h2>
-          <p id="mapStatus" class="muted">Run Configure to estimate node positions.</p>
-          <div class="buttons"><button id="mapZoomIn" type="button">+</button><button id="mapZoomOut" type="button">-</button><button id="mapFit" type="button">Fit map</button></div>
-          <div id="nodeMap" class="map" style="margin-top:12px"></div>
-          <pre id="mapDetails" style="white-space:pre-wrap;overflow-wrap:anywhere">Relative coordinates in metres. Root is (0,0).</pre>
-        </section>
-
-        <section class="card" style="border-top:4px solid #17b7a4">
-          <h2>Command result</h2>
-          <p class="muted">Latest command output. Replaced when a new command is sent.</p>
-          <div id="commandResult" aria-live="polite" >No command results yet.</div>
-        </section>
-
       </div>
-
-      <div class="right-column">
+      <div class="workspace-column">
       <aside class="card terminal-card">
         <div class="terminal-header">
-          <h2>Log</h2>
+          <h2>Live logs</h2>
           <button id="clearTerminalButton" type="button">Clear</button>
         </div>
-        <div id="terminalOutput" aria-live="polite"></div>
+        <div id="terminalOutput" aria-live="polite" tabindex="0" aria-label="Live logs"></div>
       </aside>
+      <section class="card">
+        <h2>Command result</h2>
+        <div id="commandResult" aria-live="polite">No command results yet.</div>
+      </section>
+      <section id="autoScanShortlist" class="card" hidden></section>
       </div>
       </div>
     </div>

@@ -25,6 +25,7 @@ let deviceReady = false;
 let meshChannelStatus = null;
 let activeCommandId = null;
 let activeCommandName = "conf";
+let activeTargetMac = null;
 let networkStatus = null;
 let networkStatusTimer = null;
 function markNetworkStatusStale() {
@@ -48,11 +49,43 @@ function sendPendingControl() {
 setInterval(sendPendingControl, 2000).unref();
 let activeCommandTimer = null;
 function publishCommandLock() {
-  broadcast({ type: "command_lock", locked: Boolean(activeCommandId), commandId: activeCommandId, command: activeCommandName });
+  broadcast({ type: "command_lock", locked: Boolean(activeCommandId), commandId: activeCommandId, command: activeCommandName, targetMac: activeTargetMac });
 }
 
 const receivedEvents = new Set();
 let commandHistory = [];
+let autoShortlist = null;
+let lastAutoBatch = null;
+let queuedFocus = null;
+let autoLoop = false;
+let focusedMac = null;
+let autoNextAt = 0;
+const AUTO_RESTART_DELAY_MS = 3500;
+
+function publishFocusQueue(socket) {
+  const message = { type: "focus_queue", selection: queuedFocus, autoLoop, focusedMac };
+  if (socket) socket.send(JSON.stringify(message));
+  else broadcast(message);
+}
+
+function dispatchQueuedFocus() {
+  if (activeCommandId || !deviceReady || deviceSocket?.readyState !== WebSocket.OPEN ||
+      Date.now()<autoNextAt) return;
+  if (!queuedFocus && !autoLoop) return;
+  if (!networkStatus || networkStatus.stale || !networkStatus.modelSynced ||
+      !networkStatus.nodes?.length || !networkStatus.nodes.every(node => node.online)) return;
+  if (!queuedFocus) {
+    startCommand("autoscan",{});
+    return;
+  }
+  const selection = queuedFocus;
+  queuedFocus = null;
+  autoLoop = false;
+  focusedMac = selection.mac;
+  startCommand("focus", { ...selection, queued: true });
+  publishFocusQueue();
+}
+setInterval(dispatchQueuedFocus,500).unref();
 
 function finishTimedOutCommand() {
   if (!activeCommandId) return;
@@ -82,6 +115,7 @@ function ensureCommandReady() {
 }
 function startCommand(command,params,commandId=randomUUID()) {
   ensureCommandReady();commandHistory=[];activeCommandId=commandId;activeCommandName=command;pendingControl=null;
+  activeTargetMac=command==="focus" ? params.mac : null;
   publishCommandLock();activeCommandTimer=setTimeout(finishTimedOutCommand,COMMAND_TIMEOUT_MS);
   deviceSocket.send(JSON.stringify({type:"command",command,commandId,params}),error=>{
     if(error&&activeCommandId===commandId)finishTimedOutCommand();
@@ -126,11 +160,41 @@ const server = http.createServer((req, res) => {
       catch (error) { return sendText(res, 409, error.message); }
       if (pendingControl && action !== "cancel") return sendText(res, 409, "Waiting for the previous action acknowledgement.");
       pendingControl = { type: "command_control", commandId: activeCommandId, action, controlId: randomUUID() };
+      if (action === "cancel" && ["autoscan", "focus"].includes(activeCommandName) && queuedFocus) {
+        queuedFocus = null;
+        publishFocusQueue();
+      }
+      if (action === "cancel" && activeCommandName === "autoscan") {
+        autoLoop = false;
+        publishFocusQueue();
+      }
       sendPendingControl();
       res.writeHead(202, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "sent", controlId: pendingControl.controlId }));
     });
     return;
+  }
+
+  if (req.method === "DELETE" && req.url === "/api/focus-queue") {
+    queuedFocus = null;
+    publishFocusQueue();
+    return jsonReply(res, 200, { status: "cleared" });
+  }
+
+  if (req.method === "DELETE" && req.url === "/api/auto-loop") {
+    autoLoop = false;
+    queuedFocus = null;
+    publishFocusQueue();
+    return jsonReply(res, 200, { status: "stopped" });
+  }
+
+  if (req.method === "PUT" && req.url === "/api/auto-loop") {
+    queuedFocus = null;
+    focusedMac = null;
+    autoLoop = true;
+    publishFocusQueue();
+    dispatchQueuedFocus();
+    return jsonReply(res, 202, { status: "resuming" });
   }
 
   if (req.method === "POST" && req.url === "/api/command") {
@@ -151,6 +215,15 @@ const server = http.createServer((req, res) => {
       try { parsed = parseCommand(body, (req.headers["content-type"] || "").includes("application/json")); }
       catch (error) { return sendText(res, 400, error.message); }
       const { command, params } = parsed;
+      if (command === "focus") {
+        const candidate = autoShortlist?.commandId === params.scanId && Date.now() < autoShortlist.expiresAt &&
+          autoShortlist.candidates?.some(row => row.mac.replace(/[:-]/g, "").toUpperCase() === params.mac && row.channel === params.channel);
+        if (!candidate) return sendText(res, 409, "Select a candidate from a fresh Auto Scan.");
+        queuedFocus = params;
+        publishFocusQueue();
+        dispatchQueuedFocus();
+        return jsonReply(res, 202, { status: "queued" });
+      }
 
       if (!deviceSocket || deviceSocket.readyState !== WebSocket.OPEN || !deviceReady) {
         return sendText(res, 503, "Root is offline or restoring its command state. Wait for reconnection.");
@@ -159,6 +232,13 @@ const server = http.createServer((req, res) => {
         return sendText(res, 409, "A command is already running.");
       }
 
+      if (command === "autoscan") {
+        autoLoop = true;
+        focusedMac = null;
+        queuedFocus = null;
+        autoNextAt = 0;
+        publishFocusQueue();
+      }
       const result = startCommand(command,params);
       logToUi(`Sent command "${command}" (${result.commandId}) to ESP32-S3.`);
       return jsonReply(res,202,result);
@@ -203,14 +283,17 @@ webSockets.on("connection", (socket, request) => {
   if (role === "ui") {
     operators.add(socket);
     if (networkStatus) socket.send(JSON.stringify(networkStatus));
+    if (autoShortlist && !commandHistory.includes(autoShortlist)) socket.send(JSON.stringify(autoShortlist));
+    if (lastAutoBatch && !commandHistory.includes(lastAutoBatch)) socket.send(JSON.stringify(lastAutoBatch));
     for (const event of commandHistory) socket.send(JSON.stringify(event));
-    socket.send(JSON.stringify({ type: "command_lock", locked: Boolean(activeCommandId), commandId: activeCommandId, command: activeCommandName }));
+    socket.send(JSON.stringify({ type: "command_lock", locked: Boolean(activeCommandId), commandId: activeCommandId, command: activeCommandName, targetMac: activeTargetMac }));
     socket.send(JSON.stringify({
       type: "device_connection",
       connected: Boolean(
         deviceSocket && deviceSocket.readyState === WebSocket.OPEN && deviceReady
       )
     }));
+    publishFocusQueue(socket);
     if (meshChannelStatus) socket.send(JSON.stringify(meshChannelStatus));
 
     for (const entry of recentLogs) {
@@ -264,6 +347,7 @@ webSockets.on("connection", (socket, request) => {
           broadcast({ type: "device_connection", connected: true });
           sendPendingControl();
         }
+        dispatchQueuedFocus();
         return;
       }
 
@@ -293,16 +377,27 @@ webSockets.on("connection", (socket, request) => {
           receivedEvents.add(key);
           if (receivedEvents.size > 2048) receivedEvents.delete(receivedEvents.values().next().value);
         }
+        if (message.command === "autoscan" && message.kind === "shortlist") {
+          message.expiresAt = Date.now() + 120000;
+          autoShortlist = message;
+        }
+        if (message.command === "autoscan" && message.kind === "batch") lastAutoBatch = message;
         commandHistory.push(message);
         broadcast(message);
         clearTimeout(activeCommandTimer);
         activeCommandTimer = setTimeout(finishTimedOutCommand, COMMAND_TIMEOUT_MS);
         if (message.phase === "end") {
+          if (activeCommandName==="autoscan" || activeCommandName==="focus") {
+            autoNextAt=Date.now()+AUTO_RESTART_DELAY_MS;
+            if (activeCommandName==="autoscan" && message.status!=="success") autoLoop=false;
+            publishFocusQueue();
+          }
           pendingControl = null;
           activeCommandId = null;
           publishCommandLock();
           clearTimeout(activeCommandTimer);
           activeCommandTimer = null;
+          dispatchQueuedFocus();
         }
         return;
       }

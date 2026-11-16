@@ -3,8 +3,29 @@
 #include "measured_layout.h"
 
 // Root-only command handlers. Normal nodes continue using the existing mesh protocol.
+JsonDocument autoShortlist;
+String autoScanId;
+uint32_t autoShortlistAt = 0;
+uint8_t autoPass = 0, autoAttempt = 0, autoChannel = 0;
+bool autoDiscovering = false;
+bool autoWaitingForMesh = false;
+std::vector<TimeSlicingController::BatchTarget> autoBatch;
+uint32_t autoMeshWaitSince = 0;
+constexpr uint32_t AUTO_MESH_WAIT_MS = 25000;
+bool startNextAutoRound();
+unsigned identifyBoardNumber = 0;
+uint32_t identifyRequestId = 0, identifyPeer = 0, identifyRequestedAt = 0, identifyLastSend = 0;
+bool identifyAcknowledged = false;
+
+bool acknowledgeBoardIdentification(uint32_t peer, unsigned board, uint32_t id) {
+  if (!webCommandRunning || activeCommandName != "identify" || peer != identifyPeer ||
+      board != identifyBoardNumber || id != identifyRequestId) return false;
+  identifyAcknowledged = true;
+  return true;
+}
+
 inline bool webCommandSupported(const String &name) {
-  return name=="conf" || name=="sniff" || name=="status" || name=="calibrate" || name=="diagnose";
+  return name=="conf" || name=="sniff" || name=="autoscan" || name=="focus" || name=="status" || name=="calibrate" || name=="diagnose" || name=="identify";
 }
 
 void networkSnapshot(JsonDocument &doc) {
@@ -117,6 +138,25 @@ void dispatchWebCommand(const String &id,const String &name,JsonDocument &params
     JsonDocument data;networkSnapshot(data);commandEnvelope(data,id,"data");queueCommandEvent(data);
     endWebCommand("success");return;
   }
+  if (name=="identify") {
+    const unsigned board=params["board"] | 0u;
+    if (board<1 || board>macList.size()) {
+      rejectCommand(id,"INVALID_BOARD","Select a configured board.");return;
+    }
+    const uint32_t peer=calibrationMode.connectedNodeId(board);
+    if (board!=1 && !peer) {
+      rejectCommand(id,"BOARD_OFFLINE","The selected board is offline.");return;
+    }
+    if (!beginWebLifecycle(id)) return;
+    identifyBoardNumber=board;
+    do { identifyRequestId=esp_random(); } while (!identifyRequestId);
+    identifyPeer=peer;
+    identifyAcknowledged=false;
+    identifyRequestedAt=millis();
+    identifyLastSend=identifyRequestedAt-500;
+    if (board==1) beginBoardIdentification(identifyRequestId);
+    return;
+  }
   if (name=="conf" && !params["layout"].isNull()) {
     applyMeasuredLayout(id,params["layout"]);
     return;
@@ -126,6 +166,44 @@ void dispatchWebCommand(const String &id,const String &name,JsonDocument &params
     rejectCommand(id,"MESH_NOT_READY","Wait for the configured nodes and A/n acknowledgements.");return;
   }
   if(name=="conf") { startWebConf(id);return; }
+  if(name=="autoscan" || name=="focus") {
+    autoDiscovering = name=="autoscan";
+    autoWaitingForMesh = false;
+    autoBatch.clear();
+    autoPass=0; autoAttempt=0; autoChannel=0;
+    webSniffTarget={};
+    if (!autoDiscovering) {
+      const String selected=params["mac"] | "";
+      const String scan=params["scanId"] | "";
+      const unsigned selectedChannel=params["channel"] | 0u;
+      if (scan==autoScanId && millis()-autoShortlistAt<120000) {
+        for (JsonObjectConst row : autoShortlist.as<JsonArrayConst>()) {
+          if (selected != String(row["mac"] | "") || row["channel"] != selectedChannel) continue;
+          const auto parsed=UserCommand::parse((String("sniff ")+selected).c_str());
+          if(parsed.kind==UserCommand::Kind::Sniff) {
+            webSniffTarget=parsed.target;
+            autoChannel=selectedChannel;
+          }
+        }
+      }
+      if (!autoChannel && params["queued"] == true && selectedChannel>=1 && selectedChannel<=13) {
+        const auto parsed=UserCommand::parse((String("sniff ")+selected).c_str());
+        if (parsed.kind==UserCommand::Kind::Sniff &&
+            std::find(macList.begin(),macList.end(),parsed.target)==macList.end()) {
+          webSniffTarget=parsed.target;
+          autoChannel=selectedChannel;
+        }
+      }
+      if (!autoChannel) { rejectCommand(id,"STALE_CANDIDATE","Select a candidate from a fresh Auto Scan."); return; }
+    }
+    if (!beginWebLifecycle(id)) return;
+    if (autoDiscovering) { autoShortlist.clear(); autoScanId=id; }
+    if (!startNextAutoRound()) {
+      rejectCommand(id,"START_FAILED","Auto Scan requires four configured receivers and valid channels.");
+      endWebCommand("failed");
+    }
+    return;
+  }
   if(name=="sniff") {
     const String target=params["mac"] | "";
     const unsigned channel=params["channel"] | 0u;
@@ -185,6 +263,8 @@ void processWebControl() {
 void finishWebSniff() {
   char target[18];snprintf(target,sizeof(target),"%02X:%02X:%02X:%02X:%02X:%02X",
       webSniffTarget[0],webSniffTarget[1],webSniffTarget[2],webSniffTarget[3],webSniffTarget[4],webSniffTarget[5]);
+  const bool automatic=activeCommandName=="autoscan" || activeCommandName=="focus";
+  const unsigned expected=automatic ? 1 : TimeSliceProtocol::SNIFF_CYCLES;
   double ranges[Coordinates::MAX_NODES]={};unsigned validNodes=0,completeNodes=0;
   for(unsigned board=1;board<=TEST_BOARD_COUNT;++board) {
     const String mac=configuredMac(board);
@@ -192,7 +272,7 @@ void finishWebSniff() {
     data["kind"]="sniff";data["reporterMac"]=mac;data["targetMac"]=target;
     JsonArray windows=data["windowNumbers"].to<JsonArray>();
     DistanceAverage average;
-    for(unsigned window=1;window<=TimeSliceProtocol::SNIFF_CYCLES;++window) {
+    for(unsigned window=1;window<=expected;++window) {
       const JsonVariantConst report=sniffCycleReports[String(window)][mac];
       const JsonVariantConst range=report["Distances"][target];
       if(strcmp(report["Status"] | "", "ok")==0 && range.is<double>() &&
@@ -200,11 +280,11 @@ void finishWebSniff() {
     }
     const double mean=average.mean();
     const bool valid=std::isfinite(mean) && mean>0;
-    const bool complete=valid && average.count==TimeSliceProtocol::SNIFF_CYCLES;
+    const bool complete=valid && average.count==expected;
     if(valid) {ranges[board-1]=mean;++validNodes;}
     if(complete)++completeNodes;
     data["status"]=complete ? "ok" : valid ? "partial" : "unavailable";
-    data["validCycles"]=average.count;data["cycles"]=TimeSliceProtocol::SNIFF_CYCLES;
+    data["validCycles"]=average.count;data["cycles"]=expected;
     data["channel"]=timeSlicing.discoveredChannel;
     if(lastNodeCoordinates.points[board-1].valid) {
       data["position"]["x"]=lastNodeCoordinates.points[board-1].x;
@@ -242,7 +322,7 @@ void finishWebSniff() {
     JsonDocument error;commandEnvelope(error,activeCommandId,"error");error["code"]="TARGET_NOT_HEARD";
     error["message"]="No valid target averages. Check the Wi-Fi MAC, 2.4 GHz traffic, activity, and range.";queueCommandEvent(error);
   }
-  endWebCommand(webCancelled ? "cancelled" : completeNodes==TEST_BOARD_COUNT ? "success" : validNodes ? "partial" : "failed");
+  endWebCommand(webCancelled ? "cancelled" : completeNodes==TEST_BOARD_COUNT && (!automatic || targetPosition.point.valid) ? "success" : validNodes && !automatic ? "partial" : "failed");
 }
 
 
@@ -255,9 +335,195 @@ void publishCaptureFailure() {
   queueCommandEvent(event);
 }
 
+bool startNextAutoRound() {
+  const bool started=autoBatch.empty()
+      ? timeSlicing.beginAutoRound(macList,webSniffTarget,autoChannel,autoPass+autoAttempt)
+      : timeSlicing.beginAutoBatch(macList,autoBatch);
+  if(started) {
+    webSnapshot="";
+    JsonDocument event; commandEnvelope(event,activeCommandId,"log");
+    if (!autoBatch.empty()) event["message"]=String("Measuring ")+unsigned(autoBatch.size())+" shortlisted devices.";
+    else event["message"]=String(autoDiscovering ? "Discovering Wi-Fi devices" : "Capturing target on channel ")+
+        (autoDiscovering ? "" : String(autoChannel))+" · attempt "+String(autoAttempt+1)+"/2";
+    queueCommandEvent(event);
+    return true;
+  }
+  return false;
+}
+
+void waitForAutoMesh() {
+  autoWaitingForMesh = true;
+  autoMeshWaitSince = millis();
+  JsonDocument event;
+  commandEnvelope(event,activeCommandId,"log");
+  event["message"]="Waiting for all mesh nodes to rejoin and stabilize before the next round.";
+  queueCommandEvent(event);
+}
+
+void finishAutoBatch() {
+  JsonDocument event;
+  commandEnvelope(event,activeCommandId,"data");
+  event["kind"]="batch";
+  event["layoutBootId"]=layoutBootId;
+  event["layoutRevision"]=layoutRevision;
+  JsonArray results=event["results"].to<JsonArray>();
+  for (size_t i=0;i<autoBatch.size();++i) {
+    double ranges[Coordinates::MAX_NODES]={};
+    unsigned receivers=0;
+    JsonObject row=results.add<JsonObject>();
+    JsonArray samples=row["samples"].to<JsonArray>();
+    for (unsigned board=1;board<=TEST_BOARD_COUNT;++board) {
+      const auto report=sniffReports[configuredMac(board)];
+      const auto reading=report["BatchReadings"][i];
+      if (strcmp(report["Status"] | "", "ok")!=0) {
+        samples.add(nullptr);
+        continue;
+      }
+      const unsigned count=reading[0] | 0u;
+      samples.add(count);
+      if (count<3) continue;
+      const double metres=rssiToDistance(reading[1].as<double>(),report["A"],report["n"]);
+      if (std::isfinite(metres) && metres>0) { ranges[board-1]=metres; ++receivers; }
+    }
+    const auto position=Coordinates::locateTarget(lastNodeCoordinates,ranges,TEST_BOARD_COUNT);
+    const auto &mac=autoBatch[i].mac;
+    char address[18];
+    snprintf(address,sizeof(address),"%02X:%02X:%02X:%02X:%02X:%02X",mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+    row["mac"]=address;
+    row["anchors"]=receivers;
+    if (position.point.valid) {
+      row["x"]=position.point.x;
+      row["y"]=position.point.y;
+      row["status"]="Estimated";
+    } else row["status"]=!lastNodeCoordinates.valid ? "Configure nodes first" :
+        receivers<3 ? "Insufficient samples" : "Position unavailable";
+  }
+  queueCommandEvent(event);
+  endWebCommand("success");
+}
+
+void updateAutoScan() {
+  if (webCancelled) { if (!timeSlicing.busy()) endWebCommand("cancelled"); return; }
+  if (autoWaitingForMesh) {
+    if (timeSlicing.phase()!=TimeSlicingController::Phase::FAILED && !channelMigration.busy() &&
+        timeSlicing.networkReadyForConfiguration(macList.size()) && calibrationMode.networkSynced() &&
+        commandEvents.room(TEST_BOARD_COUNT+7)) {
+      autoWaitingForMesh = false;
+      if (!startNextAutoRound()) endWebCommand("failed", "Could not start the next round after the mesh recovered.");
+    } else if (millis()-autoMeshWaitSince >= AUTO_MESH_WAIT_MS) {
+      autoWaitingForMesh = false;
+      endWebCommand("failed", "The configured nodes did not rejoin and synchronize in time for the next round.");
+    }
+    return;
+  }
+  if (timeSlicing.busy()) {
+    const String waiting=timeSlicing.reportWaitMessage();
+    if(waiting.length() && !webSnapshot.length() && backendServiceAllowed() && commandEvents.room(TEST_BOARD_COUNT+8)) {
+      webSnapshot=waiting;
+      JsonDocument event;commandEnvelope(event,activeCommandId,"log");
+      event["message"]=waiting;queueCommandEvent(event);
+    }
+    return;
+  }
+  if (!autoBatch.empty()) {
+    if (commandEvents.room(2)) finishAutoBatch();
+    return;
+  }
+  String error=timeSlicing.captureFailure();
+  if (timeSlicing.phase()==TimeSlicingController::Phase::FAILED && !error.length()) error="Receiver mesh recovery failed.";
+  const auto &reports=autoDiscovering ? channelDiscoveryReports : sniffReports;
+  if (!error.length() && reports.size()!=TEST_BOARD_COUNT) error="Missing receiver reports.";
+  for(JsonPairConst entry : reports.as<JsonObjectConst>()) {
+    if(error.length()) break;
+    const auto report=entry.value();
+    const String mac=entry.key().c_str();
+    const auto counts=report["Samples"].as<JsonObjectConst>();
+    const auto ranges=report["Distances"].as<JsonObjectConst>();
+    if(strcmp(report["Status"] | "", "ok")!=0)
+      error=String("Receiver ")+mac+": "+(report["Reason"] | "radio capture failed");
+    else if((report["RadioElapsedMs"] | 0u)<timeSlicing.captureDurationUs()/1000)
+      error=String("Receiver ")+mac+" ended capture before the scheduled window closed.";
+    else if(!autoDiscovering && (counts.size()!=1 || ranges.size()!=1 ||
+        (*counts.begin()).value().as<unsigned>()<5 || (*ranges.begin()).value().isNull()))
+      error=String("Receiver ")+mac+" had insufficient target samples.";
+  }
+  if (error.length()) {
+    if (autoAttempt++==0) {
+      JsonDocument retry;commandEnvelope(retry,activeCommandId,"log");
+      retry["message"]=String("Retrying: ")+error;queueCommandEvent(retry);
+      waitForAutoMesh();
+      return;
+    }
+    JsonDocument event; commandEnvelope(event,activeCommandId,"error"); event["message"]=error;
+    queueCommandEvent(event); endWebCommand("failed"); return;
+  }
+  if (!autoDiscovering) { finishWebSniff(); return; }
+
+  struct Ranked { String mac; unsigned channel=0, count=0; };
+  std::array<Ranked,12> best{};
+  bool truncated=false;
+  for (JsonPairConst entry : reports.as<JsonObjectConst>()) {
+    const auto report=entry.value();
+    truncated |= report["Truncated"] | false;
+    for (JsonArrayConst row : report["Candidates"].as<JsonArrayConst>()) {
+      String mac=row[0] | "";
+      mac.replace(":", "");
+      const unsigned channel=row[1] | 0u, count=row[2] | 0u;
+      if (UserCommand::parse((String("sniff ")+mac).c_str()).kind!=UserCommand::Kind::Sniff || channel<1 || channel>13 || count<3) continue;
+      auto slot=best.end();
+      for (auto it=best.begin();it!=best.end();++it) if(it->mac==mac) {slot=it;break;}
+      if(slot==best.end()) {
+        slot=std::min_element(best.begin(),best.end(),[](const Ranked &a,const Ranked &b){return a.count<b.count;});
+        if(slot->count) truncated=true;
+      }
+      if (count>slot->count) {slot->mac=mac;slot->channel=channel;slot->count=count;}
+    }
+  }
+  std::stable_sort(best.begin(),best.end(),[](const Ranked &a,const Ranked &b){return a.count>b.count;});
+  if (!best[0].count && ++autoPass<3) {
+    autoAttempt=0;
+    waitForAutoMesh();
+    return;
+  }
+  autoShortlist.clear();
+  autoShortlistAt=millis();
+  auto list=autoShortlist.to<JsonArray>();
+  for(const auto &item:best) if(item.count) {
+    auto row=list.add<JsonObject>(); row["mac"]=item.mac; row["channel"]=item.channel; row["count"]=item.count;
+  }
+  JsonDocument event;commandEnvelope(event,activeCommandId,"data");event["kind"]="shortlist";
+  event["candidates"].set(list);event["truncated"]=truncated;
+  queueCommandEvent(event);
+  if (!best[0].count) {
+    finishAutoBatch();
+    return;
+  }
+  for (const auto &item:best) if (item.count) {
+    const auto parsed=UserCommand::parse((String("sniff ")+item.mac).c_str());
+    autoBatch.push_back({parsed.target,static_cast<uint8_t>(item.channel)});
+  }
+  autoDiscovering=false;
+  waitForAutoMesh();
+}
+
 void updateWebCommand() {
   processWebControl();
   if(!webCommandRunning)return;
+  if (activeCommandName=="identify") {
+    const uint32_t now=millis();
+    if (identifyAcknowledged || (identifyBoardNumber==1 && !boardIdentificationBlinking())) {
+      char message[48];
+      snprintf(message,sizeof(message),"Board %02u blinked for 2 seconds.",identifyBoardNumber);
+      endWebCommand("success",message);
+    } else if (now-identifyRequestedAt>=6000) {
+      endWebCommand("failed","The selected board did not confirm the blink.");
+    } else if (identifyBoardNumber!=1 && now-identifyLastSend>=500) {
+      identifyLastSend=now;
+      sendBoardIdentification(identifyPeer,"blink",identifyBoardNumber,identifyRequestId);
+    }
+    return;
+  }
+  if(activeCommandName=="autoscan" || activeCommandName=="focus") { updateAutoScan(); return; }
   const auto phase=timeSlicing.phase();
   if(activeCommandName=="conf" || activeCommandName=="sniff") {
     if(timeSlicing.busy()) {

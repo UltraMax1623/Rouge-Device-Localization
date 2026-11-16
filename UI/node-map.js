@@ -2,44 +2,101 @@
 (() => {
   const status = document.getElementById("mapStatus");
   const details = document.getElementById("mapDetails");
+  const emptyState = document.getElementById("mapEmpty");
+  const scrollZoom = document.getElementById("mapScrollZoom");
   const reports = new Map();
   let layoutKey = null;
   let configureResult = null;
   let pendingSniffEnd = false;
   let targetResult=null;
+  let batchResult=null;
   const sniffReports=new Map();
   if (typeof cytoscape !== "function") {
     status.textContent = "Map library unavailable. Run npm install in UI and restart the backend.";
+    emptyState.hidden = true;
+    scrollZoom.disabled = true;
     window.nodeMap = { event() {} }; return;
   }
+  const antenna = document.createElement("canvas");
+  antenna.width = antenna.height = 96;
+  const icon = antenna.getContext("2d");
+  icon.scale(3, 3);
+  icon.strokeStyle = "#ffffff";
+  icon.fillStyle = "#ffffff";
+  icon.lineWidth = 1.8;
+  icon.lineCap = "round";
+  icon.beginPath();
+  icon.moveTo(10, 25);
+  icon.lineTo(16, 14);
+  icon.lineTo(22, 25);
+  icon.moveTo(13, 21);
+  icon.lineTo(19, 21);
+  icon.stroke();
+  for (const radius of [5, 9]) {
+    for (const angle of [0, Math.PI]) {
+      icon.beginPath();
+      icon.arc(16, 12, radius, angle - 0.6, angle + 0.6);
+      icon.stroke();
+    }
+  }
+  icon.beginPath();
+  icon.arc(16, 12, 1.75, 0, Math.PI * 2);
+  icon.fill();
+  const antennaImage = antenna.toDataURL();
   const graph = cytoscape({
     container: document.getElementById("nodeMap"), elements: [],
     layout: { name: "preset" }, autoungrabify: true,
-    minZoom: 0.02, maxZoom: 8,
+    minZoom: 0.02, maxZoom: 8, userZoomingEnabled: scrollZoom.checked,
     style: [
       { selector: "node", style: { label: "data(label)", "background-color": "#319cf0",
         color: "#15263d", "text-valign": "bottom", "text-margin-y": 8,
         "font-size": 12, "text-wrap": "wrap", "text-max-width": 130,
         width: 38, height: 38, "border-width": 3, "border-color": "#fff" } },
-      { selector: "node.root", style: { "background-color": "#17b7a4", width: 48, height: 48 } },
+      { selector: "node.anchor", style: {
+        shape: "round-rectangle",
+        "background-image": antennaImage,
+        "background-width": "84%",
+        "background-height": "84%",
+        "background-color": "#236eaa",
+        "border-width": 2
+      } },
+      { selector: "node.root", style: { "background-color": "#15796d", width: 44, height: 44 } },
       { selector: "node.target", style: { "background-color": "#ffb020", shape:"diamond", width:42,height:42 } },
+      { selector: "node.batch-target", style: {
+        width: 24, height: 24, "border-width": 2, "border-color": "#995400",
+        "z-index": 2, "font-weight": 700, "text-background-color": "#ffffff",
+        "text-background-opacity": 0.9, "text-background-padding": 2
+      } },
       { selector: "edge.sniff", style: { "line-color":"#d8a244", "line-style":"dashed" } },
       { selector: "edge", style: { label: "data(label)", width: 2, "line-color": "#9eafc2",
         "font-size": 11, "text-background-color": "#fff", "text-background-opacity": 0.9 } },
       { selector: ":selected", style: { "border-color": "#ffb020", "line-color": "#ffb020" } }
     ]
   });
-  function fitMap() { graph.fit(undefined,65); if(graph.zoom()>1.6) graph.zoom(1.6); graph.center(); }
+  function fitMap() {
+    emptyState.hidden = graph.elements().nonempty();
+    if (emptyState.hidden) {
+      graph.fit(undefined, 48);
+      if (graph.zoom() > 1.6) graph.zoom(1.6);
+      graph.center();
+    }
+  }
   document.getElementById("mapFit").onclick = fitMap;
   document.getElementById("mapZoomIn").onclick = () => graph.zoom(graph.zoom()*1.3);
   document.getElementById("mapZoomOut").onclick = () => graph.zoom(graph.zoom()/1.3);
+  scrollZoom.onchange = () => graph.userZoomingEnabled(scrollZoom.checked);
   graph.on("tap", "node", event => {
-    if(event.target.hasClass("target") && targetResult) {
+    if(event.target.hasClass("target") && !event.target.hasClass("batch-target") && targetResult) {
       const p=event.target.data("coordinates");
       details.textContent=`Target ${targetResult.targetMac}\nPosition: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\n${targetResult.message}`;
       return;
     }
     const report = reports.get(event.target.id());
+    if (event.target.hasClass("batch-target")) {
+      const point=event.target.data("coordinates");
+      details.textContent=`${event.target.id()}\nRough estimate: (${point.x.toFixed(2)}, ${point.y.toFixed(2)}) m`;
+      return;
+    }
     if(!report)return;
     details.textContent = `${report.reporterMac}\nPosition: (${report.position.x.toFixed(3)}, ${report.position.y.toFixed(3)}) m\nStatus: ${report.status}\n` +
       (report.distances || []).map(d => `${d.targetMac}: ${Number.isFinite(d.meters) ? d.meters.toFixed(3)+" m" : d.status}`).join("\n");
@@ -57,7 +114,16 @@
     }
     details.textContent = lines.join("\n");
   });
-  function render() {
+  function batchMapStatus() {
+    const { results } = batchResult;
+    const count = graph.nodes(".batch-target").length;
+    if (count) return `${count}/${results.length} shortlist positions estimated.`;
+    if (!results.length) return "Auto Scan found no eligible devices in this pass.";
+    if (results.every(row=>row.status==="Configure nodes first"))
+      return "Run Configure nodes to place targets on the map.";
+    return `No positions estimated for ${results.length} shortlisted ${results.length===1?"device":"devices"}. See Discovered devices for details.`;
+  }
+  function render(showBatch=true) {
     const elements = [], placed = new Set(), unavailable = [];
     const positions=[...reports.values()].map(r=>r.position).filter(p=>Number.isFinite(p?.x)&&Number.isFinite(p?.y));
     let separation=Infinity;
@@ -73,7 +139,7 @@
       placed.add(report.reporterMac);
       const root = p.x === 0 && p.y === 0 && report.reporterMac.endsWith(":01");
       elements.push({ data: { id: report.reporterMac, label: `${root ? "ROOT " : ""}${report.reporterMac.slice(-2)}\n(${p.x.toFixed(2)}, ${p.y.toFixed(2)}) m` },
-        classes: root ? "root" : "", position: { x: p.x*scale, y: -p.y*scale } });
+        classes: root ? "anchor root" : "anchor", position: { x: p.x*scale, y: -p.y*scale } });
     }
     const ids = [...placed];
     for (let i=0;i<ids.length;i++) for(let j=i+1;j<ids.length;j++) {
@@ -90,7 +156,16 @@
     status.textContent = `${placed.size}/${reports.size} nodes positioned. ${description}` +
       (Number.isFinite(error) ? `Fit RMSE: ${error.toFixed(3)} m. ` : "") +
       (unavailable.length ? `No position: ${unavailable.join(", ")}` : "");
-    details.textContent = "Select a node or connection for details. Scroll to zoom; drag the background to pan.";
+    details.textContent = "Select a node or connection for details. Drag the background to pan.";
+    if (showBatch && batchResult && layoutKey===`${batchResult.layoutBootId}:${batchResult.layoutRevision}`) {
+      for (const point of batchResult.results) {
+        if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || graph.getElementById(point.mac).nonempty()) continue;
+        graph.add({data:{id:point.mac,label:point.mac,coordinates:point},classes:"target batch-target",
+          position:{x:point.x*scale,y:-point.y*scale}});
+      }
+      status.textContent=batchMapStatus();
+      fitMap();
+    }
   }
   function applyConfigureDistances() {
     if(configureResult?.status!=="success")return;
@@ -101,6 +176,12 @@
   }
   window.nodeMap = {
     resize() {graph.resize();fitMap();},
+    clearFocus() {
+      targetResult=null;
+      sniffReports.clear();
+      pendingSniffEnd=false;
+      render();
+    },
     applyLayout(snapshot) {
       if(snapshot.stale || !Number.isInteger(snapshot.layoutRevision))return;
       const key=`${snapshot.layoutBootId}:${snapshot.layoutRevision}`;
@@ -122,16 +203,25 @@
       if(pendingSniffEnd && targetResult) this.event({command:"sniff",phase:"end"});
     },
     event(event) {
-    if(event.command === "sniff") {
-      if(event.phase === "start") { sniffReports.clear();targetResult=null;pendingSniffEnd=false;graph.elements(".target, .sniff").remove();status.textContent="Capturing target traffic; the map shows the active anchor layout."; }
+    if(["sniff","autoscan","focus"].includes(event.command)) {
+      if(event.phase==="data" && event.kind==="batch") { batchResult=event;render();return; }
+      if(event.phase === "start") {
+        sniffReports.clear();targetResult=null;pendingSniffEnd=false;
+        if(event.command==="sniff") batchResult=null;
+        if(event.command!=="autoscan") graph.elements(".target, .sniff").remove();
+        status.textContent=event.command==="autoscan"
+          ? `Auto Scan running. ${batchResult && layoutKey===`${batchResult.layoutBootId}:${batchResult.layoutRevision}` ? batchMapStatus() : "Waiting for the first completed batch."}`
+          : "Capturing target traffic; the map shows the active anchor layout.";
+      }
       if(event.phase === "data" && event.kind === "sniff") {
         sniffReports.set(event.reporterMac,event);
       }
       if(event.phase === "data" && event.kind === "target")targetResult=event;
       if(event.phase === "end") {
+        if(event.command==="autoscan" && !targetResult) return;
         pendingSniffEnd=Boolean(targetResult && layoutKey!==`${targetResult.layoutBootId}:${targetResult.layoutRevision}`);
         if(pendingSniffEnd)return;
-        render();
+        render(event.command!=="focus");
         const scale = graph.scratch("metreScale") || 80;
         if(Number.isFinite(targetResult?.position?.x)&&Number.isFinite(targetResult?.position?.y)) {
           const target=targetResult.targetMac;
@@ -167,7 +257,7 @@
 // Collection uses the same Cytoscape map component with measured square anchors.
 (() => {
   if(typeof cytoscape!=="function")return;
-  let graph=null;
+  let graph=null,context=null;
   const details=()=>document.getElementById("collectionMapDetails");
   const scale=450;
   function fit(all=false){if(!graph)return;graph.resize();graph.fit(all?graph.elements():graph.elements().not(".estimate"),55);graph.center();}
@@ -185,8 +275,8 @@
     return Number.isFinite(x)&&Number.isFinite(y)?{x,y}:null;
   }
   window.nodeMap=window.nodeMap||{};
-  window.nodeMap.collection=(container,setup,target,windows)=>{
-    if(container.offsetParent===null)return;
+  window.nodeMap.collection=(container,state)=>{
+    if(!state||container.offsetParent===null)return;
     if(!graph) {
       graph=cytoscape({container,layout:{name:"preset"},autoungrabify:true,minZoom:.005,maxZoom:8,style:[
         {selector:"node",style:{label:"data(label)","background-color":"#c5d1dd",width:17,height:17,color:"#415972","font-size":11,"text-valign":"bottom","text-margin-y":7,"text-wrap":"wrap","text-max-width":125,"border-width":2,"border-color":"white"}},
@@ -199,37 +289,47 @@
         {selector:":selected",style:{"border-color":"#6737c1","border-width":4}}
       ]});
       graph.on("tap","node",event=>{
-        details().textContent=event.target.data("description")||event.target.data("label");
+        const data=event.target.data();
+        details().textContent=data.description||data.label;
       });
       document.getElementById("collectionMapFit").onclick=()=>fit();
       document.getElementById("collectionMapEstimates").onclick=()=>fit(true);
     }
+    const setup=state.setup||state.lastCapture?.setup;if(!setup)return;
     const L=setup.side_length_m;
+    const key=`${setup.mesh_id}:${setup.environment_id}:${setup.dataset_split}:${state.session?.mac}:${state.pending?.id}:${state.pending?.attemptId}:${state.pending?.stage}:${Object.keys(state.pending?.windows||{}).length}:${state.savedRows}`;
+    if(key===context){graph.resize();return;}context=key;
     const elements=[];
     [[0,0],[1,0],[0,1],[1,1]].forEach(([u,v],i)=>elements.push({data:{id:`anchor-${i+1}`,label:`Sniffer 0${i+1}`,description:`Sniffer 0${i+1}: (${(u*L).toFixed(3)}, ${(v*L).toFixed(3)}) m · measured corner`},position:{x:u*scale,y:v*scale},classes:"anchor"}));
     for(const [i,j] of [[1,2],[2,4],[4,3],[3,1]])elements.push({data:{id:`side-${i}-${j}`,source:`anchor-${i}`,target:`anchor-${j}`}});
-    elements.push({data:{id:target.id,label:target.id,
-      description:`Known target: (${target.u}, ${target.v}) m`},
-      position:{x:target.u*scale,y:target.v*scale},classes:"actual"});
-    const estimateList=document.getElementById("collectionWindowEstimates");
-    estimateList.replaceChildren();
+    const points=setup.dataset_split==="test"?state.positions.unseen:state.positions.training;
+    for(const p of points) {
+      const saved=state.approved.find(a=>a.setup.mesh_id===setup.mesh_id&&a.setup.environment_id===setup.environment_id&&a.setup.target_id===p.id);
+      const current=p.id===setup.target_id;
+      elements.push({data:{id:p.id,label:current?`${p.id} · actual`:p.id,
+        description:`${p.id}: (${(p.u*L).toFixed(3)}, ${(p.v*L).toFixed(3)}) m · ${saved?"approved":"pending"} · ${setup.dataset_split}`},
+        position:{x:p.u*scale,y:p.v*scale},classes:`${saved?"saved ":""}${current?"actual ":""}${setup.dataset_split==="test"?"test":""}`});
+    }
+    const capture=state.pending||state.lastCapture;
+    const estimateList=document.getElementById("collectionWindowEstimates");estimateList.replaceChildren();
     let count=0;
-    for(const [index, window] of Object.entries(windows)) {
-        const p=estimate(window,L);
-        if(!p)continue;
-        count++;
+    if(capture&&capture.setup.mesh_id===setup.mesh_id&&capture.setup.environment_id===setup.environment_id&&capture.setup.dataset_split===setup.dataset_split) {
+      for(let index=1;index<=3;index++) {
+        const w=capture.windows[index],check=capture.review?.find(r=>r.index===index);
+        if(!w||check?.errors.length)continue;const p=estimate(w,L);if(!p)continue;count++;
         const button=document.createElement("button");button.type="button";
-        button.textContent=`W${index} · ${target.id}: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m · baseline estimate`;
-        const description=`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${target.id}: (${target.u}, ${target.v}) m\nRSSI A/n baseline estimate; not a trained ML prediction.`;
+        button.textContent=`W${index} · ${capture.setup.target_id}: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m · baseline estimate`;
+        const description=`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${capture.setup.target_id}: (${capture.setup.target_x_m}, ${capture.setup.target_y_m}) m\nRSSI A/n baseline estimate; not a trained ML prediction.`;
         button.onclick=()=>{details().textContent=description;};estimateList.append(button);
         const overlapping=elements.find(e=>e.classes==="estimate"&&Math.hypot(e.position.x-p.x/L*scale,e.position.y-p.y/L*scale)<1e-7);
         if(overlapping){overlapping.data.label+=` / W${index}`;overlapping.data.description+="\n"+description;continue;}
-        elements.push({data:{id:`estimate-${index}`,label:`W${index} · ${target.id}`,
-          description:`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${target.id}: (${target.u}, ${target.v}) m\nRSSI A/n baseline estimate; not a trained ML prediction. Overlapping markers retain their real coordinates.`},
+        elements.push({data:{id:`estimate-${index}`,label:`W${index} · ${capture.setup.target_id}`,
+          description:`Window ${index} baseline estimate: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\nActual ${capture.setup.target_id}: (${capture.setup.target_x_m}, ${capture.setup.target_y_m}) m\nRSSI A/n baseline estimate; not a trained ML prediction. Overlapping markers retain their real coordinates.`},
           position:{x:p.x/L*scale,y:p.y/L*scale},classes:"estimate"});
+      }
     }
     graph.elements().remove();graph.add(elements);fit();
-    document.getElementById("collectionMapStatus").textContent=`Sample ${L} m square · y increases downward · ${count}/3 per-window baseline estimates available. Fit all estimates to include estimates beyond this view. Overlapping estimates share coordinates.`;
-    if(count)details().textContent="Select W1, W2 or W3 for estimated coordinates.";
+    document.getElementById("collectionMapStatus").textContent=`Measured ${L} m square · y increases downward · ${count}/3 per-window baseline estimates available. Fit all estimates to include estimates beyond this view. Overlapping estimates share coordinates.`;
+    if(count)details().textContent="Select W1, W2 or W3 for estimated coordinates. Select a saved position for its three recorded windows.";
   };
 })();

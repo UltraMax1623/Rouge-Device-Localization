@@ -27,10 +27,10 @@ inline void writeModeLed(bool on, uint8_t pattern = 0) {
 #if defined(MODE_RGB_PIN)
   // Low brightness: mesh green, broadcast cyan, conf yellow, discovery purple,
   // TX orange, RX blue, waiting off and fault red. Monochrome uses blink/steady/off.
-  const uint8_t red = on && (pattern == 1 || pattern == 3 || pattern == 5 || pattern == 6) ? 16 : 0;
+  const uint8_t red = on && (pattern == 1 || pattern == 3 || pattern == 5 || pattern == 6 || pattern == 9) ? 16 : 0;
   const uint8_t green = !on ? 0 : pattern == 6 ? 8 :
       (pattern == 0 || pattern == 1 || pattern == 4) ? 16 : 0;
-  const uint8_t blue = on && (pattern == 2 || pattern == 4 || pattern == 5 || pattern == 7) ? 16 : 0;
+  const uint8_t blue = on && (pattern == 2 || pattern == 4 || pattern == 5 || pattern == 7 || pattern == 9) ? 16 : 0;
   rgbLedWrite(MODE_RGB_PIN, red, green, blue);
 #else
   digitalWrite(MODE_LED_PIN, (on != bool(MODE_LED_ACTIVE_LOW)) ? HIGH : LOW);
@@ -58,11 +58,12 @@ inline void beginModeIndicator() {
 // Nonblocking; called every loop so mesh maintenance and slot timing continue.
 inline void updateModeIndicator(const String &mode, bool fault,
                                 bool broadcasting,
-                                TimeSliceProtocol::RadioActivity radio = TimeSliceProtocol::RadioActivity::None) {
+                                TimeSliceProtocol::RadioActivity radio = TimeSliceProtocol::RadioActivity::None,
+                                bool identify = false) {
   using TimeSliceProtocol::RadioActivity;
   const uint8_t pattern = fault ? 3 : radio == RadioActivity::Transmit ? 6
       : radio == RadioActivity::Receive ? 7 : radio == RadioActivity::Waiting ? 8
-      : mode == "conf" ? 1 : mode == "sniff" ? 2
+      : identify ? 9 : mode == "conf" ? 1 : mode == "sniff" ? 2
                                       : mode == "scan" ? 5 : broadcasting ? 4 : 0;
   static uint8_t previous = 255;
   static uint32_t since = 0;
@@ -72,7 +73,7 @@ inline void updateModeIndicator(const String &mode, bool fault,
     since = now;
     FW_LOG("[LED] %s\n", fault ? "fault" : pattern == 6 ? "TX - measurement slot"
         : pattern == 7 ? "RX - listening" : pattern == 8 ? "waiting - no active measurement slot"
-        : pattern == 4
+        : pattern == 9 ? "identifying board" : pattern == 4
                                              ? "mesh broadcast" : mode.c_str());
   }
   const uint32_t elapsed = now - since;
@@ -89,7 +90,7 @@ inline void updateModeIndicator(const String &mode, bool fault,
     on = (elapsed / 500) % 2 == 0;
   } else if (pattern == 4) {
     on = (elapsed / 60) % 2 == 0;
-  } else if (pattern == 5) {
+  } else if (pattern == 5 || pattern == 9) {
     on = (elapsed / 200) % 2 == 0;
   } else {
     on = true;
