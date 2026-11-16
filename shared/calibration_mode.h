@@ -20,8 +20,11 @@ class CalibrationMode {
   }
   bool nodeOnline(unsigned board) const {
     if (board == 1) return meshStarted;
+    return connectedNodeId(board) != 0;
+  }
+  uint32_t connectedNodeId(unsigned board) const {
     const Peer *peer = findPeer(board);
-    return peer && fresh(*peer);
+    return peer && fresh(*peer) ? peer->id : 0;
   }
   bool modelAcknowledged(unsigned board) const {
     const Peer *peer = findPeer(board);

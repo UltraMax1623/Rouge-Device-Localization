@@ -1,10 +1,10 @@
-const names = new Set(["conf", "sniff", "status", "calibrate", "diagnose", "autoscan", "focus"]);
+const names = new Set(["conf", "sniff", "status", "calibrate", "diagnose", "autoscan", "focus", "identify"]);
 function parseCommand(body, json = false) {
   let value;
   if (json) value = JSON.parse(body);
   else {
     const [command, first, second, ...extra] = body.trim().replace(/^auto scan$/i, "autoscan").split(/\s+/);
-    if (extra.length) throw new Error("Too many arguments.");
+    if (extra.length || command === "identify" && second !== undefined) throw new Error("Too many arguments.");
     if (["conf", "status", "autoscan"].includes(command) && first) throw new Error("This command takes no arguments.");
     value = { command, params: command === "sniff" ? { mac: first, channel: second === undefined ? 0 : Number(second) }
       : { board: Number(first), distance: second === undefined ? 1 : Number(second) } };
@@ -34,6 +34,11 @@ function parseCommand(body, json = false) {
       return { command: "focus", params: { mac, channel, scanId: params.scanId } };
     }
     return { command: value.command, params: { mac, channel } };
+  }
+  if (value.command === "identify") {
+    if (!Number.isInteger(params.board) || params.board < 1 || params.board > 15)
+      throw new Error("Select board 01..15.");
+    return { command: "identify", params: { board: params.board } };
   }
   if (["calibrate", "diagnose"].includes(value.command)) {
     const distance = params.distance === undefined ? 1 : params.distance;

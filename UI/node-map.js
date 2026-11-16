@@ -2,44 +2,101 @@
 (() => {
   const status = document.getElementById("mapStatus");
   const details = document.getElementById("mapDetails");
+  const emptyState = document.getElementById("mapEmpty");
+  const scrollZoom = document.getElementById("mapScrollZoom");
   const reports = new Map();
   let layoutKey = null;
   let configureResult = null;
   let pendingSniffEnd = false;
   let targetResult=null;
+  let batchResult=null;
   const sniffReports=new Map();
   if (typeof cytoscape !== "function") {
     status.textContent = "Map library unavailable. Run npm install in UI and restart the backend.";
+    emptyState.hidden = true;
+    scrollZoom.disabled = true;
     window.nodeMap = { event() {} }; return;
   }
+  const antenna = document.createElement("canvas");
+  antenna.width = antenna.height = 96;
+  const icon = antenna.getContext("2d");
+  icon.scale(3, 3);
+  icon.strokeStyle = "#ffffff";
+  icon.fillStyle = "#ffffff";
+  icon.lineWidth = 1.8;
+  icon.lineCap = "round";
+  icon.beginPath();
+  icon.moveTo(10, 25);
+  icon.lineTo(16, 14);
+  icon.lineTo(22, 25);
+  icon.moveTo(13, 21);
+  icon.lineTo(19, 21);
+  icon.stroke();
+  for (const radius of [5, 9]) {
+    for (const angle of [0, Math.PI]) {
+      icon.beginPath();
+      icon.arc(16, 12, radius, angle - 0.6, angle + 0.6);
+      icon.stroke();
+    }
+  }
+  icon.beginPath();
+  icon.arc(16, 12, 1.75, 0, Math.PI * 2);
+  icon.fill();
+  const antennaImage = antenna.toDataURL();
   const graph = cytoscape({
     container: document.getElementById("nodeMap"), elements: [],
     layout: { name: "preset" }, autoungrabify: true,
-    minZoom: 0.02, maxZoom: 8,
+    minZoom: 0.02, maxZoom: 8, userZoomingEnabled: scrollZoom.checked,
     style: [
       { selector: "node", style: { label: "data(label)", "background-color": "#319cf0",
         color: "#15263d", "text-valign": "bottom", "text-margin-y": 8,
         "font-size": 12, "text-wrap": "wrap", "text-max-width": 130,
         width: 38, height: 38, "border-width": 3, "border-color": "#fff" } },
-      { selector: "node.root", style: { "background-color": "#17b7a4", width: 48, height: 48 } },
+      { selector: "node.anchor", style: {
+        shape: "round-rectangle",
+        "background-image": antennaImage,
+        "background-width": "84%",
+        "background-height": "84%",
+        "background-color": "#236eaa",
+        "border-width": 2
+      } },
+      { selector: "node.root", style: { "background-color": "#15796d", width: 44, height: 44 } },
       { selector: "node.target", style: { "background-color": "#ffb020", shape:"diamond", width:42,height:42 } },
+      { selector: "node.batch-target", style: {
+        width: 24, height: 24, "border-width": 2, "border-color": "#995400",
+        "z-index": 2, "font-weight": 700, "text-background-color": "#ffffff",
+        "text-background-opacity": 0.9, "text-background-padding": 2
+      } },
       { selector: "edge.sniff", style: { "line-color":"#d8a244", "line-style":"dashed" } },
       { selector: "edge", style: { label: "data(label)", width: 2, "line-color": "#9eafc2",
         "font-size": 11, "text-background-color": "#fff", "text-background-opacity": 0.9 } },
       { selector: ":selected", style: { "border-color": "#ffb020", "line-color": "#ffb020" } }
     ]
   });
-  function fitMap() { graph.fit(undefined,65); if(graph.zoom()>1.6) graph.zoom(1.6); graph.center(); }
+  function fitMap() {
+    emptyState.hidden = graph.elements().nonempty();
+    if (emptyState.hidden) {
+      graph.fit(undefined, 48);
+      if (graph.zoom() > 1.6) graph.zoom(1.6);
+      graph.center();
+    }
+  }
   document.getElementById("mapFit").onclick = fitMap;
   document.getElementById("mapZoomIn").onclick = () => graph.zoom(graph.zoom()*1.3);
   document.getElementById("mapZoomOut").onclick = () => graph.zoom(graph.zoom()/1.3);
+  scrollZoom.onchange = () => graph.userZoomingEnabled(scrollZoom.checked);
   graph.on("tap", "node", event => {
-    if(event.target.hasClass("target") && targetResult) {
+    if(event.target.hasClass("target") && !event.target.hasClass("batch-target") && targetResult) {
       const p=event.target.data("coordinates");
       details.textContent=`Target ${targetResult.targetMac}\nPosition: (${p.x.toFixed(3)}, ${p.y.toFixed(3)}) m\n${targetResult.message}`;
       return;
     }
     const report = reports.get(event.target.id());
+    if (event.target.hasClass("batch-target")) {
+      const point=event.target.data("coordinates");
+      details.textContent=`${event.target.id()}\nRough estimate: (${point.x.toFixed(2)}, ${point.y.toFixed(2)}) m`;
+      return;
+    }
     if(!report)return;
     details.textContent = `${report.reporterMac}\nPosition: (${report.position.x.toFixed(3)}, ${report.position.y.toFixed(3)}) m\nStatus: ${report.status}\n` +
       (report.distances || []).map(d => `${d.targetMac}: ${Number.isFinite(d.meters) ? d.meters.toFixed(3)+" m" : d.status}`).join("\n");
@@ -57,7 +114,16 @@
     }
     details.textContent = lines.join("\n");
   });
-  function render() {
+  function batchMapStatus() {
+    const { results } = batchResult;
+    const count = graph.nodes(".batch-target").length;
+    if (count) return `${count}/${results.length} shortlist positions estimated.`;
+    if (!results.length) return "Auto Scan found no eligible devices in this pass.";
+    if (results.every(row=>row.status==="Configure nodes first"))
+      return "Run Configure nodes to place targets on the map.";
+    return `No positions estimated for ${results.length} shortlisted ${results.length===1?"device":"devices"}. See Discovered devices for details.`;
+  }
+  function render(showBatch=true) {
     const elements = [], placed = new Set(), unavailable = [];
     const positions=[...reports.values()].map(r=>r.position).filter(p=>Number.isFinite(p?.x)&&Number.isFinite(p?.y));
     let separation=Infinity;
@@ -73,7 +139,7 @@
       placed.add(report.reporterMac);
       const root = p.x === 0 && p.y === 0 && report.reporterMac.endsWith(":01");
       elements.push({ data: { id: report.reporterMac, label: `${root ? "ROOT " : ""}${report.reporterMac.slice(-2)}\n(${p.x.toFixed(2)}, ${p.y.toFixed(2)}) m` },
-        classes: root ? "root" : "", position: { x: p.x*scale, y: -p.y*scale } });
+        classes: root ? "anchor root" : "anchor", position: { x: p.x*scale, y: -p.y*scale } });
     }
     const ids = [...placed];
     for (let i=0;i<ids.length;i++) for(let j=i+1;j<ids.length;j++) {
@@ -90,7 +156,16 @@
     status.textContent = `${placed.size}/${reports.size} nodes positioned. ${description}` +
       (Number.isFinite(error) ? `Fit RMSE: ${error.toFixed(3)} m. ` : "") +
       (unavailable.length ? `No position: ${unavailable.join(", ")}` : "");
-    details.textContent = "Select a node or connection for details. Scroll to zoom; drag the background to pan.";
+    details.textContent = "Select a node or connection for details. Drag the background to pan.";
+    if (showBatch && batchResult && layoutKey===`${batchResult.layoutBootId}:${batchResult.layoutRevision}`) {
+      for (const point of batchResult.results) {
+        if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || graph.getElementById(point.mac).nonempty()) continue;
+        graph.add({data:{id:point.mac,label:point.mac,coordinates:point},classes:"target batch-target",
+          position:{x:point.x*scale,y:-point.y*scale}});
+      }
+      status.textContent=batchMapStatus();
+      fitMap();
+    }
   }
   function applyConfigureDistances() {
     if(configureResult?.status!=="success")return;
@@ -101,6 +176,12 @@
   }
   window.nodeMap = {
     resize() {graph.resize();fitMap();},
+    clearFocus() {
+      targetResult=null;
+      sniffReports.clear();
+      pendingSniffEnd=false;
+      render();
+    },
     applyLayout(snapshot) {
       if(snapshot.stale || !Number.isInteger(snapshot.layoutRevision))return;
       const key=`${snapshot.layoutBootId}:${snapshot.layoutRevision}`;
@@ -123,15 +204,24 @@
     },
     event(event) {
     if(["sniff","autoscan","focus"].includes(event.command)) {
-      if(event.phase === "start") { sniffReports.clear();targetResult=null;pendingSniffEnd=false;graph.elements(".target, .sniff").remove();status.textContent="Capturing target traffic; the map shows the active anchor layout."; }
+      if(event.phase==="data" && event.kind==="batch") { batchResult=event;render();return; }
+      if(event.phase === "start") {
+        sniffReports.clear();targetResult=null;pendingSniffEnd=false;
+        if(event.command==="sniff") batchResult=null;
+        if(event.command!=="autoscan") graph.elements(".target, .sniff").remove();
+        status.textContent=event.command==="autoscan"
+          ? `Auto Scan running. ${batchResult && layoutKey===`${batchResult.layoutBootId}:${batchResult.layoutRevision}` ? batchMapStatus() : "Waiting for the first completed batch."}`
+          : "Capturing target traffic; the map shows the active anchor layout.";
+      }
       if(event.phase === "data" && event.kind === "sniff") {
         sniffReports.set(event.reporterMac,event);
       }
       if(event.phase === "data" && event.kind === "target")targetResult=event;
       if(event.phase === "end") {
+        if(event.command==="autoscan" && !targetResult) return;
         pendingSniffEnd=Boolean(targetResult && layoutKey!==`${targetResult.layoutBootId}:${targetResult.layoutRevision}`);
         if(pendingSniffEnd)return;
-        render();
+        render(event.command!=="focus");
         const scale = graph.scratch("metreScale") || 80;
         if(Number.isFinite(targetResult?.position?.x)&&Number.isFinite(targetResult?.position?.y)) {
           const target=targetResult.targetMac;
